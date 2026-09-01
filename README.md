@@ -25,7 +25,7 @@
 ## ディレクトリ
 
 ```
-kairn/                 パッケージ（config / store / server(MCP) / ui / sync / extract）
+kairn/                 パッケージ（config / store / index / server(MCP) / ui / sync。extract は段階 7）
 config/workspaces.yaml ワークスペース定義（機密なし）
 workspaces/<ws>/       データ実体（.gitignore、Drive 同期）
   cases/<case>/        worklog.md、作業ファイル、plan/、events.jsonl
@@ -48,4 +48,4 @@ docs/                  データモデル・MCP ツール・UI の仕様
 
 ## 状態
 
-骨組みのみ（2026-09-01）。実装順は docs/roadmap.md。
+段階 1（config / store / index / server(MCP, mcp 2.x) / ui）完了（2026-09-02）。sync の生データ退避・skill 配置・extract は未着手。実装順は docs/roadmap.md。

@@ -1,13 +1,37 @@
 # UI（ローカル Web、localhost / Tailscale 内のみ）
 
-人が操作するのはここだけ。データは MCP と同じファイル。
+人が操作するのはここだけ。データは MCP と同じファイル。実装: `kairn/ui.py`。
 
-- 一覧: ワークスペース内の案件（status, 進捗バー = done/全, 最終イベント, 担当 AI の最終動作）
-- 案件: かんばん（open / doing / blocked / done）、時系列（events、証拠へのリンク）、計画の版履歴
-  （どの版で何が superseded になったか）、worklog の該当節、データ所在（Drive パス・復元コマンド）
-- 操作: タスク追加・差し戻し（sendback）・コメント・優先度・案件の close/suspend。すべて event として記録され、
-  AI は次に open_case した時に受け取る
-- 鮮度: open タスクの最終イベントからの経過を表示。一定期間動きが無いものを目立たせる（自動では消さない）
-- 横断: related で繋がる案件、elements で絞り込み
+実装は **Starlette（FastAPI の基盤。MCP SDK の ASGI アプリと同じ Starlette に同居）＋ 素の HTML**。外部依存を増やさない。
+`server.build_app()` が `/`（→ `/ui`）、`/ui…`（UI）、`/mcp`（MCP）を 1 つのアプリに載せる。UI のルートは Mount ではなく
+`ui_routes(conf, "/ui")` で直接登録する（Mount 配下の `/` は末尾スラッシュ無しの `/ui` で 404 になるため）。
 
-実装: FastAPI（MCP と同居）＋ 素の HTML/JS。外部依存を増やさない。
+## 画面
+
+- **一覧** `GET /ui[?status=open|closed|suspended|all][&element=<値>][&ws=<名>]`
+  ワークスペース内の案件: status、進捗バー（done/全、計画の版）、鮮度、最終イベント、担当 AI の最終動作（actor=ai の最終イベントの agent/action）。
+  elements の値をタグ表示し、クリックで絞り込み（横断）。case.json の無いディレクトリは件数だけ表示。
+- **案件** `GET /ui/<ws>/<case>`
+  - かんばん（open / doing / blocked / done）。カードに owner・最終動作時刻・証拠・差し戻しフォーム
+  - 計画の版履歴（各版の reason / objective / タスクと状態、`carried_from` と、どの版で何が superseded になったか）
+  - データ所在（case.json の `data[]`: Drive パスと復元コマンド `rclone copy <remote>:<path> <case_dir>/`）
+  - worklog.md（折りたたみ。全文）
+  - 時系列（events。actor で色分け、agent、task、note、証拠）
+  - related（存在する案件はリンク）、elements（タグ。クリックで一覧の絞り込み）
+
+## 操作（すべて event として記録。AI は次に open_case した時に `human_feedback` で受け取る）
+
+| 操作 | POST | 記録 |
+|---|---|---|
+| 差し戻し | `/ui/<ws>/<case>/sendback` `task, note` | `{actor: human, action: sendback, task, note}`。存在しない task は 400 |
+| コメント／指示 | `/ui/<ws>/<case>/comment` `note` | `{actor: human, action: comment, note}`。空は 400 |
+| タスク追加 | `/ui/<ws>/<case>/task` `title, owner` | 生きているタスク（open/doing/blocked/done）を全部引き継いだ**計画の新版**＋追加（actor=human）。superseded は出ない |
+| 案件の close/suspend | `/ui/<ws>/<case>/status` `status, note` | case.json の status 更新＋ `{actor: human, action: status}` |
+
+フォームは `application/x-www-form-urlencoded`（UTF-8、percent-encoding）。日本語・記号は復号してそのまま記録する。成功時は 303 で案件ページへ戻る。
+優先度の操作はデータモデルに項目が無いため未実装（要判断: 段階 1 で追加していない）。
+
+## 鮮度
+
+open / doing / blocked のタスクごとに「そのタスクの最終イベント（無ければタスクの作成・更新時刻）からの経過日数」を表示する。
+**7 日超**（`ui.STALE_DAYS`）は赤字＋⚠ とカードの左罫線で目立たせる。一覧では案件内の最も古い open タスクの経過を出す。自動では消さない。
