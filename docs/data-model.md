@@ -26,6 +26,9 @@ workspaces/<ws>/
   "tickets": ["CASE-123"], "prs": [42],
   "related": ["CASE-100", "CASE-118"],      // 人／AI が明示的に書く関係（抽出に頼らない）
   "elements": {"machine": ["unit-2"], "component": ["acme-plc"], "symptom": ["起動時に driver init 未完了"]},
+  "summary": "起動直後に driver init が終わらない。UART の送信量超過が原因。",   // 3 行以内（extract の下書きを人が適用した時に入る）
+  "causal": [{"symptom": "起動時に driver init 未完了", "component": "acme-plc", "cause": "UART 460800 で送信量が超過",
+              "evidence": "## Notes: UART 460800 で送信量が超過する"}],      // 症状→部品→原因。evidence は worklog の見出し／行の引用
   "data": [{"drive": "my-drive:ws/acme/cases/CASE-123/", "files": 3, "bytes": 1234567890,
             "moved_at": "2026-09-01T12:30:00+09:00", "list": "index/raw-moved-20260901.txt"}],
   "created_at": "...", "updated_at": "...", "current_plan": 3,
@@ -35,6 +38,13 @@ workspaces/<ws>/
 - `last_checkin_at`: `open_case` は、これより新しいローカル変更（`case.json` / `events.jsonl` / `worklog.md` / `plan/*.json` の mtime）が
   あれば Drive からの checkout を skip し `drive={"skipped": "local changes newer than last checkin"}` を返す（未 checkin の変更を Drive で上書きしない）。
   未記録なら checkout する（`--update` なのでローカルの方が新しいファイルは上書きされない）。
+
+### summary / elements / related / causal（抽出の下書きの適用先）
+- `kairn/extract`（MCP `extract_card` / `kairn extract` / UI「下書きを取得」）は下書きを返すだけで case.json には書かない。
+- UI の「この下書きを case.json に適用」（人の操作）が `title` / `summary` / `elements` / `related` / `causal` を**置き換え**、
+  `{actor: human, action: decision, note: "applied extract draft", confidence}` を events に追記する。
+- `elements` のキーは `machine` / `component` / `symptom` / `ticket` / `site` / `external`（`kairn/extract/schema.json`）。手で作った案件は一部のキーだけでもよい。
+- `causal[]` の各要素は `{symptom, component, cause, evidence}`（すべて文字列）。UI の案件ページに「症状 → 部品 → 原因」として表示する。
 
 ### data[]（生データの所在。`kairn raw-move` / `kairn daily` が追記する）
 - `drive`: 移動先（`<remote>:<root>/<ws>/cases/<case>/`。案件ディレクトリの相対構造をそのまま保つ）
@@ -73,7 +83,7 @@ workspaces/<ws>/
 {"t": "…", "actor": "ai", "action": "plan", "plan": 3, "note": "指摘を受けて再計画"}
 ```
 `action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | checkout | status | extract
-`actor`: ai | human | kairn（kairn の自動処理: raw-move 等。UI では既定色）
+`actor`: ai | human | kairn（kairn の自動処理: raw-move・extract 等。UI では既定色）。extract の event は `agent: "extract:<name>"`、`note`（ok / 失敗理由）、`elapsed_sec`、`exit_code`、`timeout_sec` を持つ
 
 ## 証拠（evidence）の型
 `type` は commit / pr / file / test / url。`note` は actor=human のみ（AI の証拠にはならない）。型ごとの必須キー:

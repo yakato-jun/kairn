@@ -25,7 +25,8 @@
 ## ディレクトリ
 
 ```
-kairn/                 パッケージ（config / store / index / server(MCP) / ui / sync。extract は段階 7）
+kairn/                 パッケージ（config / store / index / server(MCP) / ui / sync / extract）
+kairn/extract/         案件カードの下書き抽出: prompt.md（子エージェントへの指示）/ schema.json（出力の JSON Schema）/ adapters.py（claude / codex / opencode / antigravity）
 config/config.example.yaml  環境ローカル設定の書式例（架空名）。実体は ~/.config/kairn/config.yaml（kairn のコマンドが書く。コミットしない）
 contrib/systemd/       日次同期の systemd user unit（kairn-daily.service / .timer）
 workspaces/<ws>/       データ実体（.gitignore、Drive 同期）
@@ -74,7 +75,19 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
   systemctl --user list-timers kairn-daily.timer; journalctl --user -u kairn-daily
   ```
 
+## 抽出（extract）
+
+案件カード（case.json）の下書き（title / summary / elements / related / 症状→部品→原因）を、**文脈隔離した子エージェント**が案件ディレクトリを読んで作る
+（docs/extract-agents.md）。使うエージェントは `~/.config/kairn/config.yaml` の `extract.agent`（`kairn setup --agent`）: claude / codex / opencode / antigravity。
+子プロセスは案件ディレクトリを cwd に、読み取り専用オプション・最小限の環境変数で起動し、出力は `kairn/extract/schema.json` で検証する。
+**下書きは書き込まない**。適用は UI の案件ページ「下書きを取得」→ 差分を見て「この下書きを case.json に適用」（人の操作）だけ。
+
+```
+kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]   # 下書きを表示（失敗は exit 1）
+```
+MCP からは `extract_card(case)`（失敗も `ok=false` の結果として返す）。毎回 events に `{actor: kairn, agent: "extract:<name>", action: extract}` が残る。
+
 ## 状態
 
 段階 1（config / store / index / server(MCP, mcp 2.x) / ui）完了（2026-09-02）。段階 5（sync: bag2zst / raw-move / daily / systemd timer）完了（2026-09-02）。
-skill 配置・extract は未着手。実装順は docs/roadmap.md。
+段階 7（extract: MCP `extract_card` / `kairn extract` / UI の取得・適用）完了（2026-09-02）。skill 配置（6）と各 CLI の登録手順は未着手。実装順は docs/roadmap.md。

@@ -1,6 +1,6 @@
 # MCP ツール（10 個以内。説明文は短く）
 
-実装: `kairn/server.py`（mcp 2.x `mcp.server.mcpserver.MCPServer`、streamable HTTP を `/mcp` に提供。UI と同一プロセス）。
+実装: `kairn/server.py`（mcp 2.x `mcp.server.mcpserver.MCPServer`、streamable HTTP を `/mcp` に提供。UI と同一プロセス）。ツールは 10 個。
 判断の規則の実体は `kairn/store.py`（証拠必須・superseded 自動化）。server は引数を検証して委譲する。
 
 ## 共通
@@ -29,8 +29,7 @@
 | `find_cases(query, workspace?, k=5)` | | `[{case, score, reasons[]}]` | 案件カード（title/tickets/related/elements）×3 ＋ 本文節の bm25 を合算。語は OR（問いの一部にでも当たる案件を拾う）。3 文字未満の語だけなら `case_id` / `title` の LIKE で補う。案件を選ぶのは人 |
 | `checkin(case, workspace?, agent?)` | | `{ok, rclone, last_checkin_at}` | ローカル → Drive（`sync.checkin`、設定済み remote のみ）＋ `case.json.last_checkin_at` 更新＋ `checkin` event。**Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする**（rclone sync）。他環境で作業した後は先に `checkout` する運用 |
 | `drive_index(pattern, workspace?, limit=50)` | 正規表現 | `[{path, size, mtime}]` | `index/drive-index.txt`（`kairn drive-index` で生成）を検索。無ければ空 |
-
-`extract_card(case)`（`claude -p` 等の子プロセスで case.json の下書きを返す。読み取り専用・書き込まない）は段階 7 の担当で未実装（docs/roadmap.md）。
+| `extract_card(case, workspace?)` | | `{ok, card, agent, elapsed_sec, error, raw_excerpt}` | 設定 `extract.agent` の子エージェント（`kairn/extract/adapters.py`）を案件ディレクトリを cwd に、最小限の環境変数で起動し、出力を `kairn/extract/schema.json` で検証した下書きを `card` に返す（docs/extract-agents.md）。**case.json には書かない**（適用は UI の人の操作のみ）。タイムアウト・非ゼロ終了・JSON 無し・スキーマ不一致は `ok=false, error` で返す（`is_error` にしない。未知の案件だけ `ToolError`）。毎回 `{actor: kairn, agent: "extract:<name>", action: extract, note, elapsed_sec, exit_code, timeout_sec}` を events に追記 |
 
 ## server instructions（各エージェントに表示される要約）
 

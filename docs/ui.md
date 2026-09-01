@@ -15,6 +15,7 @@
   - かんばん（open / doing / blocked / done）。カードに owner・最終動作時刻・証拠・差し戻しフォーム
   - 計画の版履歴（各版の reason / objective / タスクと状態、`carried_from` と、どの版で何が superseded になったか）
   - データ所在（case.json の `data[]`: Drive パスと復元コマンド `rclone copy <remote>:<path> <case_dir>/`）
+  - summary（あれば objective の下）、症状 → 部品 → 原因（case.json の `causal[]`。あれば）
   - worklog.md（折りたたみ。全文）
   - 時系列（events の直近 100 件、新しい順。actor で色分け（human / ai。kairn 等その他は既定色）、agent、task、note、証拠）
   - related（存在する案件はリンク）、elements（タグ。クリックで一覧の絞り込み）
@@ -27,6 +28,8 @@
 | コメント／指示 | `/ui/<ws>/<case>/comment` `note` | `{actor: human, action: comment, note}`。空は 400 |
 | タスク追加 | `/ui/<ws>/<case>/task` `title, owner` | 生きているタスク（open/doing/blocked/done）を全部引き継いだ**計画の新版**＋追加（actor=human）。superseded は出ない |
 | 案件の close/suspend | `/ui/<ws>/<case>/status` `status, note` | case.json の status 更新＋ `{actor: human, action: status}` |
+| 下書きを取得 | `/ui/<ws>/<case>/extract` | `extract.extract_card` を実行し、結果画面（agent・所要時間・ok/失敗理由、現在の case.json と下書きの対比、症状→部品→原因、下書き JSON）を返す（200、リダイレクトしない）。case.json は書かない。`{actor: kairn, agent: extract:<name>, action: extract}` |
+| この下書きを case.json に適用 | `/ui/<ws>/<case>/apply` `card`（下書き JSON。結果画面の hidden） | schema.json で再検証し、title / summary / elements / related / causal を置き換え＋ `{actor: human, action: decision, note: "applied extract draft"}`。不正な JSON・スキーマ不一致は 400 |
 
 フォームは `application/x-www-form-urlencoded`（UTF-8、percent-encoding）。日本語・記号は復号してそのまま記録する。成功時は 303 で案件ページへ戻る。
 `owner` は ai | human 以外を 400 で拒否する。
