@@ -18,7 +18,7 @@
 
 | ツール | 引数 | 返り値 | 実装で強制する規則 |
 |---|---|---|---|
-| `open_case(case, workspace?, agent?)` | | `{case, plan, open_tasks, recent_events(直近20), human_feedback(人の sendback/comment 直近5), related, worklog_tail(末尾3000字), drive, paths}` | 先に Drive から取り寄せ（`sync.checkout`）。失敗してもローカル写しで続行し `drive={fetched:false, error, note}` で返す。`checkout` event を追記 |
+| `open_case(case, workspace?, agent?)` | | `{case, plan, open_tasks, recent_events(直近20), human_feedback(人の sendback/comment 直近5), related, worklog_tail(末尾3000字), drive, paths}` | 先に Drive から取り寄せ（`sync.checkout`、`rclone copy --update`: ローカルの方が新しいファイルは上書きしない）。失敗してもローカル写しで続行し `drive={fetched:false, error, note}` で返す。`checkout` event を追記 |
 | `list_cases(workspace?, status="open", query="")` | `status`: open\|closed\|suspended\|all。`query` は id/title 部分一致 | `[{case, title, status, progress{total,done,open,plan}, last_event}]` | |
 | `plan(case, objective, tasks[], reason, workspace?, agent?)` | `tasks: [{title, owner?: ai\|human, carried_from?: "T012"}]` | 新版の plan（`superseded: [...]` を含む） | 版番号は自動。`carried_from` で引き継がれなかった open/doing/blocked は前版で `superseded`。未知の `carried_from` は拒否 |
 | `update_task(case, task, status, evidence[]?, note?, workspace?, agent?)` | `status`: open\|doing\|blocked\|done\|dropped | 更新後の task | `done` は `evidence` 必須（各要素は `{type: commit\|pr\|file\|test\|url, ...}`）。存在しない task・計画未作成は拒否。event（started/done/dropped/progress）を追記 |

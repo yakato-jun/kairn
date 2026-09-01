@@ -8,6 +8,9 @@
   kairn cases [<ws>] [--all]
   kairn new <case id> "<title>" [--ws <ws>]
   kairn checkout <ws> [<case>] | checkin <ws> [<case>] | index <ws> | drive-index <ws>
+  kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮（30 分以上更新のないもの）
+  kairn raw-move <ws> [<case>] [--dry-run]  # 生データ（rules.raw_data）を Drive へ移動し、所在を案件に記録
+  kairn daily <ws> [--dry-run]              # bag2zst -> checkin -> raw-move -> drive-index -> index（systemd timer 用）
   kairn serve [--port 8765]              # MCP + UI
   kairn install-skill                    # skills/kairn を ~/.agents/skills に置き ~/.claude/skills からリンク
 """
@@ -167,6 +170,41 @@ def cmd_sync(a):
         print(Index(ws.index_dir, ws.cases_dir).rebuild(full=a.full))
     elif a.cmd == "drive-index":
         print(sync.drive_index(conf, ws))
+    elif a.cmd == "bag2zst":
+        r = sync.bag2zst(conf, ws, a.case, dry=a.dry_run)
+        if not r["enabled"]:
+            print("bag_to_zst is disabled (rules.bag_to_zst: false)"); return
+        for x in r["done"]:
+            print(f"{'[dry] ' if a.dry_run else ''}{x['src']} -> {x['dst']} ({x['bytes']} bytes)")
+        for x in r["errors"]:
+            print(f"ERROR {x['src']}: {x['error']}", file=sys.stderr)
+        print(f"{len(r['done'])} compressed, {len(r['errors'])} errors")
+        if r["errors"]:
+            sys.exit(1)
+    elif a.cmd == "raw-move":
+        r = sync.raw_move(conf, ws, a.case, dry=a.dry_run)
+        errors = 0
+        for cid, c in r["cases"].items():
+            if c.get("error"):
+                errors += 1; print(f"ERROR {cid}: {c['error']}", file=sys.stderr); continue
+            if not c["planned"]:
+                continue
+            if a.dry_run:
+                print(f"[dry] {cid}: {len(c['planned'])} file(s) -> {c['drive']}")
+                for rel in c["planned"]:
+                    print(f"  {rel}")
+            else:
+                print(f"{cid}: moved {len(c['moved'])}/{len(c['planned'])} file(s), {c['bytes']} bytes -> {c['drive']}")
+        print(f"total: {r['files']} file(s), {r['bytes']} bytes{' (dry-run)' if a.dry_run else ''}")
+        if errors:
+            sys.exit(1)
+    elif a.cmd == "daily":
+        r = sync.daily(conf, ws, dry=a.dry_run)
+        for name, st in r["steps"].items():
+            print(f"{name}: {'ok' if st['ok'] else 'ERROR ' + st['error']}")
+        print(f"daily {'ok' if r['ok'] else 'FAILED'} ({r['started']} .. {r['finished']}), log: {ws.index_dir / 'daily.log'}")
+        if not r["ok"]:
+            sys.exit(1)
 
 
 def cmd_serve(a):
@@ -196,8 +234,9 @@ def main() -> None:
     s = sub.add_parser("status"); s.set_defaults(f=cmd_status)
     s = sub.add_parser("cases"); s.add_argument("ws", nargs="?"); s.add_argument("--all", action="store_true"); s.set_defaults(f=cmd_cases)
     s = sub.add_parser("new"); s.add_argument("id"); s.add_argument("title"); s.add_argument("--ws"); s.set_defaults(f=cmd_new)
-    for name in ("checkout", "checkin", "index", "drive-index"):
+    for name in ("checkout", "checkin", "index", "drive-index", "bag2zst", "raw-move"):
         s = sub.add_parser(name); s.add_argument("ws", nargs="?"); s.add_argument("case", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.add_argument("--full", action="store_true"); s.set_defaults(f=cmd_sync)
+    s = sub.add_parser("daily", help="bag2zst -> checkin -> raw-move -> drive-index -> index"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8765); s.set_defaults(f=cmd_serve)
     s = sub.add_parser("install-skill"); s.set_defaults(f=cmd_install_skill)
     a = ap.parse_args()

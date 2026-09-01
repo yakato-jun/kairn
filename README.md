@@ -26,11 +26,11 @@
 
 ```
 kairn/                 パッケージ（config / store / index / server(MCP) / ui / sync。extract は段階 7）
-config/workspaces.yaml ワークスペース定義（機密なし）
+config/config.example.yaml  環境ローカル設定の書式例（架空名）。実体は ~/.config/kairn/config.yaml（kairn のコマンドが書く。コミットしない）
+contrib/systemd/       日次同期の systemd user unit（kairn-daily.service / .timer）
 workspaces/<ws>/       データ実体（.gitignore、Drive 同期）
   cases/<case>/        worklog.md、作業ファイル、plan/、events.jsonl
-  index/               各環境で再生成する索引（sqlite 等）
-  drive-index.txt      Drive 上の全ファイル一覧
+  index/               各環境で再生成する索引（kairn.sqlite）、drive-index.txt、daily.log、raw-moved-YYYYMMDD.txt
 skills/kairn/SKILL.md  各エージェント共通の運用手順（~/.agents/skills/kairn へ配置、~/.claude/skills はリンク）
 docs/                  データモデル・MCP ツール・UI の仕様
 ```
@@ -44,8 +44,33 @@ docs/                  データモデル・MCP ツール・UI の仕様
 | OpenCode | `~/.claude/skills` / `~/.agents/skills` を自動で読む | `opencode.json` `"mcp": {"kairn": {"type":"remote","url":…}}` |
 
 リポジトリ側の CLAUDE.md / AGENTS.md には「このリポジトリは kairn ワークスペース `<ws>` に属する」
-の数行だけを書き、対応表は `config/workspaces.yaml` を正とする。
+の数行だけを書き、対応表は各環境の `~/.config/kairn/config.yaml`（`kairn attach` が書く）を正とする。
+
+## 同期（sync）
+
+テキスト層（worklog / case.json / plan / events 等）は `checkout` / `checkin` で Drive と往復する。生データ層
+（`rules.raw_data`: 拡張子が bag/zst/… **または** `min_size` 超、かつ更新から `min_age` 超）はテキスト層の同期から除外し、
+`raw-move` で Drive へ**移動**（ローカルから削除）して所在を案件に記録する。
+
+```
+kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active → <name>.zst（zstd -T0 -6、検証後に置換、mtime 引き継ぎ。30 分以内に更新されたものは対象外）
+kairn raw-move <ws> [<case>] [--dry-run]  # rclone move → <remote>:<root>/<ws>/cases/<case>/…。移動後に case.json.data[]、worklog.md の
+                                          #   「## Data location」（case.json が無ければ DATA.md）、index/raw-moved-YYYYMMDD.txt、progress event に記録
+kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move → drive-index → index を順に実行。段が失敗しても次へ進み、index/daily.log に記録
+```
+
+- 復元: `rclone copy <remote>:<root>/<ws>/cases/<case>/<file> <案件ディレクトリ>/`（Data location の行と UI に表示）。
+- `checkout` は `rclone copy --update`（ローカルの方が新しいファイルは上書きしない）。`open_case` が毎回 checkout するため。
+- 帯域制限は `rules.bwlimit`（例 `"08:00,4M 20:00,off"`。rclone の `--bwlimit` にそのまま渡す）。
+- 日次実行（systemd user timer、毎日 12:30 ± 10 分、停止中だった分は次回起動時に実行）:
+  ```
+  cp contrib/systemd/kairn-daily.{service,timer} ~/.config/systemd/user/
+  sed -i 's/<workspace>/acme/' ~/.config/systemd/user/kairn-daily.service   # 自分のワークスペース名に
+  systemctl --user daemon-reload && systemctl --user enable --now kairn-daily.timer
+  systemctl --user list-timers kairn-daily.timer; journalctl --user -u kairn-daily
+  ```
 
 ## 状態
 
-段階 1（config / store / index / server(MCP, mcp 2.x) / ui）完了（2026-09-02）。sync の生データ退避・skill 配置・extract は未着手。実装順は docs/roadmap.md。
+段階 1（config / store / index / server(MCP, mcp 2.x) / ui）完了（2026-09-02）。段階 5（sync: bag2zst / raw-move / daily / systemd timer）完了（2026-09-02）。
+skill 配置・extract は未着手。実装順は docs/roadmap.md。

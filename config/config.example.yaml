@@ -1,0 +1,42 @@
+# kairn 環境ローカル設定の【例】（書式のみ。架空名）。
+# 実体は ~/.config/kairn/config.yaml に置く（リポジトリにはコミットしない。顧客名・ローカルパスを含むため）。
+# 人は編集しない。`kairn setup` / `kairn attach` / `kairn detach` が書く。
+# drive.remote は `kairn setup --remote <name>` が書く。kairn はここに書かれた remote 以外を使わない。
+drive:
+  remote: my-drive               # rclone の remote 名（利用者ごと）
+  root: ws                       # <remote>:ws/<workspace>/ に各ワークスペースを置く
+
+extract:
+  agent: claude                  # 抽出に使う子エージェント: claude | codex | opencode | antigravity
+
+# 同期・退避の共通規則（省略時は kairn/config.py の DEFAULT_RULES）
+rules:
+  exclude:                       # 同期・移動しない（ビルド産物等）
+    - "**/target/**"
+    - "**/build/**"
+    - "**/__pycache__/**"
+    - "**/node_modules/**"
+    - "**/.venv/**"
+    - "*.o"
+    - "*.rlib"
+    - "*.pyc"
+  raw_data:                      # 生データ層: `kairn raw-move` / `kairn daily` で Drive へ移動（ローカルから削除）する対象
+    extensions: [bag, zst, pgm, npz, zip, gz, tar, active, pcd, mp4]
+    min_size: 50M                # 拡張子に関わらずこのサイズ超は生データ扱い（rclone の表記: k / M / G）
+    min_age: 14d                 # 更新からこの期間を過ぎたものだけ移動（rclone の表記: h / d / w）
+  bag_to_zst: true               # *.bag / *.bag.active は zstd 圧縮（<name>.zst）してから扱う
+  # bwlimit: "08:00,4M 20:00,off"   # 任意。rclone の --bwlimit にそのまま渡す（時間帯別の帯域制限）
+
+# ワークスペース（顧客・会社ごとに 1 つ）。repos は `kairn attach <ws> [<repo>...]` が書く。
+# kairn は、ここに載っていないパスに対しては何もしない。
+workspaces:
+  acme:
+    description: "ACME 向けの開発（複数リポジトリで 1 ワークスペース）"
+    repos:                       # 所属リポジトリ（絶対パス）。各リポジトリの <link_name>/ を cases/ へのリンクにする
+      - /home/user/acme-robot
+      - /home/user/acme-tools
+    link_name: tmp
+  personal:
+    description: "顧客横断の個人ログ。他ワークスペースからは明示指定でのみ参照"
+    repos: []
+    link_name: tmp

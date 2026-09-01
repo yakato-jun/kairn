@@ -3,15 +3,28 @@
 - checkout(ws[, case]):  <remote>:<root>/<ws>/cases[/<case>] -> local（テキスト層のみ、削除は追従しない）
 - checkin(ws[, case]):   local -> remote（テキスト層 sync。削除は _deleted/<日付>/ へ退避）
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
-生データ（raw）の移動は別コマンド（roadmap 5）。ここでは扱わない。
+- bag2zst(ws[, case]):   *.bag / *.bag.active を zstd 圧縮（<name>.zst、mtime 引き継ぎ、元は削除）
+- raw_move(ws[, case]):  生データ（rules.raw_data）を rclone move で Drive へ移動し、所在を case.json / worklog に記録
+- daily(ws):             bag2zst -> checkin -> raw_move -> drive_index -> index rebuild（失敗しても次段へ。index/daily.log）
+
+生データ判定は既存の _filters（テキスト層の除外）と同じ規則: (拡張子が raw_data.extensions に含まれる OR
+サイズが min_size 超) AND 更新から min_age 超。rclone には include パスとサイズパスの 2 回に分けて渡す
+（1 回の呼び出しでは --include と --min-size が AND になるため）。
 """
 from __future__ import annotations
 
 import datetime as _dt
+import json
+import os
+import re
+import shutil
 import subprocess
+import time
+import traceback
 from pathlib import Path
 
 from .config import Config, Workspace
+from .store import CaseStore, now_iso
 
 
 class RcloneError(RuntimeError):
@@ -30,6 +43,12 @@ def _filters(conf: Config) -> list[str]:
     return args
 
 
+def _bw(conf: Config) -> list[str]:
+    """帯域制限（任意）。rules.bwlimit をそのまま rclone の --bwlimit に渡す。"""
+    bw = conf.rules.get("bwlimit")
+    return ["--bwlimit", str(bw)] if bw else []
+
+
 def _run(cmd: list[str], dry: bool = False) -> subprocess.CompletedProcess:
     if dry:
         cmd = cmd + ["--dry-run"]
@@ -43,7 +62,9 @@ def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
     src = conf.drive_path(ws.name, "cases", *( [case] if case else [] ))
     dst = ws.cases_dir / case if case else ws.cases_dir
     dst.mkdir(parents=True, exist_ok=True)
-    r = _run(["rclone", "copy", src, str(dst), "--fast-list", "--transfers", "8", "--stats-one-line", "-v", *_filters(conf)], dry)
+    # --update: 宛先（ローカル）の方が新しいファイルは上書きしない（open_case が毎回 checkout するため）
+    r = _run(["rclone", "copy", src, str(dst), "--update", "--fast-list", "--transfers", "8", "--stats-one-line", "-v",
+              *_filters(conf), *_bw(conf)], dry)
     return (r.stderr or r.stdout).strip()[-400:]
 
 
@@ -54,7 +75,7 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     dst = conf.drive_path(ws.name, "cases", *( [case] if case else [] ))
     backup = conf.drive_path(ws.name, "_deleted", _dt.date.today().isoformat())
     r = _run(["rclone", "sync", str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
-              "--stats-one-line", "-v", *_filters(conf)], dry)
+              "--stats-one-line", "-v", *_filters(conf), *_bw(conf)], dry)
     return (r.stderr or r.stdout).strip()[-400:]
 
 
@@ -94,3 +115,301 @@ def create_ws_on_drive(conf: Config, ws_name: str) -> None:
 def list_ws_on_drive(conf: Config) -> list[str]:
     r = subprocess.run(["rclone", "lsf", "--dirs-only", f"{conf.remote}:{conf.drive_root}"], capture_output=True, text=True)
     return [x.rstrip("/") for x in r.stdout.split()] if r.returncode == 0 else []
+
+
+# ---------------------------------------------------------------------------
+# 生データ層（raw）: 判定・圧縮・移動
+# ---------------------------------------------------------------------------
+
+_SIZE_UNITS = {"b": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4, "p": 1024 ** 5}
+_AGE_UNITS = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400, "M": 30 * 86400, "y": 365 * 86400}
+BAG_MIN_AGE_SEC = 30 * 60  # 更新から 30 分未満の bag は書き込み中とみなして圧縮しない
+
+
+def parse_size(v) -> int:
+    """rclone の SizeSuffix 表記（'50M', '1.5G', '100k'）→ bytes。単位なしは rclone と同じく KiB。"""
+    if isinstance(v, (int, float)):
+        return int(v * 1024)
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([bBkKmMgGtTpP])?(?:i?[bB])?\s*", str(v))
+    if not m:
+        raise ValueError(f"invalid size: {v!r} (expected e.g. 50M, 1G, 100k)")
+    n, unit = float(m.group(1)), (m.group(2) or "k").lower()
+    return int(n * _SIZE_UNITS[unit])
+
+
+def parse_age(v) -> float:
+    """rclone の Duration 表記（'14d', '12h', '2w', '1M', '1y'）→ 秒。単位なしは秒。"""
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w|M|y)?\s*", str(v))
+    if not m:
+        raise ValueError(f"invalid age: {v!r} (expected e.g. 14d, 12h, 2w)")
+    return float(m.group(1)) * _AGE_UNITS[m.group(2) or "s"]
+
+
+def raw_rules(conf: Config) -> dict:
+    """rules.raw_data を解釈した形: {extensions: [...], min_size: bytes, min_age: sec, min_size_str, min_age_str}"""
+    raw = conf.rules.get("raw_data") or {}
+    exts = [str(e).lstrip(".").lower() for e in raw.get("extensions", [])]
+    return {"extensions": exts,
+            "min_size": parse_size(raw["min_size"]) if raw.get("min_size") else None, "min_size_str": str(raw.get("min_size") or ""),
+            "min_age": parse_age(raw["min_age"]) if raw.get("min_age") else 0.0, "min_age_str": str(raw.get("min_age") or "")}
+
+
+def is_raw(path: Path, rules: dict, now: float | None = None) -> bool:
+    """生データか: (拡張子が対象 OR サイズが min_size 超) AND 更新から min_age 超。シンボリックリンクは対象外。"""
+    if path.is_symlink() or not path.is_file():
+        return False
+    st = path.stat()
+    now = time.time() if now is None else now
+    if now - st.st_mtime <= rules["min_age"]:
+        return False
+    ext = path.name.rsplit(".", 1)[-1].lower() if "." in path.name else ""
+    by_ext = ext in rules["extensions"]
+    by_size = rules["min_size"] is not None and st.st_size > rules["min_size"]
+    return by_ext or by_size
+
+
+def _case_dirs(ws: Workspace, case: str | None) -> list[Path]:
+    if case:
+        d = ws.cases_dir / case
+        if not d.is_dir():
+            raise RcloneError(f"no such case directory: {d}")
+        return [d]
+    if not ws.cases_dir.exists():
+        return []
+    return sorted(p for p in ws.cases_dir.iterdir() if p.is_dir() and not p.is_symlink() and not p.name.startswith("."))
+
+
+def _walk_files(root: Path):
+    """root 配下の通常ファイル（シンボリックリンクのディレクトリ・ファイルは辿らない）。"""
+    for r, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(r, d))]
+        for fn in files:
+            p = Path(r) / fn
+            if not p.is_symlink() and p.is_file():
+                yield p
+
+
+def bag_candidates(root: Path, now: float | None = None) -> list[Path]:
+    """圧縮対象: *.bag / *.bag.active のうち更新から 30 分以上経ったもの（.part / .zst 済みは除く）。"""
+    now = time.time() if now is None else now
+    out = []
+    for p in _walk_files(root):
+        if not (p.name.endswith(".bag") or p.name.endswith(".bag.active")):
+            continue
+        if (p.with_name(p.name + ".zst")).exists():
+            continue
+        if now - p.stat().st_mtime < BAG_MIN_AGE_SEC:
+            continue
+        out.append(p)
+    return sorted(out)
+
+
+def compress_bag(src: Path) -> Path:
+    """zstd -T0 -6 で <name>.zst に圧縮（.part に書き、zstd -t で検証後 rename）。mtime を引き継ぎ、元を削除。"""
+    if not shutil.which("zstd"):
+        raise RuntimeError("zstd command not found")
+    dst = src.with_name(src.name + ".zst")
+    part = dst.with_name(dst.name + ".part")
+    st = src.stat()
+    try:
+        r = subprocess.run(["zstd", "-T0", "-6", "-q", "-f", "-o", str(part), str(src)], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"zstd failed for {src}: {(r.stderr or r.stdout).strip()[-400:]}")
+        t = subprocess.run(["zstd", "-t", "-q", str(part)], capture_output=True, text=True)
+        if t.returncode != 0:
+            raise RuntimeError(f"zstd -t failed for {part}: {(t.stderr or t.stdout).strip()[-400:]}")
+        os.replace(part, dst)
+    except BaseException:
+        if part.exists():
+            part.unlink()
+        raise
+    os.utime(dst, (st.st_atime, st.st_mtime))
+    src.unlink()
+    return dst
+
+
+def bag2zst(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False) -> dict:
+    """ワークスペース（または 1 案件）内の bag を圧縮。rules.bag_to_zst が false なら何もしない。
+    返り値: {enabled, dry, done: [{src, dst, bytes}], skipped: N, errors: [{src, error}]}"""
+    out: dict = {"enabled": bool(conf.rules.get("bag_to_zst", True)), "dry": dry, "done": [], "errors": []}
+    if not out["enabled"]:
+        return out
+    for d in _case_dirs(ws, case):
+        for src in bag_candidates(d):
+            rel = str(src.relative_to(ws.cases_dir))
+            if dry:
+                out["done"].append({"src": rel, "dst": rel + ".zst", "bytes": src.stat().st_size, "dry": True})
+                continue
+            try:
+                size = src.stat().st_size
+                dst = compress_bag(src)
+                out["done"].append({"src": rel, "dst": str(dst.relative_to(ws.cases_dir)), "bytes": size, "zst_bytes": dst.stat().st_size})
+            except Exception as e:  # 1 件の失敗で残りを止めない
+                out["errors"].append({"src": rel, "error": str(e)})
+    return out
+
+
+def _raw_filter_sets(conf: Config, rr: dict) -> list[list[str]]:
+    """rclone に渡すフィルタ（OR を 2 回の呼び出しで表現）。両方に rules.exclude と --min-age を付ける。
+    --include と --exclude の併用は rclone が「順序不定」と警告する（実測で除外が効かない）ため、
+    順序が確定する --filter 規則（'- <exclude>' → '+ *.{ext}' → '- **'）で組む。"""
+    excl: list[str] = []
+    for pat in conf.rules.get("exclude", []):
+        excl += ["--filter", f"- {pat}"]
+    age = ["--min-age", rr["min_age_str"]] if rr["min_age_str"] else []
+    sets = []
+    if rr["extensions"]:
+        sets.append(excl + ["--filter", "+ *.{" + ",".join(rr["extensions"]) + "}", "--filter", "- **"] + age)
+    if rr["min_size_str"]:
+        sets.append(excl + ["--min-size", rr["min_size_str"]] + age)
+    return sets
+
+
+def _lsf_local(src: Path, filt: list[str]) -> dict[str, int]:
+    """rclone lsf（同じフィルタ）でローカル側の移動対象を列挙 → {相対パス: bytes}"""
+    r = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--format", "ps", "--separator", "\t", str(src), *filt],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RcloneError((r.stderr or r.stdout).strip()[-800:])
+    out: dict[str, int] = {}
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        p, *rest = line.split("\t")
+        try:
+            out[p] = int(rest[0]) if rest else 0
+        except ValueError:
+            out[p] = 0
+    return out
+
+
+def _human(n: int) -> str:
+    x = float(n)
+    for u in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if x < 1024 or u == "TiB":
+            return f"{x:.0f} {u}" if u == "B" else f"{x:.1f} {u}"
+        x /= 1024
+    return f"{n} B"
+
+
+def _append_data_location(path: Path, line: str, title: str) -> None:
+    """worklog.md の `## Data location` 節（無ければ末尾に作る）の末尾に 1 行追記。DATA.md（無ければ作る）にも使う。"""
+    text = path.read_text(encoding="utf-8") if path.exists() else f"# {title}\n"
+    lines = text.splitlines()
+    head = next((i for i, l in enumerate(lines) if l.strip() == "## Data location"), None)
+    if head is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += ["## Data location", line]
+    else:
+        end = next((i for i in range(head + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        while end > head + 1 and not lines[end - 1].strip():
+            end -= 1
+        lines.insert(end, line)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def record_data_location(ws: Workspace, case_dir: Path, drive: str, moved: dict[str, int], list_rel: str) -> dict:
+    """移動結果を案件に記録: case.json.data[] ＋ worklog.md の Data location（case.json 無しなら DATA.md）＋ progress event。"""
+    n, b = len(moved), sum(moved.values())
+    entry = {"drive": drive, "files": n, "bytes": b, "moved_at": now_iso(), "list": list_rel}
+    line = (f"- {entry['moved_at'][:10]}: {n} file(s), {_human(b)} moved to `{drive}` (list: {list_rel}). "
+            f"restore: `rclone copy {drive}<file> <local case dir>/`")
+    store = CaseStore(ws.cases_dir)
+    if (case_dir / "case.json").exists():
+        case = store.load_case(case_dir.name)
+        case.setdefault("data", []).append(entry)
+        store.save_case(case)
+        _append_data_location(case_dir / "worklog.md", line, case.get("title", case_dir.name))
+        store.append_event(case_dir.name, {"actor": "kairn", "agent": "sync", "action": "progress",
+                                           "note": f"raw_move: {n} file(s), {_human(b)} -> {drive}", "data": entry})
+    else:
+        _append_data_location(case_dir / "DATA.md", line, f"{case_dir.name} — data location")
+    return entry
+
+
+def raw_move(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False) -> dict:
+    """生データを Drive へ移動（rclone move。転送後にハッシュ照合してローカルを削除するのは rclone）。
+    返り値: {dry, cases: {case: {planned: [...], moved: [...], bytes, drive, error?}}, files, bytes}"""
+    rr = raw_rules(conf)
+    sets = _raw_filter_sets(conf, rr)
+    out: dict = {"dry": dry, "cases": {}, "files": 0, "bytes": 0}
+    if not sets:
+        return out
+    today = _dt.date.today().strftime("%Y%m%d")
+    list_rel = f"index/raw-moved-{today}.txt"
+    for d in _case_dirs(ws, case):
+        drive = conf.drive_path(ws.name, "cases", d.name) + "/"
+        summary: dict = {"planned": [], "moved": [], "bytes": 0, "drive": drive}
+        out["cases"][d.name] = summary
+        try:
+            planned: dict[str, int] = {}
+            for filt in sets:
+                for rel, size in _lsf_local(d, filt).items():
+                    p = d / rel
+                    if is_raw(p, rr):  # rclone の判定と一致することを確認（不一致は移動しない）
+                        planned[rel] = size or p.stat().st_size
+            summary["planned"] = sorted(planned)
+            if not planned:
+                continue
+            for filt in sets:
+                _run(["rclone", "move", str(d), drive, "--fast-list", "--transfers", "4", "--stats-one-line", "-v",
+                      *filt, *_bw(conf)], dry)
+            if dry:
+                continue
+            moved = {rel: size for rel, size in planned.items() if not (d / rel).exists()}
+            summary["moved"] = sorted(moved)
+            summary["bytes"] = sum(moved.values())
+            if not moved:
+                continue
+            lst = ws.data_dir / list_rel
+            lst.parent.mkdir(parents=True, exist_ok=True)
+            with lst.open("a", encoding="utf-8") as fh:
+                for rel in sorted(moved):
+                    fh.write(f"{d.name}/{rel}\t{moved[rel]}\t{drive}{rel}\n")
+            summary["record"] = record_data_location(ws, d, drive, moved, list_rel)
+            out["files"] += len(moved)
+            out["bytes"] += summary["bytes"]
+        except Exception as e:
+            summary["error"] = str(e)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 日次同期
+# ---------------------------------------------------------------------------
+
+def daily(conf: Config, ws: Workspace, dry: bool = False) -> dict:
+    """bag2zst -> checkin -> raw_move -> drive_index -> index rebuild。各段の結果と例外を index/daily.log に追記し、
+    失敗しても次段へ進む。返り値: {workspace, started, finished, dry, ok, steps: {name: {ok, result|error}}}"""
+    from .index import Index
+    ws.index_dir.mkdir(parents=True, exist_ok=True)
+    log = ws.index_dir / "daily.log"
+    steps = [
+        ("bag2zst", lambda: bag2zst(conf, ws, dry=dry)),
+        ("checkin", lambda: checkin(conf, ws, dry=dry)),
+        ("raw_move", lambda: raw_move(conf, ws, dry=dry)),
+        ("drive_index", lambda: str(drive_index(conf, ws))),
+        ("index", lambda: Index(ws.index_dir, ws.cases_dir).rebuild()),
+    ]
+    out: dict = {"workspace": ws.name, "started": now_iso(), "dry": dry, "ok": True, "steps": {}}
+
+    def _log(msg: str) -> None:
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(f"{now_iso()} {msg}\n")
+
+    _log(f"daily start ws={ws.name} dry={dry}")
+    for name, fn in steps:
+        try:
+            res = fn()
+            out["steps"][name] = {"ok": True, "result": res}
+            _log(f"{name}: ok {json.dumps(res, ensure_ascii=False, default=str)[:2000]}")
+        except Exception as e:
+            out["ok"] = False
+            out["steps"][name] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            _log(f"{name}: ERROR {type(e).__name__}: {e}\n{traceback.format_exc()}")
+    out["finished"] = now_iso()
+    _log(f"daily end ok={out['ok']}")
+    return out

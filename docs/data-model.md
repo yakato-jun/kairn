@@ -26,10 +26,19 @@ workspaces/<ws>/
   "tickets": ["CASE-123"], "prs": [42],
   "related": ["CASE-100", "CASE-118"],      // 人／AI が明示的に書く関係（抽出に頼らない）
   "elements": {"machine": ["unit-2"], "component": ["acme-plc"], "symptom": ["起動時に driver init 未完了"]},
-  "data": [{"drive": "ws/acme/cases/CASE-123/...", "moved_at": "2026-09-01"}],
+  "data": [{"drive": "my-drive:ws/acme/cases/CASE-123/", "files": 3, "bytes": 1234567890,
+            "moved_at": "2026-09-01T12:30:00+09:00", "list": "index/raw-moved-20260901.txt"}],
   "created_at": "...", "updated_at": "...", "current_plan": 3
 }
 ```
+
+### data[]（生データの所在。`kairn raw-move` / `kairn daily` が追記する）
+- `drive`: 移動先（`<remote>:<root>/<ws>/cases/<case>/`。案件ディレクトリの相対構造をそのまま保つ）
+- `files` / `bytes`: その回に移動した件数・容量。`moved_at`: ISO 8601
+- `list`: 移動したファイルの一覧（ワークスペースの data_dir からの相対パス。1 行 `<case>/<相対パス>\t<bytes>\t<drive パス>`。同じ日の分は追記）
+- 同じ内容を `worklog.md` の `## Data location` 節（無ければ末尾に作る）に 1 行（日付・件数・容量・Drive パス・復元コマンド）で書く。
+  case.json の無いディレクトリでは `DATA.md` に同じ行を書く。events には `{"actor": "kairn", "agent": "sync", "action": "progress", "data": {…}}` を追記する。
+- 復元: `rclone copy <drive><file> <案件ディレクトリ>/`
 
 ## plan/vNNNN.json（計画の版）
 ```json

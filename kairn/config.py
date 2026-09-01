@@ -22,7 +22,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = Path(os.environ.get("KAIRN_DATA_ROOT", ROOT / "workspaces"))
 USER_CONFIG_PATH = Path(os.environ.get("KAIRN_CONFIG", os.path.expanduser("~/.config/kairn/config.yaml")))
-EXAMPLE_CONFIG_PATH = ROOT / "config" / "workspaces.example.yaml"
+EXAMPLE_CONFIG_PATH = ROOT / "config" / "config.example.yaml"
 
 DEFAULT_RULES = {
     "exclude": ["**/target/**", "**/build/**", "**/__pycache__/**", "**/node_modules/**", "**/.venv/**", "*.o", "*.rlib", "*.pyc"],
