@@ -1,7 +1,7 @@
 """環境ローカル設定（~/.config/kairn/config.yaml）。人は編集しない。kairn のコマンドが書く。
 
   drive:      {remote: <rclone remote>, root: ws}          kairn setup --remote が書く
-  extract:    {agent: claude|codex|opencode|antigravity}   kairn setup --agent
+  extract:    {agent: claude|codex|opencode|antigravity, timeout: 600}   kairn setup --agent / --extract-timeout（秒）
   workspaces: {<name>: {repos: [<abs path> | {path: <abs path>} | {glob: <pattern>} | {exclude: <abs path>} ...], link_name: tmp}}
               kairn attach / detach が書く（glob: は展開時にディレクトリだけ採る。exclude: は glob: の展開から外す（detach が書く）。
               未知のキー・空文字は拒否）
@@ -33,6 +33,7 @@ DEFAULT_RULES = {
     "raw_data": {"extensions": ["bag", "zst", "pgm", "npz", "zip", "gz", "tar", "active", "pcd", "mp4"], "min_size": "50M", "min_age": "14d"},
     "bag_to_zst": True,
 }
+DEFAULT_EXTRACT_TIMEOUT_SEC = 600  # extract の子エージェントのタイムアウト（秒）。extract.timeout
 
 
 @dataclass
@@ -90,6 +91,7 @@ class Config:
     rules: dict
     workspaces: dict[str, Workspace]
     path: Path = USER_CONFIG_PATH
+    extract_timeout: int = DEFAULT_EXTRACT_TIMEOUT_SEC
 
     def drive_path(self, ws: str, *parts: str) -> str:
         return f"{self.remote}:{'/'.join([self.drive_root, ws, *parts]).strip('/')}"
@@ -109,7 +111,7 @@ class Config:
     def to_dict(self) -> dict:
         return {
             "drive": {"remote": self.remote, "root": self.drive_root},
-            "extract": {"agent": self.extract_agent},
+            "extract": {"agent": self.extract_agent, "timeout": self.extract_timeout},
             "rules": self.rules,
             "workspaces": {
                 n: {"description": w.description, "repos": list(w.repo_specs), "link_name": w.link_name}
@@ -176,8 +178,12 @@ def _parse(raw: dict, path: Path) -> Config:
         repos = expand_repos(specs, name)
         wss[name] = Workspace(name=name, description=w.get("description", ""), repos=repos, repo_specs=specs, link_name=w.get("link_name", "tmp"))
     rules = {**DEFAULT_RULES, **(raw.get("rules") or {})}
-    return Config(remote=remote, drive_root=drive.get("root", "ws"), extract_agent=(raw.get("extract") or {}).get("agent", "claude"),
-                  rules=rules, workspaces=wss, path=path)
+    ext = raw.get("extract") or {}
+    timeout = ext.get("timeout", DEFAULT_EXTRACT_TIMEOUT_SEC)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise SystemExit(f"kairn: extract.timeout must be a positive integer (seconds), got {timeout!r}")
+    return Config(remote=remote, drive_root=drive.get("root", "ws"), extract_agent=ext.get("agent", "claude"),
+                  rules=rules, workspaces=wss, path=path, extract_timeout=timeout)
 
 
 def load(path: Path | None = None) -> Config:
@@ -187,11 +193,17 @@ def load(path: Path | None = None) -> Config:
     return _parse(yaml.safe_load(path.read_text(encoding="utf-8")) or {}, path)
 
 
-def create(remote: str, agent: str = "claude", path: Path | None = None, drive_root: str = "ws") -> Config:
+def create(remote: str, agent: str = "claude", path: Path | None = None, drive_root: str = "ws",
+           extract_timeout: int | None = None) -> Config:
+    """設定を書く（既存の rules / workspaces / extract.timeout は引き継ぐ）。extract_timeout=None なら既存値（無ければ既定 600）。"""
     path = path or USER_CONFIG_PATH
     existing = load(path) if path.exists() else None
+    if extract_timeout is None:
+        extract_timeout = existing.extract_timeout if existing else DEFAULT_EXTRACT_TIMEOUT_SEC
+    if extract_timeout <= 0:
+        raise SystemExit(f"kairn: extract timeout must be a positive integer (seconds), got {extract_timeout!r}")
     conf = Config(remote=remote, drive_root=drive_root, extract_agent=agent, rules=dict(existing.rules if existing else DEFAULT_RULES),
-                  workspaces=dict(existing.workspaces if existing else {}), path=path)
+                  workspaces=dict(existing.workspaces if existing else {}), path=path, extract_timeout=extract_timeout)
     conf.save()
     return conf
 

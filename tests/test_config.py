@@ -81,3 +81,40 @@ def test_assert_data_not_tracked_checks_data_root(tmp_path):
         cfg.assert_data_not_tracked(repo / "data")
     with pytest.raises(SystemExit):
         cfg.assert_data_not_tracked(repo / "data" / "acme")          # 配下でも検出
+
+
+def test_extract_timeout_setting(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("drive: {remote: my-drive}\nworkspaces: {}\n", encoding="utf-8")
+    assert cfg.load(p).extract_timeout == 600                                   # 既定
+    p.write_text("drive: {remote: my-drive}\nextract: {agent: codex, timeout: 42}\nworkspaces: {}\n", encoding="utf-8")
+    conf = cfg.load(p)
+    assert conf.extract_timeout == 42 and conf.extract_agent == "codex"
+    conf.save()
+    assert "timeout: 42" in p.read_text(encoding="utf-8")
+    assert cfg.create("my-drive", "claude", path=p).extract_timeout == 42        # 省略時は既存値を保つ
+    assert cfg.create("my-drive", "claude", path=p, extract_timeout=90).extract_timeout == 90
+    assert cfg.load(p).extract_timeout == 90
+    for bad in ("0", "-1", "'10'", "true", "1.5"):
+        p.write_text(f"drive: {{remote: my-drive}}\nextract: {{timeout: {bad}}}\nworkspaces: {{}}\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match="extract.timeout"):
+            cfg.load(p)
+    with pytest.raises(SystemExit):
+        cfg.create("my-drive", path=tmp_path / "new.yaml", extract_timeout=0)
+
+
+def test_cli_setup_writes_extract_timeout(tmp_path, monkeypatch, capsys):
+    from kairn import cli
+    p = tmp_path / "config.yaml"
+    monkeypatch.setattr(cfg, "rclone_remotes", lambda: ["my-drive"])
+    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", p)
+    monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
+    monkeypatch.setattr("kairn.sync.list_ws_on_drive", lambda conf: [])
+    monkeypatch.setattr("sys.argv", ["kairn", "setup", "--remote", "my-drive", "--agent", "codex", "--extract-timeout", "120"])
+    cli.main()
+    assert "extract.timeout=120s" in capsys.readouterr().out
+    conf = cfg.load(p)
+    assert conf.extract_timeout == 120 and conf.extract_agent == "codex"
+    monkeypatch.setattr("sys.argv", ["kairn", "setup", "--remote", "my-drive"])
+    cli.main()
+    assert cfg.load(p).extract_timeout == 120                                    # --extract-timeout 省略時は既存値を保つ

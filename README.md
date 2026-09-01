@@ -131,6 +131,7 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 
 案件カード（case.json）の下書き（title / summary / elements / related / 症状→部品→原因）を、**文脈隔離した子エージェント**が案件ディレクトリを読んで作る
 （docs/extract-agents.md）。使うエージェントは `~/.config/kairn/config.yaml` の `extract.agent`（`kairn setup --agent`）: claude / codex / opencode / antigravity。
+タイムアウトは `extract.timeout`（秒、既定 600。`kairn setup --extract-timeout <sec>`）。
 子プロセスは案件ディレクトリを cwd に、読み取り専用オプション・最小限の環境変数で起動し、出力は `kairn/extract/schema.json` で検証する。
 **下書きは書き込まない**。適用は UI の案件ページ「下書きを取得」→ 差分を見て「この下書きを case.json に適用」（人の操作）だけ。
 

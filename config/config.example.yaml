@@ -7,7 +7,8 @@ drive:
   root: ws                       # <remote>:ws/<workspace>/ に各ワークスペースを置く
 
 extract:
-  agent: claude                  # 抽出に使う子エージェント: claude | codex | opencode | antigravity
+  agent: claude                  # 抽出に使う子エージェント: claude | codex | opencode | antigravity（kairn setup --agent）
+  timeout: 600                   # 子エージェントのタイムアウト（秒）。kairn setup --extract-timeout <sec>
 
 # 同期・退避の共通規則（省略時は kairn/config.py の DEFAULT_RULES）
 rules:

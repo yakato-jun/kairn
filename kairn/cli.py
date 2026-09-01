@@ -1,6 +1,6 @@
 """kairn CLI（人が使う入口。設定ファイルはこのコマンドが書く）
 
-  kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity]
+  kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity] [--extract-timeout <sec>]
   kairn ws list | ws create <name>
   kairn attach <ws> [<repo path>...]     # 省略時は cwd。<repo>/<link_name> を cases/ へのリンクにする
   kairn detach [<repo path>]             # 省略時は cwd。glob: 由来なら exclude: を書いて展開から外す
@@ -42,8 +42,8 @@ def cmd_setup(a):
     if a.remote not in remotes:
         raise SystemExit(f"kairn: rclone remote {a.remote!r} not found (have: {remotes}).\n"
                          f"create it first:  rclone config create {a.remote} drive scope=drive")
-    conf = cfg.create(a.remote, a.agent)
-    print(f"config written: {conf.path}\n  remote={conf.remote} root={conf.drive_root} extract.agent={conf.extract_agent}")
+    conf = cfg.create(a.remote, a.agent, extract_timeout=a.extract_timeout)
+    print(f"config written: {conf.path}\n  remote={conf.remote} root={conf.drive_root} extract.agent={conf.extract_agent} extract.timeout={conf.extract_timeout}s")
     from . import sync
     names = sync.list_ws_on_drive(conf)
     print(f"workspaces on drive: {names or '(none)'}")
@@ -123,7 +123,7 @@ def cmd_detach(a):
 def cmd_status(a):
     conf = cfg.load()
     from .store import CaseStore
-    print(f"config: {conf.path}\nremote: {conf.remote}  root: {conf.drive_root}  extract.agent: {conf.extract_agent}")
+    print(f"config: {conf.path}\nremote: {conf.remote}  root: {conf.drive_root}  extract.agent: {conf.extract_agent}  extract.timeout: {conf.extract_timeout}s")
     here = conf.workspace_for_path(Path.cwd())
     print(f"cwd: {Path.cwd()} -> workspace: {here.name if here else '(not attached)'}")
     for ws in conf.workspaces.values():
@@ -265,7 +265,7 @@ def cmd_install_skill(a):
 def main() -> None:
     ap = argparse.ArgumentParser(prog="kairn", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("setup"); s.add_argument("--remote", required=True); s.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode", "antigravity"]); s.set_defaults(f=cmd_setup)
+    s = sub.add_parser("setup"); s.add_argument("--remote", required=True); s.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode", "antigravity"]); s.add_argument("--extract-timeout", type=int, default=None, metavar="SEC", help="extract の子エージェントのタイムアウト秒（既定 600。省略時は既存値を保つ）"); s.set_defaults(f=cmd_setup)
     s = sub.add_parser("ws"); ss = s.add_subparsers(dest="sub", required=True); ss.add_parser("list"); c = ss.add_parser("create"); c.add_argument("name"); c.add_argument("--description"); s.set_defaults(f=cmd_ws)
     s = sub.add_parser("attach"); s.add_argument("ws"); s.add_argument("repos", nargs="*"); s.set_defaults(f=cmd_attach)
     s = sub.add_parser("detach"); s.add_argument("repo", nargs="?"); s.set_defaults(f=cmd_detach)

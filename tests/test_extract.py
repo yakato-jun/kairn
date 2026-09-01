@@ -248,3 +248,14 @@ def test_apply_card_writes_case_and_decision(conf):
     assert ev == {**ev, "actor": "human", "action": "decision", "note": "applied extract draft", "confidence": 0.8}
     with pytest.raises(ValueError):
         extract.apply_card(st, "CASE-123", good_card(extra=1))
+
+
+def test_extract_card_uses_config_timeout(conf, monkeypatch):
+    """timeout を省略すると設定 extract.timeout（conf.extract_timeout）が subprocess と event に渡る。"""
+    _seed(conf); ws = conf.workspaces["acme"]
+    conf.extract_timeout = 77
+    fake = FakeRun(stdout=_claude_stdout(good_card()))
+    monkeypatch.setattr(adapters.subprocess, "run", fake)
+    r = extract.extract_card(conf, ws, "CASE-123")
+    assert r["ok"] and fake.calls[-1]["timeout"] == 77
+    assert CaseStore(ws.cases_dir).events("CASE-123")[-1]["timeout_sec"] == 77

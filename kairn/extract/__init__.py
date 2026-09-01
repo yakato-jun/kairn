@@ -20,7 +20,6 @@ import jsonschema
 from .. import config as cfg
 from ..store import CaseStore
 from . import adapters
-from .adapters import DEFAULT_TIMEOUT_SEC
 
 PROMPT_PATH = Path(__file__).with_name("prompt.md")
 SCHEMA_PATH = Path(__file__).with_name("schema.json")
@@ -82,8 +81,11 @@ def _excerpt(r: adapters.RunResult) -> str:
 
 
 def extract_card(conf: cfg.Config, ws: cfg.Workspace, case: str, agent: str | None = None,
-                 timeout: int = DEFAULT_TIMEOUT_SEC) -> dict:
-    """案件カードの下書きを子エージェントで作る（読み取りのみ。case.json には書かない。結果は events に記録）。"""
+                 timeout: int | None = None) -> dict:
+    """案件カードの下書きを子エージェントで作る（読み取りのみ。case.json には書かない。結果は events に記録）。
+    timeout（秒）は省略時に設定 `extract.timeout`（conf.extract_timeout、既定 600）。"""
+    if timeout is None:
+        timeout = conf.extract_timeout
     st = CaseStore(ws.cases_dir)
     st.load_case(case)  # 未知の案件は CaseNotFound
     case_dir = st.case_dir(case)

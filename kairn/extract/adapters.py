@@ -15,7 +15,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_TIMEOUT_SEC = 600  # docs/extract-agents.md の antigravity 例（--print-timeout 10m）に合わせる
+DEFAULT_TIMEOUT_SEC = 600  # 既定値。実際の値は設定 extract.timeout（config.DEFAULT_EXTRACT_TIMEOUT_SEC と同じ既定）を extract_card が渡す
 # 子プロセスへ渡す環境変数（最小限）。各 CLI が必要とするものはアダプタの env_keys に足す
 COMMON_ENV_KEYS = ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER",
                    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME")

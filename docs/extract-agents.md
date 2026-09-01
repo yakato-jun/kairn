@@ -39,8 +39,8 @@
   （claude: `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` / `CLAUDE_CONFIG_DIR`、codex: `OPENAI_API_KEY` /
   `OPENAI_BASE_URL` / `CODEX_HOME`、opencode: `OPENCODE_CONFIG` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`、antigravity: 追加なし）。
   それ以外（`KAIRN_*` を含む）は渡さない。
-- タイムアウトは既定 600 秒（`adapters.DEFAULT_TIMEOUT_SEC`。antigravity の `--print-timeout` には `10m` の形で渡す）。
-  `extract_card(..., timeout=)` で変えられる。設定ファイルの項目は無い。
+- タイムアウトは設定 `extract.timeout`（秒、既定 600。`kairn setup --extract-timeout <sec>` が書く。antigravity の `--print-timeout` には
+  `10m` の形で渡す）。`extract_card(..., timeout=)` を明示すればそちらが優先（テスト用）。
 - 入口: MCP `extract_card(case, workspace?)`、CLI `kairn extract <case> [--ws] [--agent] [--json]`（失敗は exit 1）、
   UI 案件ページの「下書きを取得」（結果画面で現在値との差分を見て「この下書きを case.json に適用」）。適用は UI からだけ
   （`extract.apply_card`: title / summary / elements / related / causal を置き換え、`{actor: human, action: decision, note: "applied extract draft"}`）。
