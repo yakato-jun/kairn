@@ -34,7 +34,7 @@ def test_mcp_extract_card_returns_failure_as_result(conf, monkeypatch):
             assert r.is_error and "CASE-404" in r.content[0].text
     anyio.run(main)
     assert results["fail"]["ok"] is False and results["fail"]["error"] == "exit code 1" and results["fail"]["agent"] == "claude"
-    assert results["ok"]["ok"] is True and results["ok"]["card"] == good_card()
+    assert results["ok"]["ok"] is True and results["ok"]["card"] == {**good_card(), "related_unknown": []}
     assert st.load_case("CASE-123")["title"] == "起動時に driver が初期化されない"  # MCP は書かない
     assert [e["action"] for e in st.events("CASE-123")[-2:]] == ["extract", "extract"]
 
@@ -50,7 +50,7 @@ def test_cli_extract(conf, monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["kairn", "extract", "CASE-123", "--ws", "acme", "--json"])
     cli.main()
     out = json.loads(capsys.readouterr().out)
-    assert out["ok"] is True and out["card"] == good_card() and out["agent"] == "claude"
+    assert out["ok"] is True and out["card"] == {**good_card(), "related_unknown": []} and out["agent"] == "claude"
     monkeypatch.setattr(adapters.subprocess, "run", FakeRun(stdout="x", returncode=1))
     monkeypatch.setattr("sys.argv", ["kairn", "extract", "CASE-123", "--ws", "acme", "--agent", "antigravity"])
     with pytest.raises(SystemExit) as e:

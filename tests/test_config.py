@@ -74,13 +74,36 @@ def test_assert_data_not_tracked_checks_data_root(tmp_path):
     repo = tmp_path / "repo"; (repo / "data" / "acme").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / "data" / "acme" / "case.json").write_text("{}")
-    cfg.assert_data_not_tracked(repo / "data")                       # 未追跡なら OK
+    # L-1: リポジトリ内で ignore されていない → 拒否（次の git add で入ってしまう）
+    with pytest.raises(SystemExit, match="not ignored"):
+        cfg.assert_data_not_tracked(repo / "data")
+    (repo / ".gitignore").write_text("data/\n")
+    cfg.assert_data_not_tracked(repo / "data")                       # ignore 済み・未追跡なら OK
+    cfg.assert_data_not_tracked(repo / "data" / "acme")              # 配下も ignore 扱い
     cfg.assert_data_not_tracked(tmp_path / "outside")                # リポジトリ外・存在しないなら OK
-    subprocess.run(["git", "-C", str(repo), "add", "data"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-f", "data"], check=True)
     with pytest.raises(SystemExit, match="tracked by git"):
         cfg.assert_data_not_tracked(repo / "data")
     with pytest.raises(SystemExit):
         cfg.assert_data_not_tracked(repo / "data" / "acme")          # 配下でも検出
+
+
+def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys):
+    """L-5: kairn checkout --dry-run は索引（kairn.sqlite）を書き換えない。"""
+    import subprocess
+    from kairn import cli, sync
+    from kairn.store import CaseStore
+    ws = conf.workspaces["acme"]
+    CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
+    monkeypatch.setattr(cfg, "load", lambda path=None: conf)
+    monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
+    monkeypatch.setattr(sync, "_run", lambda cmd, dry=False: subprocess.CompletedProcess(cmd, 0, "fake", ""))
+    monkeypatch.setattr("sys.argv", ["kairn", "checkout", "acme", "--dry-run"])
+    cli.main()
+    assert not (ws.index_dir / "kairn.sqlite").exists() and "index not rebuilt" in capsys.readouterr().out
+    monkeypatch.setattr("sys.argv", ["kairn", "checkout", "acme"])
+    cli.main()
+    assert (ws.index_dir / "kairn.sqlite").exists()
 
 
 def test_extract_timeout_setting(tmp_path):

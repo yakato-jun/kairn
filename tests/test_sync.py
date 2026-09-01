@@ -119,8 +119,19 @@ def test_bag_candidates(conf, tmp_path):
     _touch(case / "fresh.bag", 10, 60)                                          # 30 分未満は除外
     _touch(case / "done.bag", 10, 3600); _touch(case / "done.bag.zst", 10, 3600)  # 圧縮済みは除外
     _touch(case / "other.txt", 10, 3600)
-    sub = _touch(case / "build" / "x.bag", 10, 3600)
-    assert sync.bag_candidates(case) == sorted([old, act, sub])
+    sub = _touch(case / "nested" / "x.bag", 10, 3600)
+    _touch(case / "build" / "x.bag", 10, 3600); _touch(case / "sub" / "target" / "y.bag", 10, 3600)   # rules.exclude 配下は対象外（L-6）
+    exclude = conf.rules["exclude"]
+    assert sync.bag_candidates(case, exclude=exclude) == sorted([old, act, sub])
+    assert sync.bag_candidates(case) == sorted([old, act, sub, case / "build" / "x.bag", case / "sub" / "target" / "y.bag"])  # 明示しなければ除外なし
+
+
+def test_bag2zst_skips_excluded_dirs(conf, fake):
+    ws = conf.workspaces["acme"]
+    _touch(ws.cases_dir / "CASE-123" / "run.bag", 10, 3600)
+    _touch(ws.cases_dir / "CASE-123" / "target" / "debug" / "x.bag", 10, 3600)
+    r = sync.bag2zst(conf, ws, dry=True)
+    assert [x["src"] for x in r["done"]] == ["CASE-123/run.bag"]
 
 
 # ---------- bag2zst ----------
@@ -352,6 +363,31 @@ def test_exclude_patterns_match_root_and_nested(conf, tmp_path, monkeypatch):
     assert r.returncode == 0, r.stderr
     got = sorted(str(p.relative_to(dst)) for p in dst.rglob("*") if p.is_file())
     assert got == ["keep.txt", "sub/keep.md", "targets/keep.txt"]
+
+
+@pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
+def test_raw_filter_sets_with_real_rclone(conf, tmp_path, monkeypatch):
+    """L-7: _raw_filter_sets を実 rclone（ローカル→ローカル copy）で検証。拡張子パス／サイズパス／14 日未満除外／target/ 除外。"""
+    monkeypatch.setenv("RCLONE_CONFIG", str(tmp_path / "rclone-empty.conf"))
+    src = tmp_path / "src"
+    old = 20 * DAY
+    _touch(src / "a.bag", 10, old)                         # 拡張子 → 拡張子パス
+    _touch(src / "sub" / "b.bag.active", 10, old)          # 拡張子（ネスト）
+    _touch(src / "new.bag", 10, 1 * DAY)                   # 14 日未満 → どちらにも出ない
+    _touch(src / "notes.md", 10, old)                      # 対象外の拡張子・小さい
+    _touch(src / "target" / "c.bag", 10, old)              # rules.exclude
+    _touch(src / "sub" / "target" / "d.bag", 10, old)      # rules.exclude（ネスト）
+    big = src / "big.log"; big.write_bytes(b""); os.truncate(big, 50 * 1024 ** 2 + 1); os.utime(big, (time.time() - old, time.time() - old))
+    bigt = src / "target" / "big.log"; bigt.write_bytes(b""); os.truncate(bigt, 50 * 1024 ** 2 + 1); os.utime(bigt, (time.time() - old, time.time() - old))
+    sets = sync._raw_filter_sets(conf, sync.raw_rules(conf))
+    assert len(sets) == 2
+    got = []
+    for i, filt in enumerate(sets):
+        dst = tmp_path / f"dst{i}"
+        r = subprocess.run(["rclone", "copy", str(src), str(dst), *filt], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        got.append(sorted(str(p.relative_to(dst)) for p in dst.rglob("*") if p.is_file()))
+    assert got == [["a.bag", "sub/b.bag.active"], ["big.log"]]
 
 
 def test_checkin_marks_last_checkin_at(conf, fake):

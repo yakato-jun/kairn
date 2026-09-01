@@ -2,6 +2,7 @@
 
 - extract_card(conf, ws, case): 設定 extract.agent のアダプタで子プロセスを実行し、出力を schema.json で検証して
   {ok, card, agent, elapsed_sec, error, raw_excerpt} を返す。**ファイルには書かない**。
+  card.related のうち実在しない案件 ID は card.related_unknown に分ける（UI で印を付ける。apply では related に含めない）。
   cwd は案件ディレクトリそのものではなく、一時ディレクトリへの写し（stage_case_dir: 自案件のディレクトリ全体（シンボリックリンク・
   rules.exclude・生データを除く）＋ 同じワークスペースの兄弟案件の case.json だけ）。ワークスペース境界をファイルシステムで切る。
   結果（成功／失敗理由・所要時間・終了コード）は events に {actor: kairn, agent: "extract:<name>", action: extract} で記録する。
@@ -11,7 +12,6 @@
 """
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import shutil
@@ -23,7 +23,7 @@ import jsonschema
 
 from .. import config as cfg
 from ..store import CaseStore
-from ..sync import is_raw, raw_rules
+from ..sync import excluded_dir, excluded_file, is_raw, raw_rules
 from . import adapters
 
 PROMPT_PATH = Path(__file__).with_name("prompt.md")
@@ -79,17 +79,12 @@ def render_prompt(cases_dir: Path, case: str) -> str:
     return "\n".join(lines)
 
 
-def _skip_dir(name: str, exclude: list[str]) -> bool:
-    """rules.exclude の `<dir>/**` 形（target/** 等）に当たるディレクトリ名か。"""
-    return any(p.endswith("/**") and "/" not in p[:-3] and fnmatch.fnmatch(name, p[:-3]) for p in exclude)
-
-
 def _skip_file(p: Path, exclude: list[str], rr: dict) -> bool:
     """写しに含めないファイル: シンボリックリンク、rules.exclude のファイルパターン（*.o 等）、生データ
     （拡張子が rules.raw_data.extensions か min_size 超。min_age は問わない＝子エージェントに大きなバイナリを渡さない）。"""
     if p.is_symlink() or not p.is_file():
         return True
-    if any(not pat.endswith("/**") and fnmatch.fnmatch(p.name, pat) for pat in exclude):
+    if excluded_file(p.name, exclude):
         return True
     return is_raw(p, {**rr, "min_age": -1.0})
 
@@ -106,7 +101,7 @@ def stage_case_dir(conf: cfg.Config, cases_dir: Path, case: str, dest_root: Path
     dst.mkdir(parents=True, exist_ok=False)
     for root, dirs, files in os.walk(src):
         rel = Path(root).relative_to(src)
-        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(root, d)) and not _skip_dir(d, exclude))
+        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(root, d)) and not excluded_dir(d, exclude))
         for d in dirs:
             (dst / rel / d).mkdir(exist_ok=True)
         for fn in files:
@@ -172,15 +167,30 @@ def extract_card(conf: cfg.Config, ws: cfg.Workspace, case: str, agent: str | No
                 if err:
                     result["error"] = err
                 else:
+                    split_unknown_related(card, st)
                     result.update(ok=True, card=card)
     note = f"ok (confidence {result['card'].get('confidence')})" if result["ok"] else result["error"]
     st.append_event(case, {**event, "note": note, "elapsed_sec": result["elapsed_sec"]})
     return result
 
 
+def split_unknown_related(card: dict, st: CaseStore) -> dict:
+    """card["related"] のうちワークスペースに実在しない案件 ID を card["related_unknown"] に分ける（related には残さない）。
+    スキーマ検証後に呼ぶ（related_unknown はスキーマ外の kairn 付加項目。apply_card では捨てる）。"""
+    known = set(st.list_case_ids())
+    rel = card.get("related") or []
+    card["related"] = [r for r in rel if r in known]
+    card["related_unknown"] = [r for r in rel if r not in known]
+    return card
+
+
 def apply_card(st: CaseStore, case: str, card: dict) -> dict:
     """人が UI で確定した下書きを case.json に適用する（title / summary / elements / related / causal）。
+    `related_unknown`（extract_card が分けた実在しない ID）は捨て、related には含めない。
     スキーマ検証に通らなければ ValueError。decision event を記録し、更新後の case を返す。"""
+    if not isinstance(card, dict):
+        raise ValueError("draft must be a JSON object")
+    card = {k: v for k, v in card.items() if k != "related_unknown"}
     err = validate_card(card)
     if err:
         raise ValueError(err)

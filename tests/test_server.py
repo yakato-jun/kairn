@@ -174,6 +174,30 @@ def test_open_case_fetches_before_reading(conf, monkeypatch):
     assert ev[-1]["action"] == "checkout"
 
 
+def test_invalid_case_id_is_rejected_before_touching_filesystem(conf, monkeypatch):
+    """L-9: 案件 ID の検証はワークスペース解決（cases_dir の存在確認）より前。cases_dir に触れたら AssertionError になる。"""
+    from kairn import config as cfg
+    from kairn.store import validate_case_id
+    for bad in ("../x", "..", ".hidden", "a/b", ""):
+        with pytest.raises(ValueError):
+            validate_case_id(bad)
+    validate_case_id("CASE-123")
+    mcp = srv.create_server(conf)
+
+    def boom(self):
+        raise AssertionError("filesystem touched with an invalid case id")
+    monkeypatch.setattr(cfg.Workspace, "cases_dir", property(boom))
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            for tool, args in [("open_case", {}), ("plan", {"objective": "o", "reason": "r", "tasks": []}),
+                               ("update_task", {"task": "T001", "status": "doing"}), ("log_event", {"action": "progress", "note": "n"}),
+                               ("checkin", {}), ("extract_card", {})]:
+                r = await c.call_tool(tool, {"case": "../x", **args})
+                assert r.is_error and "invalid case id" in r.content[0].text, (tool, r.content)
+    run(main)
+
+
 def test_open_case_unknown_case_reports_drive_result(conf, mocked_rclone):
     mcp = srv.create_server(conf)
 

@@ -265,7 +265,10 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
             if isinstance(x, list):
                 return ", ".join(map(str, x))
             return str(x or "")
-        rows = "".join(f"<tr><th>{k}</th><td>{_esc(_v(c.get(k)))}</td><td>{_esc(_v(card.get(k)))}</td></tr>"
+        unknown = card.get("related_unknown") or []
+        mark = (f" <span class='stale' title='ワークスペースに実在しない案件 ID（適用しても related に入らない）'>⚠ 実在しない: {_esc(', '.join(map(str, unknown)))}</span>"
+                if unknown else "")
+        rows = "".join(f"<tr><th>{k}</th><td>{_esc(_v(c.get(k)))}</td><td>{_esc(_v(card.get(k)))}{mark if k == 'related' else ''}</td></tr>"
                        for k in ("title", "summary", "elements", "related"))
         causal = "".join(f"<li>{_esc(x['symptom'])} → {_esc(x['component'])} → {_esc(x['cause'])} <small class='muted'>({_esc(x['evidence'])})</small></li>"
                          for x in card.get("causal", []))

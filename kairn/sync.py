@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import fnmatch
 import json
 import os
 import re
@@ -194,21 +195,32 @@ def _case_dirs(ws: Workspace, case: str | None) -> list[Path]:
     return sorted(p for p in ws.cases_dir.iterdir() if p.is_dir() and not p.is_symlink() and not p.name.startswith("."))
 
 
-def _walk_files(root: Path):
-    """root 配下の通常ファイル（シンボリックリンクのディレクトリ・ファイルは辿らない）。"""
+def excluded_dir(name: str, exclude: list[str]) -> bool:
+    """ディレクトリ名が rules.exclude の `<dir>/**` 形（target/** 等。先頭に / の無いものは任意の階層）に当たるか。"""
+    return any(p.endswith("/**") and "/" not in p[:-3] and fnmatch.fnmatch(name, p[:-3]) for p in exclude)
+
+
+def excluded_file(name: str, exclude: list[str]) -> bool:
+    """ファイル名が rules.exclude のファイルパターン（*.o 等。`/**` で終わらないもの）に当たるか。"""
+    return any(not p.endswith("/**") and fnmatch.fnmatch(name, p) for p in exclude)
+
+
+def _walk_files(root: Path, exclude: list[str] = ()):
+    """root 配下の通常ファイル（シンボリックリンクのディレクトリ・ファイルは辿らない。rules.exclude のディレクトリ・ファイルも除く）。"""
     for r, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(r, d))]
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(r, d)) and not excluded_dir(d, exclude)]
         for fn in files:
             p = Path(r) / fn
-            if not p.is_symlink() and p.is_file():
+            if not p.is_symlink() and p.is_file() and not excluded_file(fn, exclude):
                 yield p
 
 
-def bag_candidates(root: Path, now: float | None = None) -> list[Path]:
-    """圧縮対象: *.bag / *.bag.active のうち更新から 30 分以上経ったもの（.part / .zst 済みは除く）。"""
+def bag_candidates(root: Path, now: float | None = None, exclude: list[str] = ()) -> list[Path]:
+    """圧縮対象: *.bag / *.bag.active のうち更新から 30 分以上経ったもの（.part / .zst 済みは除く）。
+    rules.exclude（target/** 等）配下は対象にしない（同期もされないビルド産物を圧縮しない）。"""
     now = time.time() if now is None else now
     out = []
-    for p in _walk_files(root):
+    for p in _walk_files(root, list(exclude)):
         if not (p.name.endswith(".bag") or p.name.endswith(".bag.active")):
             continue
         if (p.with_name(p.name + ".zst")).exists():
@@ -249,8 +261,9 @@ def bag2zst(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     out: dict = {"enabled": bool(conf.rules.get("bag_to_zst", True)), "dry": dry, "done": [], "errors": []}
     if not out["enabled"]:
         return out
+    exclude = [str(x) for x in conf.rules.get("exclude", [])]
     for d in _case_dirs(ws, case):
-        for src in bag_candidates(d):
+        for src in bag_candidates(d, exclude=exclude):
             rel = str(src.relative_to(ws.cases_dir))
             if dry:
                 out["done"].append({"src": rel, "dst": rel + ".zst", "bytes": src.stat().st_size, "dry": True})

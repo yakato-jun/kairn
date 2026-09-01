@@ -188,7 +188,7 @@ def test_extract_card_success_records_event_and_writes_nothing(conf, monkeypatch
     monkeypatch.setenv("SECRET_TOKEN", "s")
     before = st.load_case("CASE-123")
     r = extract.extract_card(conf, ws, "CASE-123", timeout=42)
-    assert r["ok"] is True and r["card"] == good_card() and r["agent"] == "claude" and r["error"] is None
+    assert r["ok"] is True and r["card"] == {**good_card(), "related_unknown": []} and r["agent"] == "claude" and r["error"] is None
     assert r["elapsed_sec"] >= 0 and "result" in r["raw_excerpt"]
     call = fake.calls[0]
     assert Path(call["cwd"]).name == "CASE-123" and call["cwd"] != str(ws.cases_dir / "CASE-123")  # 写し（M-3）
@@ -290,3 +290,18 @@ def test_extract_cwd_is_staged_copy_with_siblings_case_json_only(conf, monkeypat
     # 元の案件ディレクトリは変わらず、写しは実行後に消える
     assert (case / "run.bag").exists() and (case / "link.md").is_symlink() and not cwd.exists()
     assert "CASE-100" in call["cmd"][2]  # プロンプトの文脈（兄弟 ID）は従来どおり
+
+
+# ---------- L-3: related に実在しない案件 ID → related_unknown ----------
+
+def test_extract_card_splits_unknown_related(conf, monkeypatch):
+    st = _seed(conf); ws = conf.workspaces["acme"]
+    monkeypatch.setattr(adapters.subprocess, "run", FakeRun(stdout=_claude_stdout(good_card(related=["CASE-100", "CASE-999", "CASE-100"]))))
+    r = extract.extract_card(conf, ws, "CASE-123")
+    assert r["ok"] and r["card"]["related"] == ["CASE-100", "CASE-100"] and r["card"]["related_unknown"] == ["CASE-999"]
+    # apply では related_unknown を捨て、related に含めない
+    c = extract.apply_card(st, "CASE-123", r["card"])
+    assert c["related"] == ["CASE-100", "CASE-100"] and "related_unknown" not in c
+    assert "related_unknown" not in st.load_case("CASE-123")
+    with pytest.raises(ValueError):
+        extract.apply_card(st, "CASE-123", "not an object")

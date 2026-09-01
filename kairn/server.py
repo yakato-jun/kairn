@@ -19,7 +19,7 @@ from starlette.routing import Mount, Route
 
 from . import config as cfg
 from .index import Index
-from .store import CaseNotFound, CaseStore
+from .store import CaseNotFound, CaseStore, validate_case_id
 
 INSTRUCTIONS = (
     "kairn: 案件（case）単位の作業ログ。案件を開くときは open_case（無ければ find_cases / list_cases で選ぶ。選ぶのは人）。"
@@ -41,6 +41,11 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
     mcp = MCPServer("kairn", instructions=INSTRUCTIONS, version="0.0.1")
 
     def _ws(workspace: str | None, case: str | None = None) -> cfg.Workspace:
+        if case is not None:  # ファイルシステムに触れる前に案件 ID を検証する（"../x" 等）
+            try:
+                validate_case_id(case)
+            except ValueError as e:
+                raise ToolError(str(e)) from None
         if workspace:
             if workspace not in conf.workspaces:
                 raise ToolError(f"unknown workspace {workspace!r} (known: {list(conf.workspaces)})")

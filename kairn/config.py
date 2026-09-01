@@ -10,7 +10,7 @@
 規則:
 - drive.remote が無ければ起動しない。設定済みの remote 以外は決して使わない。
 - workspaces.<name>.repos に登録されたパス以外に対して kairn は何もしない。
-- workspaces/（データ）が git に追跡されていたら起動しない。
+- workspaces/（データ）が git に追跡されていたら、または git リポジトリ内にあるのに ignore されていなければ起動しない。
 """
 from __future__ import annotations
 
@@ -212,24 +212,42 @@ def create(remote: str, agent: str | None = None, path: Path | None = None, driv
     return conf
 
 
-def _tracked_in_git(path: Path) -> bool:
-    """path（またはその配下）が、path を含む git リポジトリで追跡されているか。リポジトリ外・存在しないなら False。"""
+def _git_top(path: Path) -> str | None:
+    """path を含む git リポジトリのトップ。リポジトリ外・存在しないなら None。"""
     probe = path if path.is_dir() else path.parent
     if not probe.exists():
-        return False
+        return None
     top = subprocess.run(["git", "-C", str(probe), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-    if top.returncode != 0:
+    return top.stdout.strip() if top.returncode == 0 else None
+
+
+def _tracked_in_git(path: Path, top: str | None = None) -> bool:
+    """path（またはその配下）が、path を含む git リポジトリで追跡されているか。リポジトリ外・存在しないなら False。"""
+    top = top or _git_top(path)
+    if not top:
         return False
-    r = subprocess.run(["git", "-C", top.stdout.strip(), "ls-files", "--", str(path)], capture_output=True, text=True)
+    r = subprocess.run(["git", "-C", top, "ls-files", "--", str(path)], capture_output=True, text=True)
     return r.returncode == 0 and bool(r.stdout.strip())
 
 
+def _ignored_in_git(path: Path, top: str) -> bool:
+    """path が .gitignore 等で無視されているか（git check-ignore -q）。"""
+    return subprocess.run(["git", "-C", top, "check-ignore", "-q", "--", str(path)], capture_output=True, text=True).returncode == 0
+
+
 def assert_data_not_tracked(data_root: Path | None = None) -> None:
-    """安全弁: workspaces/（リポジトリ内）と KAIRN_DATA_ROOT が git に追跡されていたら起動を拒否する。"""
+    """安全弁: workspaces/（リポジトリ内）と KAIRN_DATA_ROOT が git に追跡されている、または git リポジトリ内にあるのに
+    ignore されていない（次の `git add` で入ってしまう）なら起動を拒否する。リポジトリ外なら何もしない。"""
     data_root = data_root or DATA_ROOT
     for p in {ROOT / "workspaces", data_root}:
-        if _tracked_in_git(p):
+        top = _git_top(p)
+        if not top:
+            continue
+        if _tracked_in_git(p, top):
             raise SystemExit(f"kairn: refusing to run — {p} is tracked by git (data must never be committed)")
+        if not _ignored_in_git(p, top):
+            raise SystemExit(f"kairn: refusing to run — {p} is inside the git repository {top} but not ignored "
+                             f"(add it to .gitignore; data must never be committed)")
 
 
 def rclone_remotes() -> list[str]:

@@ -49,7 +49,7 @@ kairn detach [<repo path>]                # 所属を外す（glob: 由来なら
 kairn status                              # 設定・cwd の所属・各ワークスペースの案件数とリンク状態
 kairn cases [<ws>] [--all]                # 案件一覧（既定は open のみ）
 kairn new <case id> "<title>" [--ws <ws>] # 案件を作る（case.json）
-kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新
+kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新（--dry-run では索引を書き換えない）
 kairn checkin <ws> [<case>] [--dry-run]   # ローカル → Drive（案件単位は rclone sync、ワークスペース全体は rclone copy。last_checkin_at 更新）
 kairn index <ws> [--full]                 # 索引（SQLite FTS5）の差分再生成（--full で全部）
 kairn drive-index <ws>                    # Drive 上の全ファイル一覧を index/drive-index.txt に
@@ -130,7 +130,7 @@ mkdir -p ~/.config/opencode/agents && cp contrib/opencode/agents/kairn-extract.m
 `raw-move` で Drive へ**移動**（ローカルから削除）して所在を案件に記録する。
 
 ```
-kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active → <name>.zst（zstd -T0 -6、検証後に置換、mtime 引き継ぎ。30 分以内に更新されたものは対象外）
+kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active → <name>.zst（zstd -T0 -6、検証後に置換、mtime 引き継ぎ。30 分以内に更新されたものと rules.exclude（target/** 等）配下は対象外）
 kairn raw-move <ws> [<case>] [--dry-run]  # rclone move → <remote>:<root>/<ws>/cases/<case>/…。移動後に case.json.data[]、worklog.md の
                                           #   「## Data location」（case.json が無ければ DATA.md）、index/raw-moved-YYYYMMDD.txt、progress event に記録
 kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move → drive-index → index を順に実行。段が失敗しても次へ進み、index/daily.log に記録

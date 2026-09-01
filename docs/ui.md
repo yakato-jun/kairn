@@ -1,5 +1,7 @@
 # UI（ローカル Web、localhost / Tailscale 内のみ）
 
+**Host の許可リスト検査は未実装**（DNS リバインディング対策なし）。localhost / Tailscale 内からだけ到達できる前提で運用する（`kairn serve --host` を公開アドレスにしない）。
+
 人が操作するのはここだけ。データは MCP と同じファイル。実装: `kairn/ui.py`。
 
 実装は **Starlette（FastAPI の基盤。MCP SDK の ASGI アプリと同じ Starlette に同居）＋ 素の HTML**。外部依存を増やさない。
@@ -28,8 +30,8 @@
 | コメント／指示 | `/ui/<ws>/<case>/comment` `note` | `{actor: human, action: comment, note}`。空は 400 |
 | タスク追加 | `/ui/<ws>/<case>/task` `title, owner` | 生きているタスク（open/doing/blocked/done）を全部引き継いだ**計画の新版**＋追加（actor=human）。superseded は出ない |
 | 案件の close/suspend | `/ui/<ws>/<case>/status` `status, note` | case.json の status 更新＋ `{actor: human, action: status}` |
-| 下書きを取得 | `/ui/<ws>/<case>/extract` | `extract.extract_card` を実行し、結果画面（agent・所要時間・ok/失敗理由、現在の case.json と下書きの対比、症状→部品→原因、下書き JSON）を返す（200、リダイレクトしない）。case.json は書かない。`{actor: kairn, agent: extract:<name>, action: extract}` |
-| この下書きを case.json に適用 | `/ui/<ws>/<case>/apply` `card`（下書き JSON。結果画面の hidden） | schema.json で再検証し、title / summary / elements / related / causal を置き換え＋ `{actor: human, action: decision, note: "applied extract draft"}`。不正な JSON・スキーマ不一致は 400 |
+| 下書きを取得 | `/ui/<ws>/<case>/extract` | `extract.extract_card` を threadpool で実行し（子プロセス待ちの間も同じプロセスの MCP を止めない）、結果画面（agent・所要時間・ok/失敗理由、現在の case.json と下書きの対比、症状→部品→原因、下書き JSON）を返す（200、リダイレクトしない）。下書きの `related` にワークスペースに実在しない案件 ID があれば `related_unknown` として ⚠ 印を付ける（適用しても related に入らない）。case.json は書かない。`{actor: kairn, agent: extract:<name>, action: extract}` |
+| この下書きを case.json に適用 | `/ui/<ws>/<case>/apply` `card`（下書き JSON。結果画面の hidden） | `related_unknown` を捨てて schema.json で再検証し、title / summary / elements / related / causal を置き換え＋ `{actor: human, action: decision, note: "applied extract draft"}`。不正な JSON・スキーマ不一致は 400 |
 
 フォームは `application/x-www-form-urlencoded`（UTF-8、percent-encoding）。日本語・記号は復号してそのまま記録する。成功時は 303 で案件ページへ戻る。
 `owner` は ai | human 以外を 400 で拒否する。

@@ -164,7 +164,10 @@ def cmd_sync(a):
     from .index import Index
     if a.cmd == "checkout":
         print(sync.checkout(conf, ws, a.case, dry=a.dry_run))
-        print(Index(ws.index_dir, ws.cases_dir).rebuild())
+        if a.dry_run:
+            print("(dry-run: index not rebuilt)")
+        else:
+            print(Index(ws.index_dir, ws.cases_dir).rebuild())
     elif a.cmd == "checkin":
         print(sync.checkin(conf, ws, a.case, dry=a.dry_run))
     elif a.cmd == "index":

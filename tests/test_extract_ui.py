@@ -72,3 +72,17 @@ def test_ui_extract_does_not_block_other_requests(conf, monkeypatch):
         release.set(); t.join(timeout=10); g.join(timeout=10)
     assert not blocked and got.get("page") == 200
     assert result["extract"].status_code == 200 and "released" in result["extract"].text
+
+
+def test_ui_marks_unknown_related(conf, monkeypatch):
+    """L-3: 下書き画面で実在しない related に印を付け、適用しても related に入らない。"""
+    st = _seed(conf)
+    c = TestClient(build_ui(conf))
+    monkeypatch.setattr(adapters.subprocess, "run", FakeRun(stdout=_claude_stdout(good_card(related=["CASE-100", "CASE-999"]))))
+    r = c.post("/ui/acme/CASE-123/extract")
+    assert r.status_code == 200 and "実在しない: CASE-999" in r.text
+    import html as _html, re
+    card = json.loads(_html.unescape(re.search(r"name=card value='([^']*)'", r.text).group(1)))
+    assert card["related_unknown"] == ["CASE-999"]
+    assert c.post("/ui/acme/CASE-123/apply", data={"card": json.dumps(card)}, follow_redirects=False).status_code == 303
+    assert st.load_case("CASE-123")["related"] == ["CASE-100"]
