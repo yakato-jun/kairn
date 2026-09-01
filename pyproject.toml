@@ -5,6 +5,7 @@ description = "Case-based worklog operations: MCP server, local UI, Drive sync, 
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=2",
+  "starlette>=0.40",
   "uvicorn>=0.30",
   "pyyaml>=6.0",
   "python-multipart>=0.0.9",
