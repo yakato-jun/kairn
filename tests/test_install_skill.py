@@ -34,3 +34,20 @@ def test_install_skill_links_both_and_keeps_existing(tmp_path: Path, monkeypatch
     cli.main()
     out = capsys.readouterr().out
     assert out.count("linked ") == 2 and (home3 / ".claude" / "skills" / "kairn").is_symlink()
+    # 最後に、各エージェントの許可設定手順（実際のデータ領域のパス入り）を表示する
+    d = str(cfg.DATA_ROOT.resolve())
+    assert out.rstrip().endswith(cli.permission_notes())
+    for needle in (f"claude --add-dir {d}", "permissions.additionalDirectories", f"codex --add-dir {d}", "disk-full-read-access",
+                   f'external_directory に {{"{d}/**": "allow"}}', f"agy --add-dir {d}", f"{d}/<ws>/cases/"):
+        assert needle in out, needle
+
+
+def test_permission_notes_match_readme(tmp_path: Path):
+    """README「各エージェントへの適用」5 と install-skill の表示が同じ手順（コマンド・設定キー）を指す。パスは README が ~/kairn/workspaces、表示は実パス。"""
+    readme = (cfg.ROOT / "README.md").read_text(encoding="utf-8")
+    notes = cli.permission_notes(tmp_path / "data")
+    d = str((tmp_path / "data").resolve())
+    assert d in notes and "~/kairn/workspaces" not in notes
+    for needle in ("claude --add-dir", "permissions.additionalDirectories", "codex --add-dir", 'sandbox_permissions=["disk-full-read-access"]',
+                   "permission.external_directory", "agy --add-dir", "trust"):
+        assert needle in readme and needle in notes, needle

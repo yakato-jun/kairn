@@ -242,9 +242,26 @@ def install_skill(home: Path) -> list[str]:
     return out
 
 
+def permission_notes(data_root: Path | None = None) -> str:
+    """各エージェントがデータ領域（workspaces/）を読み書きするための許可設定の手順。kairn は設定を書き換えず、表示するだけ。
+    README「各エージェントへの適用」の 6 と同じ内容（tests/test_install_skill.py が照合する）。"""
+    d = str((data_root or cfg.DATA_ROOT).resolve())
+    return "\n".join([
+        f"案件は {d}/<ws>/cases/ にある（リポジトリの外。open_case が返す paths.case_dir の絶対パスで読み書きする）。",
+        "各エージェントがここを読み書きできるよう、追加ディレクトリの許可を設定する（kairn は自動では書き換えない）:",
+        f"  Claude Code : claude --add-dir {d}",
+        f"                または ~/.claude/settings.json の permissions.additionalDirectories に \"{d}\" を追加（ユーザー設定。フォルダを trust した後に有効）",
+        f"  Codex       : codex --add-dir {d}   （workspace に加えて書き込み可。読み取り範囲も広げるなら -c 'sandbox_permissions=[\"disk-full-read-access\"]'）",
+        f"  OpenCode    : opencode.json の permission.external_directory に {{\"{d}/**\": \"allow\"}}（該当エージェントの permission でも可）",
+        f"  Antigravity : agy --add-dir {d}   （複数指定可）",
+    ])
+
+
 def cmd_install_skill(a):
     for line in install_skill(Path(os.path.expanduser(a.home)).resolve()):
         print(line)
+    print()
+    print(permission_notes())
 
 
 def main() -> None:

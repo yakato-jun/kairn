@@ -113,7 +113,39 @@ mkdir -p ~/.config/opencode/agents && cp contrib/opencode/agents/kairn-extract.m
 ```
 未配置だと opencode の extract は失敗し `ok=false` になる。
 
-### 5. リポジトリ側に書くこと（CLAUDE.md / AGENTS.md）
+### 5. 各エージェントに `workspaces/` の読み書きを許可する
+
+案件ディレクトリはリポジトリの外、kairn のデータ領域 `workspaces/<ws>/cases/`（既定 `~/kairn/workspaces`。`KAIRN_DATA_ROOT` で変えられる）にある。
+エージェントは `open_case` が返す `paths.case_dir` の絶対パスで読み書きするので、各エージェントの「追加ディレクトリ許可」でこの領域を開ける。
+kairn は各エージェントの設定を自動では書き換えない（`kairn install-skill` の最後に、実際のパスを入れた同じ手順を表示する）:
+
+| エージェント | 許可の与え方 |
+|---|---|
+| Claude Code | 起動時 `claude --add-dir ~/kairn/workspaces`、または `~/.claude/settings.json` の `permissions.additionalDirectories` に `"~/kairn/workspaces"` を追加（ユーザー設定。フォルダを trust した後に有効） |
+| Codex CLI | `codex --add-dir ~/kairn/workspaces`（workspace に加えて書き込み可）。読み取り範囲も広げるなら `-c 'sandbox_permissions=["disk-full-read-access"]'` |
+| OpenCode | `opencode.json` の `permission.external_directory` に `{"~/kairn/workspaces/**": "allow"}`（該当エージェントの `permission:` でも可。書式は https://opencode.ai/docs/permissions/ ） |
+| Antigravity | `agy --add-dir ~/kairn/workspaces`（複数指定可） |
+
+Claude Code の `~/.claude/settings.json`:
+```json
+{
+  "permissions": {
+    "additionalDirectories": ["~/kairn/workspaces"]
+  }
+}
+```
+
+OpenCode の `~/.config/opencode/opencode.json`:
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "external_directory": {"~/kairn/workspaces/**": "allow"}
+  }
+}
+```
+
+### 6. リポジトリ側に書くこと（CLAUDE.md / AGENTS.md）
 
 紐付けの正は各環境の `~/.config/kairn/config.yaml`（`kairn attach` が書く）。リポジトリには所属ワークスペースと入口だけを書く:
 
