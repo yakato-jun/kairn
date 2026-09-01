@@ -2,8 +2,8 @@
 
   kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity] [--extract-timeout <sec>]
   kairn ws list | ws create <name>
-  kairn attach <ws> [<repo path>...]     # 省略時は cwd。<repo>/<link_name> を cases/ へのリンクにする
-  kairn detach [<repo path>]             # 省略時は cwd。glob: 由来なら exclude: を書いて展開から外す
+  kairn attach <ws> [<repo path>...]     # 省略時は cwd。リポジトリの所属を設定に記録するだけ（リポジトリ側には何も作らない）
+  kairn detach [<repo path>]             # 省略時は cwd。所属を外す。glob: 由来なら exclude: を書いて展開から外す
   kairn status
   kairn cases [<ws>] [--all]
   kairn new <case id> "<title>" [--ws <ws>]
@@ -14,7 +14,8 @@
   kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]
                                          # 子エージェントで case.json の下書きを作る（書き込まない。適用は UI）
   kairn serve [--port 8765]              # MCP + UI
-  kairn install-skill [--home <dir>]     # <home>/.agents/skills/kairn と <home>/.claude/skills/kairn を skills/kairn へのリンクにする（既存は上書きしない）
+  kairn install-skill [--home <dir>]     # <home>/.agents/skills/kairn と <home>/.claude/skills/kairn を skills/kairn へのリンクにする（既存は上書きしない）。
+                                         # 最後に、各エージェントがデータ領域（workspaces/）を読み書きするための許可設定手順を表示する
 """
 from __future__ import annotations
 
@@ -71,21 +72,6 @@ def cmd_ws(a):
         print(f"created workspace {a.name}: {conf.drive_path(a.name)} and {conf.workspaces[a.name].data_dir}")
 
 
-def _link(repo: Path, ws: cfg.Workspace) -> str:
-    link = repo / ws.link_name
-    target = ws.cases_dir
-    target.mkdir(parents=True, exist_ok=True)
-    if link.is_symlink():
-        if link.resolve() == target.resolve():
-            return "already linked"
-        raise SystemExit(f"kairn: {link} is a symlink to {link.resolve()} (not {target}); fix by hand")
-    if link.exists():
-        n = sum(1 for _ in link.iterdir())
-        raise SystemExit(f"kairn: {link} exists with {n} entries. move its contents into {target} first (migration), then re-run attach")
-    link.symlink_to(target, target_is_directory=True)
-    return f"linked {link} -> {target}"
-
-
 def cmd_attach(a):
     conf = cfg.load()
     ws = conf.workspaces.get(a.ws)
@@ -102,9 +88,10 @@ def cmd_attach(a):
         if other and other.name != ws.name:
             raise SystemExit(f"kairn: {repo} is already attached to workspace {other.name!r} (detach first)")
         ws.add_repo(repo)
-        print(f"{repo}: {_link(repo, ws)}")
+        print(f"{repo} -> {ws.name}")
+    ws.cases_dir.mkdir(parents=True, exist_ok=True)
     conf.save()
-    print(f"attached {len(repos)} repo(s) to {ws.name}. config: {conf.path}")
+    print(f"attached {len(repos)} repo(s) to {ws.name}. config: {conf.path}\ncases: {ws.cases_dir} (agents need permission for {ws.data_dir.parent}; see: kairn install-skill)")
 
 
 def cmd_detach(a):
@@ -114,9 +101,6 @@ def cmd_detach(a):
     if not ws or repo not in [r.resolve() for r in ws.repos]:
         raise SystemExit(f"kairn: {repo} is not attached")
     ws.remove_repo(repo)
-    link = repo / ws.link_name
-    if link.is_symlink():
-        link.unlink(); print(f"removed link {link}")
     conf.save(); print(f"detached {repo} from {ws.name}")
 
 
@@ -131,9 +115,7 @@ def cmd_status(a):
         ids = st.list_case_ids(); raw = st.list_dirs_without_case()
         print(f"\n[{ws.name}] {ws.description}\n  data: {ws.data_dir} (exists={ws.data_dir.exists()})\n  cases: {len(ids)} with case.json, {len(raw)} dirs without (legacy)\n  repos:")
         for r in ws.repos:
-            link = r / ws.link_name
-            state = "linked" if link.is_symlink() and link.resolve() == ws.cases_dir.resolve() else ("EXISTS(not link)" if link.exists() else "no link")
-            print(f"    {r}  [{state}]")
+            print(f"    {r}")
 
 
 def cmd_cases(a):

@@ -47,7 +47,7 @@ def _post(url: str, data: dict) -> int:
 @pytest.fixture
 def env(tmp_path, fake_rclone):
     config = tmp_path / "config.yaml"
-    config.write_text("drive: {remote: my-drive, root: ws}\nextract: {agent: claude}\nworkspaces:\n  acme: {description: e2e, repos: [], link_name: tmp}\n", encoding="utf-8")
+    config.write_text("drive: {remote: my-drive, root: ws}\nextract: {agent: claude}\nworkspaces:\n  acme: {description: e2e, repos: []}\n", encoding="utf-8")
     return with_fake_rclone_env(fake_rclone, KAIRN_CONFIG=str(config), KAIRN_DATA_ROOT=str(tmp_path / "data"))
 
 
@@ -56,11 +56,13 @@ def _cli(env, *args, **kw):
 
 
 def test_end_to_end(tmp_path, env, fake_rclone):
-    repo = tmp_path / "acme-robot"; repo.mkdir()
+    repo = tmp_path / "acme-robot"; (repo / "tmp" / "old-notes").mkdir(parents=True)   # 既存の tmp/ 実体があっても attach できる
     r = _cli(env, "attach", "acme", str(repo)); assert r.returncode == 0, r.stderr
-    assert (repo / "tmp").is_symlink() and (repo / "tmp").resolve() == (tmp_path / "data" / "acme" / "cases").resolve()
+    assert not (repo / "tmp").is_symlink() and (repo / "tmp" / "old-notes").is_dir()      # リポジトリ側には何も作らない・壊さない
+    assert sorted(p.name for p in repo.iterdir()) == ["tmp"]
+    assert (tmp_path / "data" / "acme" / "cases").is_dir()
     r = _cli(env, "new", "CASE-123", "起動時に driver が初期化されない", "--ws", "acme"); assert r.returncode == 0, r.stderr
-    r = _cli(env, "status"); assert r.returncode == 0 and "acme" in r.stdout and "linked" in r.stdout, r.stderr
+    r = _cli(env, "status"); assert r.returncode == 0 and "acme" in r.stdout and str(repo) in r.stdout and "link" not in r.stdout, r.stderr
     case_dir = tmp_path / "data" / "acme" / "cases" / "CASE-123"
     (case_dir / "worklog.md").write_text("# t\n## Objective\n起動時に widget driver の init が終わらない\n## Notes\nUART 460800 で送信量が超過する\n", encoding="utf-8")
     # console script も動く（.venv/bin/kairn）

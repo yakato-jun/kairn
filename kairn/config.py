@@ -2,9 +2,10 @@
 
   drive:      {remote: <rclone remote>, root: ws}          kairn setup --remote が書く
   extract:    {agent: claude|codex|opencode|antigravity, timeout: 600}   kairn setup --agent / --extract-timeout（秒）
-  workspaces: {<name>: {repos: [<abs path> | {path: <abs path>} | {glob: <pattern>} | {exclude: <abs path>} ...], link_name: tmp}}
+  workspaces: {<name>: {repos: [<abs path> | {path: <abs path>} | {glob: <pattern>} | {exclude: <abs path>} ...]}}
               kairn attach / detach が書く（glob: は展開時にディレクトリだけ採る。exclude: は glob: の展開から外す（detach が書く）。
-              未知のキー・空文字は拒否）
+              未知のキー・空文字は拒否）。repos は「cwd がどのワークスペースに属するか」を決めるためだけの対応表で、
+              リポジトリ側には何も作らない（案件は DATA_ROOT/<name>/cases/ にだけある）
   rules:      同期・退避規則（既定値あり）
 
 規則:
@@ -43,7 +44,6 @@ class Workspace:
     description: str = ""
     repos: list[Path] = field(default_factory=list)            # 展開済み（glob: はディレクトリに展開）
     repo_specs: list = field(default_factory=list)             # 設定ファイルに書く形（文字列 / {path} / {glob} / {exclude}）
-    link_name: str = "tmp"
     data_root: Path | None = None  # None なら DATA_ROOT（KAIRN_DATA_ROOT）
 
     def add_repo(self, repo: Path) -> None:
@@ -115,7 +115,7 @@ class Config:
             "extract": {"agent": self.extract_agent, "timeout": self.extract_timeout},
             "rules": self.rules,
             "workspaces": {
-                n: {"description": w.description, "repos": list(w.repo_specs), "link_name": w.link_name}
+                n: {"description": w.description, "repos": list(w.repo_specs)}
                 for n, w in self.workspaces.items()
             },
         }
@@ -177,7 +177,7 @@ def _parse(raw: dict, path: Path) -> Config:
         w = w or {}
         specs = list(w.get("repos") or [])
         repos = expand_repos(specs, name)
-        wss[name] = Workspace(name=name, description=w.get("description", ""), repos=repos, repo_specs=specs, link_name=w.get("link_name", "tmp"))
+        wss[name] = Workspace(name=name, description=w.get("description", ""), repos=repos, repo_specs=specs)
     rules = {**DEFAULT_RULES, **(raw.get("rules") or {})}
     ext = raw.get("extract") or {}
     timeout = ext.get("timeout", DEFAULT_EXTRACT_TIMEOUT_SEC)

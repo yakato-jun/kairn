@@ -33,13 +33,11 @@ rules:
 workspaces:
   acme:
     description: "ACME 向けの開発（複数リポジトリで 1 ワークスペース）"
-    repos:                       # 所属リポジトリ。各リポジトリの <link_name>/ を cases/ へのリンクにする
+    repos:                       # 所属リポジトリ（cwd → ワークスペースの対応表。リポジトリ側には何も作らない）
       - /home/user/acme-robot    # 文字列 = 絶対パス（`- path: /home/user/acme-robot` と同じ）
       - path: /home/user/acme-tools
       - glob: ~/Acme*            # 一致するディレクトリを全部（読み込み時に展開。ファイルは除く）
       - exclude: /home/user/Acme-old   # glob の展開から外す（glob 由来のリポジトリを `kairn detach` すると書かれる）
-    link_name: tmp
   personal:
     description: "顧客横断の個人ログ。他ワークスペースからは明示指定でのみ参照"
     repos: []
-    link_name: tmp

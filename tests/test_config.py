@@ -150,3 +150,38 @@ def test_create_keeps_existing_agent_when_omitted(tmp_path):
     assert cfg.create("my-drive", "opencode", path=p).extract_agent == "opencode"
     assert cfg.create("my-drive", path=p).extract_agent == "opencode"            # 省略時は既存値
     assert cfg.load(p).extract_agent == "opencode"
+
+
+def test_cli_attach_detach_status_record_mapping_only(conf, tmp_path, monkeypatch, capsys):
+    """attach はリポジトリ → ワークスペースの対応を設定に書くだけ。リポジトリ側にリンクを作らず、既存の tmp/ 実体があっても拒否しない。
+    detach は対応を消すだけ。status は所属リポジトリを列挙する（リンク状態は表示しない）。"""
+    from kairn import cli
+    repo = tmp_path / "acme-robot"; (repo / "tmp" / "notes").mkdir(parents=True)
+    (repo / "tmp" / "notes" / "a.md").write_text("keep")
+    # 既存の設定に link_name が残っていても読めて、保存で消える（旧版からの移行）
+    p = tmp_path / "old.yaml"
+    p.write_text(f"drive: {{remote: my-drive}}\nworkspaces:\n  acme:\n    repos: [{repo}]\n    link_name: tmp\n", encoding="utf-8")
+    old = cfg.load(p); assert not hasattr(old.workspaces["acme"], "link_name"); old.save()
+    assert "link_name" not in p.read_text(encoding="utf-8") and old.workspaces["acme"].repos == [repo]
+    monkeypatch.setattr(cfg, "load", lambda path=None: conf)
+    monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
+    monkeypatch.setattr("sys.argv", ["kairn", "attach", "acme", str(repo)])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "acme" in out and "link" not in out
+    assert not (repo / "tmp").is_symlink() and (repo / "tmp" / "notes" / "a.md").read_text() == "keep"
+    assert sorted(p.name for p in repo.iterdir()) == ["tmp"]
+    assert conf.workspace_for_path(repo / "src").name == "acme"
+    raw = conf.path.read_text(encoding="utf-8")
+    assert str(repo) in raw and "link_name" not in raw
+    # status: 所属だけ
+    monkeypatch.setattr("sys.argv", ["kairn", "status"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert f"    {repo}\n" in out and "linked" not in out and "no link" not in out and "EXISTS" not in out
+    # detach: 対応を消すだけ。リポジトリ側は触らない
+    monkeypatch.setattr("sys.argv", ["kairn", "detach", str(repo)])
+    cli.main()
+    assert "detached" in capsys.readouterr().out
+    assert conf.workspace_for_path(repo) is None and (repo / "tmp" / "notes" / "a.md").read_text() == "keep"
+    assert str(repo) not in conf.path.read_text(encoding="utf-8")
