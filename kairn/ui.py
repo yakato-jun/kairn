@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -16,10 +16,11 @@ from starlette.responses import HTMLResponse, PlainTextResponse, RedirectRespons
 from starlette.routing import Route
 
 from . import config as cfg
-from .store import JST, CaseStore
+from .store import JST, TASK_OWNERS, CaseStore
 
 STALE_DAYS = 7  # これを超えて動きの無い open タスクを目立たせる（自動では消さない）
 LIVE = ("open", "doing", "blocked")
+LIST_STATUSES = ("open", "closed", "suspended", "all")
 
 CSS = """
 body{font-family:system-ui,sans-serif;margin:0;background:#f5f6f8;color:#222}header{background:#22313f;color:#fff;padding:.6em 1em}
@@ -96,7 +97,9 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
     async def index(req: Request) -> Response:
         want_ws = req.query_params.get("ws") or ""
         element = req.query_params.get("element") or ""   # elements の値で絞り込み
-        status = req.query_params.get("status") or "open"  # open|closed|suspended|all
+        status = req.query_params.get("status") or "open"  # open|closed|suspended|all（それ以外は open に正規化。値を HTML に反射するため）
+        if status not in LIST_STATUSES:
+            status = "open"
         rows = []
         for ws in conf.workspaces.values():
             if want_ws and ws.name != want_ws:
@@ -122,7 +125,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
             legacy = st.list_dirs_without_case()
             if legacy and not element:
                 rows.append(f"<tr><td>{_esc(ws.name)}</td><td colspan=6><small>{len(legacy)} directories without case.json (legacy)</small></td></tr>")
-        filt = (f"<p><small>status: " + " ".join(f"<a href='{P}?status={s}{'&element=' + quote(element, safe='') if element else ''}'>{s}</a>" for s in ("open", "closed", "suspended", "all"))
+        filt = (f"<p><small>status: " + " ".join(f"<a href='{P}?status={s}{'&element=' + quote(element, safe='') if element else ''}'>{s}</a>" for s in LIST_STATUSES)
                 + (f" · element: <b>{_esc(element)}</b> <a href='{P}?status={status}'>✕</a>" if element else "") + "</small></p>")
         return _page("cases", filt + f"<table><tr><th>ws</th><th>case</th><th>status</th><th>progress</th><th>鮮度</th><th>last event</th><th>AI last</th></tr>{''.join(rows)}</table>")
 
@@ -131,7 +134,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
             ws = _ws(req.path_params["ws"])
             cid = req.path_params["case"]; st = CaseStore(ws.cases_dir)
             c = st.load_case(cid)
-        except KeyError:
+        except (KeyError, ValueError):  # 未知のワークスペース／案件、不正な案件 ID
             return PlainTextResponse("not found", status_code=404)
         plan = st.current_plan(cid); events = st.events(cid)
         cols: dict[str, list[str]] = {"open": [], "doing": [], "blocked": [], "done": []}
@@ -188,11 +191,13 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
         return _page(cid, body)
 
     async def act(req: Request) -> Response:
+        if not same_origin(req):
+            return PlainTextResponse("forbidden: cross-site request", status_code=403)
         try:
             ws = _ws(req.path_params["ws"])
             cid = req.path_params["case"]; kind = req.path_params["kind"]
             st = CaseStore(ws.cases_dir); st.load_case(cid)
-        except KeyError:
+        except (KeyError, ValueError):
             return PlainTextResponse("not found", status_code=404)
         form = await req.form()  # application/x-www-form-urlencoded, UTF-8（percent-encoding は Starlette が復号）
         note = str(form.get("note", "")).strip()
@@ -209,9 +214,12 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
             title = str(form.get("title", "")).strip()
             if not title:
                 return PlainTextResponse("title is required", status_code=400)
+            owner = str(form.get("owner", "ai"))
+            if owner not in TASK_OWNERS:
+                return PlainTextResponse("owner must be ai or human", status_code=400)
             plan = st.current_plan(cid)
             carried = [{"carried_from": t["id"]} for t in (plan["tasks"] if plan else []) if t["status"] in (*LIVE, "done")]
-            st.new_plan_version(cid, (plan or {}).get("objective", ""), carried + [{"title": title, "owner": str(form.get("owner", "ai"))}],
+            st.new_plan_version(cid, (plan or {}).get("objective", ""), carried + [{"title": title, "owner": owner}],
                                 reason=f"human added a task via UI: {title}", actor="human")
         elif kind == "status":
             try:
@@ -224,6 +232,20 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
 
     return [Route(P, index), Route(P + "/", index), Route(P + "/{ws}/{case}", case_page),
             Route(P + "/{ws}/{case}/{kind}", act, methods=["POST"])]
+
+
+def same_origin(req: Request) -> bool:
+    """CSRF 対策（POST のみ）: Sec-Fetch-Site が same-origin / none 以外、または Origin / Referer のホストが
+    Host と異なれば拒否。どちらのヘッダも無い（curl 等）場合は通す。"""
+    sfs = req.headers.get("sec-fetch-site")
+    if sfs and sfs not in ("same-origin", "none"):
+        return False
+    host = req.headers.get("host", "")
+    for h in ("origin", "referer"):
+        v = req.headers.get(h)
+        if v and urlsplit(v).netloc != host:
+            return False
+    return True
 
 
 def _evidence(e: object) -> str:

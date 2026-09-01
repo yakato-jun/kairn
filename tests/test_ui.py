@@ -89,3 +89,47 @@ def test_element_filter_and_related(conf):
     t = c.get("/ui?element=unit-2").text
     assert "CASE-123" in t and "CASE-100" not in t
     assert "href='/ui/acme/CASE-123'" in c.get("/ui/acme/CASE-100").text
+
+
+def test_post_rejects_cross_site(conf):
+    """CSRF: Origin / Referer / Sec-Fetch-Site がリクエストの Host と食い違う POST は 403（何も記録しない）。"""
+    st = _seed(conf)
+    c = TestClient(build_ui(conf))
+    n = len(st.events("CASE-123"))
+    for headers in ({"Origin": "http://evil.example"}, {"Referer": "http://evil.example/ui/acme/CASE-123"},
+                    {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site", "Origin": "http://testserver"},
+                    {"Origin": "null"}):
+        r = c.post("/ui/acme/CASE-123/comment", data={"note": "injected"}, headers=headers, follow_redirects=False)
+        assert r.status_code == 403, headers
+    assert len(st.events("CASE-123")) == n
+    for headers in ({"Origin": "http://testserver"}, {"Referer": "http://testserver/ui/acme/CASE-123"},
+                    {"Sec-Fetch-Site": "same-origin", "Origin": "http://testserver"}, {"Sec-Fetch-Site": "none"}, {}):
+        r = c.post("/ui/acme/CASE-123/comment", data={"note": "ok"}, headers=headers, follow_redirects=False)
+        assert r.status_code == 303, headers
+    assert len(st.events("CASE-123")) == n + 5
+
+
+def test_invalid_case_id_is_404_not_500(conf):
+    _seed(conf)
+    c = TestClient(build_ui(conf))
+    for path in ("/ui/acme/%2e%2e", "/ui/acme/.hidden"):
+        assert c.get(path).status_code == 404, path
+    assert c.post("/ui/acme/%2e%2e/comment", data={"note": "x"}).status_code == 404
+    assert c.post("/ui/acme/.hidden/comment", data={"note": "x"}).status_code == 404
+
+
+def test_status_query_is_normalized(conf):
+    _seed(conf)
+    c = TestClient(build_ui(conf))
+    evil = "<script>alert(1)</script>"
+    r = c.get("/ui", params={"status": evil, "element": "unit-2"})
+    assert r.status_code == 200 and evil not in r.text and "href='/ui?status=open'" in r.text
+    assert "CASE-123" in r.text  # open として扱う
+    assert "CASE-123" in c.get("/ui?status=all").text and "CASE-123" not in c.get("/ui?status=closed").text
+
+
+def test_task_form_rejects_unknown_owner(conf):
+    st = _seed(conf)
+    c = TestClient(build_ui(conf))
+    assert c.post("/ui/acme/CASE-123/task", data={"title": "x", "owner": "robot"}).status_code == 400
+    assert st.current_plan("CASE-123")["version"] == 1
