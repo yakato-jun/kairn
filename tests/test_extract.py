@@ -164,7 +164,10 @@ class FakeRun:
         self.calls = []
 
     def __call__(self, cmd, **kw):
-        self.calls.append({"cmd": cmd, **kw})
+        cwd = Path(kw["cwd"]) if kw.get("cwd") else None
+        # cwd（一時ディレクトリの写し）は実行後に消えるので、その時点の親ディレクトリ配下の一覧を取っておく
+        tree = sorted(str(p.relative_to(cwd.parent)) for p in cwd.parent.rglob("*")) if cwd and cwd.exists() else None
+        self.calls.append({"cmd": cmd, **kw, "tree": tree})
         if self.missing:
             raise FileNotFoundError(cmd[0])
         if self.timeout:
@@ -188,7 +191,8 @@ def test_extract_card_success_records_event_and_writes_nothing(conf, monkeypatch
     assert r["ok"] is True and r["card"] == good_card() and r["agent"] == "claude" and r["error"] is None
     assert r["elapsed_sec"] >= 0 and "result" in r["raw_excerpt"]
     call = fake.calls[0]
-    assert call["cwd"] == str(ws.cases_dir / "CASE-123") and call["timeout"] == 42 and call["stdin"] is subprocess.DEVNULL
+    assert Path(call["cwd"]).name == "CASE-123" and call["cwd"] != str(ws.cases_dir / "CASE-123")  # 写し（M-3）
+    assert call["timeout"] == 42 and call["stdin"] is subprocess.DEVNULL
     assert "SECRET_TOKEN" not in call["env"] and "PATH" in call["env"]
     assert call["cmd"][0] == "claude" and "CASE-100" in call["cmd"][2] and "PROMPT" not in call["cmd"][2]
     after = st.load_case("CASE-123")
@@ -229,7 +233,7 @@ def test_extract_card_codex_reads_out_file(conf, monkeypatch):
     r = extract.extract_card(conf, ws, "CASE-123", agent="codex")
     assert r["ok"] and r["card"]["title"] == "from -o" and r["agent"] == "codex"
     cmd = fake.calls[0]["cmd"]
-    assert cmd[:2] == ["codex", "exec"] and cmd[cmd.index("-C") + 1] == str(ws.cases_dir / "CASE-123")
+    assert cmd[:2] == ["codex", "exec"] and cmd[cmd.index("-C") + 1] == fake.calls[0]["cwd"] and Path(fake.calls[0]["cwd"]).name == "CASE-123"
     assert not (ws.cases_dir / "CASE-123" / "out.json").exists()  # -o は案件ディレクトリの外
     assert not any(p.name.startswith("prompt") for p in (ws.cases_dir / "CASE-123").iterdir())
     assert st.events("CASE-123")[-1]["agent"] == "extract:codex"
@@ -259,3 +263,30 @@ def test_extract_card_uses_config_timeout(conf, monkeypatch):
     r = extract.extract_card(conf, ws, "CASE-123")
     assert r["ok"] and fake.calls[-1]["timeout"] == 77
     assert CaseStore(ws.cases_dir).events("CASE-123")[-1]["timeout_sec"] == 77
+
+
+# ---------- M-3: 子エージェントの cwd は一時ディレクトリの写し（自案件＋兄弟の case.json だけ） ----------
+
+def test_extract_cwd_is_staged_copy_with_siblings_case_json_only(conf, monkeypatch, tmp_path):
+    st = _seed(conf); ws = conf.workspaces["acme"]
+    case = st.case_dir("CASE-123")
+    (case / "sub").mkdir(); (case / "sub" / "0901_notes.md").write_text("x", encoding="utf-8")
+    (case / "target").mkdir(); (case / "target" / "a.o").write_bytes(b"o")            # rules.exclude
+    (case / "run.bag").write_bytes(b"b" * 10)                                          # 生データ（拡張子）
+    (case / "link.md").symlink_to(case / "worklog.md")                                 # シンボリックリンク
+    (ws.cases_dir / "CASE-100" / "secret-notes.md").write_text("sibling worklog", encoding="utf-8")
+    (ws.cases_dir / "0815_legacy").mkdir(); (ws.cases_dir / "0815_legacy" / "worklog.md").write_text("legacy", encoding="utf-8")
+    (ws.data_dir / "index").mkdir(parents=True); (ws.data_dir / "index" / "drive-index.txt").write_text("i", encoding="utf-8")
+    other = tmp_path / "data" / "other-ws" / "cases" / "CASE-777"; other.mkdir(parents=True); (other / "worklog.md").write_text("other ws", encoding="utf-8")
+    fake = FakeRun(stdout=_claude_stdout(good_card()))
+    monkeypatch.setattr(adapters.subprocess, "run", fake)
+    r = extract.extract_card(conf, ws, "CASE-123")
+    assert r["ok"]
+    call = fake.calls[0]
+    cwd = Path(call["cwd"])
+    assert cwd.name == "CASE-123" and cwd.parent.name == "cases" and not str(cwd).startswith(str(ws.data_dir))
+    assert call["tree"] == ["CASE-100", "CASE-100/case.json", "CASE-123", "CASE-123/case.json", "CASE-123/events.jsonl",
+                            "CASE-123/sub", "CASE-123/sub/0901_notes.md", "CASE-123/worklog.md"]
+    # 元の案件ディレクトリは変わらず、写しは実行後に消える
+    assert (case / "run.bag").exists() and (case / "link.md").is_symlink() and not cwd.exists()
+    assert "CASE-100" in call["cmd"][2]  # プロンプトの文脈（兄弟 ID）は従来どおり

@@ -44,3 +44,31 @@ def test_ui_extract_and_apply(conf, monkeypatch):
     assert c.post("/ui/acme/CASE-123/apply", data={"card": "{bad"}).status_code == 400
     assert c.post("/ui/acme/CASE-123/apply", data={"card": json.dumps(good_card(extra=1))}).status_code == 400
     assert c.post("/ui/acme/CASE-123/extract", headers={"origin": "http://evil.example"}).status_code == 403
+
+
+def test_ui_extract_does_not_block_other_requests(conf, monkeypatch):
+    """M-1: extract（最長 extract.timeout 秒の subprocess）中でも同じアプリの別リクエストが処理される（threadpool で実行）。"""
+    import threading
+    from kairn import extract, ui
+    _seed(conf)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_extract(conf_, ws, case, agent=None, timeout=None):
+        started.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("extract was never released")
+        return {"ok": False, "card": None, "agent": "fake", "elapsed_sec": 0.0, "error": "released", "raw_excerpt": ""}
+    monkeypatch.setattr(extract, "extract_card", slow_extract)
+    # with 付き: 全リクエストが 1 つのイベントループ（portal）を共有する（本番の uvicorn と同じ条件）
+    with TestClient(build_ui(conf)) as c:
+        result = {}
+        t = threading.Thread(target=lambda: result.update(extract=c.post("/ui/acme/CASE-123/extract")))
+        t.start()
+        assert started.wait(timeout=5)
+        got = {}
+        g = threading.Thread(target=lambda: got.update(page=c.get("/ui/acme/CASE-123").status_code))
+        g.start(); g.join(timeout=3)
+        blocked = g.is_alive()      # extract がイベントループを塞いでいると GET が終わらない
+        release.set(); t.join(timeout=10); g.join(timeout=10)
+    assert not blocked and got.get("page") == 200
+    assert result["extract"].status_code == 200 and "released" in result["extract"].text

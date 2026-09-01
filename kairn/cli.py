@@ -265,7 +265,7 @@ def cmd_install_skill(a):
 def main() -> None:
     ap = argparse.ArgumentParser(prog="kairn", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("setup"); s.add_argument("--remote", required=True); s.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode", "antigravity"]); s.add_argument("--extract-timeout", type=int, default=None, metavar="SEC", help="extract の子エージェントのタイムアウト秒（既定 600。省略時は既存値を保つ）"); s.set_defaults(f=cmd_setup)
+    s = sub.add_parser("setup"); s.add_argument("--remote", required=True); s.add_argument("--agent", default=None, choices=["claude", "codex", "opencode", "antigravity"], help="抽出エージェント（省略時は既存値を保つ。初回は claude）"); s.add_argument("--extract-timeout", type=int, default=None, metavar="SEC", help="extract の子エージェントのタイムアウト秒（既定 600。省略時は既存値を保つ）"); s.set_defaults(f=cmd_setup)
     s = sub.add_parser("ws"); ss = s.add_subparsers(dest="sub", required=True); ss.add_parser("list"); c = ss.add_parser("create"); c.add_argument("name"); c.add_argument("--description"); s.set_defaults(f=cmd_ws)
     s = sub.add_parser("attach"); s.add_argument("ws"); s.add_argument("repos", nargs="*"); s.set_defaults(f=cmd_attach)
     s = sub.add_parser("detach"); s.add_argument("repo", nargs="?"); s.set_defaults(f=cmd_detach)

@@ -28,10 +28,12 @@ def _touch(p: Path, size: int = 10, age_sec: float = 0) -> Path:
 class FakeRun:
     """subprocess.run の代役。rclone: 引数を記録し、lsf はローカルを自前で列挙、move は対象ファイルを削除して成功を返す。"""
 
-    def __init__(self, rules, fail_move: bool = False, fail: set[str] | None = None):
+    def __init__(self, rules, fail_move: bool = False, fail: set[str] | None = None, fail_move_nth: int | None = None):
         self.calls: list[list[str]] = []
         self.rules = rules
         self.fail_move = fail_move
+        self.fail_move_nth = fail_move_nth  # n 回目の move だけ失敗させる（1 始まり）
+        self.moves = 0
         self.fail = fail or set()
 
     def __call__(self, cmd, **kw):
@@ -53,7 +55,8 @@ class FakeRun:
                 rows.append(f"{p.relative_to(src)}\t{p.stat().st_size}")
             return subprocess.CompletedProcess(cmd, 0, "\n".join(rows) + ("\n" if rows else ""), "")
         if prog == "rclone" and sub == "move":
-            if self.fail_move:
+            self.moves += 1
+            if self.fail_move or self.moves == self.fail_move_nth:
                 return subprocess.CompletedProcess(cmd, 1, "", "fake rclone move failed")
             if "--dry-run" not in cmd:
                 src = Path(cmd[2])
@@ -275,6 +278,26 @@ def test_append_data_location_creates_section_at_end(tmp_path):
     sync._append_data_location(p, "- line1", "t")
     sync._append_data_location(p, "- line2", "t")
     assert p.read_text(encoding="utf-8") == "# t\n\n## Notes\nx\n\n## Data location\n- line1\n- line2\n"
+
+
+def test_raw_move_records_files_moved_before_second_move_fails(conf, fake):
+    """M-2: 拡張子パス（1 回目）で移動済みのファイルは、サイズパス（2 回目）が失敗しても記録される（所在不明にしない）。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-123", "t", "acme", actor="human")
+    _touch(ws.cases_dir / "CASE-123" / "run.bag", 10, 20 * DAY)
+    fake.fail_move_nth = 2
+    r = sync.raw_move(conf, ws)
+    c = r["cases"]["CASE-123"]
+    assert "error" in c and "move failed" in c["error"]
+    assert c["moved"] == ["run.bag"] and c["bytes"] == 10 and r["files"] == 1
+    assert not (ws.cases_dir / "CASE-123" / "run.bag").exists()
+    data = st.load_case("CASE-123")["data"]
+    assert len(data) == 1 and data[0]["files"] == 1
+    assert (ws.data_dir / data[0]["list"]).read_text(encoding="utf-8") == "CASE-123/run.bag\t10\tmy-drive:ws/acme/cases/CASE-123/run.bag\n"
+    assert "## Data location\n- " in (ws.cases_dir / "CASE-123" / "worklog.md").read_text(encoding="utf-8")
+    assert st.events("CASE-123")[-1]["action"] == "progress"
+    assert sync.raw_move(conf, ws, dry=True)["cases"]["CASE-123"]["planned"] == []  # 次回の planned に出ない
 
 
 def test_raw_move_failure_is_reported_not_recorded(conf, fake):

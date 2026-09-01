@@ -12,6 +12,7 @@ from datetime import datetime
 from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
@@ -236,7 +237,8 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
                 return PlainTextResponse(str(e), status_code=400)
         elif kind == "extract":  # 子エージェントで下書きを作り、差分と適用ボタンを表示する（case.json は書かない）
             from . import extract
-            r = extract.extract_card(conf, ws, cid)
+            # 子プロセスは最長 extract.timeout 秒ブロックする。同じプロセスの MCP（/mcp）を止めないようスレッドで実行する
+            r = await run_in_threadpool(extract.extract_card, conf, ws, cid)
             return _page(f"{cid} draft", _draft_view(ws, cid, st.load_case(cid), r))
         elif kind == "apply":  # 人が確認した下書きを case.json に適用（title / summary / elements / related / causal）
             from . import extract

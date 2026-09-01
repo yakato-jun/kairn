@@ -118,3 +118,12 @@ def test_cli_setup_writes_extract_timeout(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["kairn", "setup", "--remote", "my-drive"])
     cli.main()
     assert cfg.load(p).extract_timeout == 120                                    # --extract-timeout 省略時は既存値を保つ
+    assert cfg.load(p).extract_agent == "codex"                                  # --agent 省略時も既存値を保つ（M-4）
+
+
+def test_create_keeps_existing_agent_when_omitted(tmp_path):
+    p = tmp_path / "config.yaml"
+    assert cfg.create("my-drive", path=p).extract_agent == "claude"              # 初回の既定
+    assert cfg.create("my-drive", "opencode", path=p).extract_agent == "opencode"
+    assert cfg.create("my-drive", path=p).extract_agent == "opencode"            # 省略時は既存値
+    assert cfg.load(p).extract_agent == "opencode"

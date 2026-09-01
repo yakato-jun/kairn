@@ -349,6 +349,7 @@ def record_data_location(ws: Workspace, case_dir: Path, drive: str, moved: dict[
 
 def raw_move(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False) -> dict:
     """生データを Drive へ移動（rclone move。転送後にハッシュ照合してローカルを削除するのは rclone）。
+    2 回目の move が失敗しても 1 回目で移動済みのファイルは記録してから error を付ける（記録漏れで所在不明にしない）。
     返り値: {dry, cases: {case: {planned: [...], moved: [...], bytes, drive, error?}}, files, bytes}"""
     rr = raw_rules(conf)
     sets = _raw_filter_sets(conf, rr)
@@ -371,24 +372,30 @@ def raw_move(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
             summary["planned"] = sorted(planned)
             if not planned:
                 continue
+            # 2 回の move（拡張子パス／サイズパス）。途中で失敗しても、それまでに消えた（＝移動済みの）ファイルは必ず記録する
+            failure: Exception | None = None
             for filt in sets:
-                _run(["rclone", "move", str(d), drive, "--fast-list", "--transfers", "4", "--stats-one-line", "-v",
-                      *filt, *_bw(conf)], dry)
-            if dry:
-                continue
-            moved = {rel: size for rel, size in planned.items() if not (d / rel).exists()}
-            summary["moved"] = sorted(moved)
-            summary["bytes"] = sum(moved.values())
-            if not moved:
-                continue
-            lst = ws.data_dir / list_rel
-            lst.parent.mkdir(parents=True, exist_ok=True)
-            with lst.open("a", encoding="utf-8") as fh:
-                for rel in sorted(moved):
-                    fh.write(f"{d.name}/{rel}\t{moved[rel]}\t{drive}{rel}\n")
-            summary["record"] = record_data_location(ws, d, drive, moved, list_rel)
-            out["files"] += len(moved)
-            out["bytes"] += summary["bytes"]
+                try:
+                    _run(["rclone", "move", str(d), drive, "--fast-list", "--transfers", "4", "--stats-one-line", "-v",
+                          *filt, *_bw(conf)], dry)
+                except Exception as e:
+                    failure = e
+                    break
+            if not dry:
+                moved = {rel: size for rel, size in planned.items() if not (d / rel).exists()}
+                summary["moved"] = sorted(moved)
+                summary["bytes"] = sum(moved.values())
+                if moved:
+                    lst = ws.data_dir / list_rel
+                    lst.parent.mkdir(parents=True, exist_ok=True)
+                    with lst.open("a", encoding="utf-8") as fh:
+                        for rel in sorted(moved):
+                            fh.write(f"{d.name}/{rel}\t{moved[rel]}\t{drive}{rel}\n")
+                    summary["record"] = record_data_location(ws, d, drive, moved, list_rel)
+                    out["files"] += len(moved)
+                    out["bytes"] += summary["bytes"]
+            if failure is not None:
+                raise failure
         except Exception as e:
             summary["error"] = str(e)
     return out

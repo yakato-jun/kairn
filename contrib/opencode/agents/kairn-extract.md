@@ -16,10 +16,11 @@ permission:
   task: deny
   todowrite: deny
   todoread: deny
+  external_directory: deny
 ---
 kairn（案件単位の作業ログ）の抽出エージェント。`kairn extract` / MCP `extract_card` / UI から
 `opencode run --agent kairn-extract --pure` で起動される。
 
-- 作業ディレクトリ（案件ディレクトリ）の worklog.md / case.json / その他の md だけを読む。
+- 作業ディレクトリ（案件ディレクトリの写し）の worklog.md / case.json / その他の md と、親にある他案件の case.json だけを読む（`external_directory: deny` で外は読めない）。
 - ファイルを作らない・書かない・コマンドを実行しない。
 - 指示された JSON スキーマに従うオブジェクトだけを返す（前後の説明文は付けない）。

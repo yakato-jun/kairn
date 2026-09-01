@@ -9,11 +9,24 @@
 |---|---|---|---|
 | claude | `claude -p "<prompt>" --output-format json` | JSON | `--allowedTools Read,Grep,Glob --strict-mcp-config`（MCP を読まない＝再帰防止） |
 | codex | `codex exec "<prompt>" -C <case_dir> --json --output-schema schema.json -o out.json` | JSON（スキーマ強制） | `-s read-only --ephemeral --skip-git-repo-check` |
-| opencode | `opencode run "<message>" --format json --agent kairn-extract --pure` | JSON イベント列（最終メッセージを抽出） | 読み取り専用は agent 定義（tools 制限）で担保。`--pure` でプラグイン無効 |
+| opencode | `opencode run "<message>" --format json --agent kairn-extract --pure` | JSON イベント列（最終メッセージを抽出） | 読み取り専用は agent 定義（`permission:` で read / grep / glob / list 以外を deny、`external_directory: deny`）で担保。`--pure` でプラグイン無効 |
 | antigravity | `agy --print "<prompt>" --sandbox --print-timeout 10m` | テキスト（本文中の JSON を抽出） | `--sandbox`。`--dangerously-skip-permissions` は使わない |
 
 共通規則:
-- 作業ディレクトリは対象案件のディレクトリのみ。ワークスペース外は渡さない。
+- 作業ディレクトリは対象案件のディレクトリの**写し**（一時ディレクトリ）。ワークスペース外は渡さない。
+
+## 境界（ワークスペース・案件）の担保
+
+- **境界は一時ディレクトリへのコピーで担保し、各 CLI のサンドボックス（claude の `--allowedTools`、codex の `-s read-only`、
+  opencode の `permission` / `external_directory: deny`、antigravity の `--sandbox`）は補助**。プロンプト文（「親より上には行かない」）には頼らない。
+  実データの `workspaces/` は複数ワークスペースが同居する（案件ディレクトリの 3 つ上）ため、案件ディレクトリを cwd にすると
+  子エージェントが他ワークスペースへ辿れてしまう。
+- `extract.stage_case_dir()` が `TemporaryDirectory/cases/` に (1) 自案件のディレクトリ全体（シンボリックリンク、`rules.exclude` の
+  ディレクトリ／ファイルパターン、生データ＝`rules.raw_data` の拡張子か `min_size` 超のファイルを除く）、(2) 同じワークスペースの
+  兄弟案件の `case.json` だけ、を置き、(1) を cwd にする。実行後に一時ディレクトリごと消す。案件ディレクトリには何も書かない。
+- **文脈隔離の範囲は MCP 無効・ツール制限・一時 cwd まで**。子プロセスは利用者の HOME 配下にある各 CLI の設定
+  （`~/.claude/CLAUDE.md`、hooks、`~/.codex/config.toml`、`~/.config/opencode/` 等）を読む。それらを隔離したい場合は
+  `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `OPENCODE_CONFIG`（環境変数として子に渡る）で別の設定を指す。
 - 出力はスキーマ検証に通ったものだけ返す。通らなければ「下書き失敗」（採用しない）。
 - 書き込みはしない。確定は人（UI で差分を確認）。
 - タイムアウト・終了コード・所要時間・使用エージェントを events に記録する。
@@ -30,7 +43,7 @@
   `causal`（`[{symptom, component, cause, evidence}]`）, `confidence`（0〜1）。検証は `jsonschema`（明示依存）。
   codex には `--output-schema` でそのまま渡す。
 - `adapters.py`: 表の 4 アダプタ。各アダプタは (a) `build_command(prompt_path, schema_path, case_dir, timeout, out_path=None)`（純関数。
-  codex だけ `out_path` 必須＝`-o`）、(b) `run(...)`（`subprocess.run(cwd=case_dir, env=最小限, timeout=…, stdin=DEVNULL)`）、
+  codex だけ `out_path` 必須＝`-o`。`case_dir` は写しのパス）、(b) `run(...)`（`subprocess.run(cwd=case_dir, env=最小限, timeout=…, stdin=DEVNULL)`）、
   (c) `extract_json(stdout, out_file=None)`。JSON の取り出し順: claude は `--output-format json` の `result` 文字列 → 本文から、
   codex は `-o` ファイル → `--json` イベント列の最後の `item.completed` / `agent_message` → 本文、opencode はイベント列の最後の text 部品
   （`part.type == "text"`）→ 本文、antigravity は本文から。「本文から」＝ 全体が JSON → ```json フェンス → 前後に説明文があれば `{` から
@@ -42,8 +55,9 @@
 - タイムアウトは設定 `extract.timeout`（秒、既定 600。`kairn setup --extract-timeout <sec>` が書く。antigravity の `--print-timeout` には
   `10m` の形で渡す）。`extract_card(..., timeout=)` を明示すればそちらが優先（テスト用）。
 - 入口: MCP `extract_card(case, workspace?)`、CLI `kairn extract <case> [--ws] [--agent] [--json]`（失敗は exit 1）、
-  UI 案件ページの「下書きを取得」（結果画面で現在値との差分を見て「この下書きを case.json に適用」）。適用は UI からだけ
+  UI 案件ページの「下書きを取得」（結果画面で現在値との差分を見て「この下書きを case.json に適用」。UI と MCP は同じプロセスなので
+  `run_in_threadpool` で実行し、子プロセス待ちの間も `/mcp` を止めない）。適用は UI からだけ
   （`extract.apply_card`: title / summary / elements / related / causal を置き換え、`{actor: human, action: decision, note: "applied extract draft"}`）。
 - 結果は毎回 events に `{actor: kairn, agent: "extract:<name>", action: extract, note: "ok (confidence …)" | 失敗理由, elapsed_sec, exit_code, timeout_sec}`。
-- opencode の agent `kairn-extract`（`permission:` で read / grep / glob / list 以外を deny した定義）は `contrib/opencode/agents/kairn-extract.md`。
+- opencode の agent `kairn-extract`（`permission:` で read / grep / glob / list 以外を deny、`external_directory: deny` で cwd 外を拒否した定義）は `contrib/opencode/agents/kairn-extract.md`。
   `~/.config/opencode/agents/` に置く（README）。未配置なら opencode が失敗し `ok=false` になる。

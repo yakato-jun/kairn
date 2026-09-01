@@ -42,7 +42,7 @@ docs/                  データモデル・MCP ツール・UI の仕様
 設定ファイル `~/.config/kairn/config.yaml` はこれらのコマンドが書く（人は編集しない）。`<ws>` 省略時は cwd が属するワークスペース。
 
 ```
-kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity] [--extract-timeout <sec>]   # 使う remote（これ以外は使わない）と抽出エージェント
+kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity] [--extract-timeout <sec>]   # 使う remote（これ以外は使わない）と抽出エージェント（--agent / --extract-timeout 省略時は既存値を保つ）
 kairn ws list | kairn ws create <name> [--description "…"]   # ワークスペース一覧（Drive 上の有無つき）／作成
 kairn attach <ws> [<repo path>...]        # リポジトリを所属させ <repo>/<link_name>（既定 tmp）を cases/ へのリンクにする（省略時は cwd）
 kairn detach [<repo path>]                # 所属を外す（glob: 由来なら exclude: を書く）
@@ -107,7 +107,7 @@ OpenCode の `~/.config/opencode/opencode.json`（プロジェクト直下の `o
 ### 4. OpenCode で extract を使う場合（`extract.agent: opencode`）
 
 読み取り専用のエージェント定義 `contrib/opencode/agents/kairn-extract.md` を `~/.config/opencode/agents/` に置く
-（書式は https://opencode.ai/docs/agents/ 。`tools:` は deprecated のため `permission:` で read / grep / glob / list 以外を deny）:
+（書式は https://opencode.ai/docs/agents/ 。`tools:` は deprecated のため `permission:` で read / grep / glob / list 以外を deny、`external_directory: deny` で cwd 外を拒否）:
 ```
 mkdir -p ~/.config/opencode/agents && cp contrib/opencode/agents/kairn-extract.md ~/.config/opencode/agents/
 ```
@@ -158,7 +158,7 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 案件カード（case.json）の下書き（title / summary / elements / related / 症状→部品→原因）を、**文脈隔離した子エージェント**が案件ディレクトリを読んで作る
 （docs/extract-agents.md）。使うエージェントは `~/.config/kairn/config.yaml` の `extract.agent`（`kairn setup --agent`）: claude / codex / opencode / antigravity。
 タイムアウトは `extract.timeout`（秒、既定 600。`kairn setup --extract-timeout <sec>`）。
-子プロセスは案件ディレクトリを cwd に、読み取り専用オプション・最小限の環境変数で起動し、出力は `kairn/extract/schema.json` で検証する。
+子プロセスは**案件ディレクトリの写し**（一時ディレクトリ。自案件の全体＋同じワークスペースの兄弟案件の `case.json` だけ）を cwd に、読み取り専用オプション・最小限の環境変数で起動し、出力は `kairn/extract/schema.json` で検証する（ワークスペース境界はファイルシステムで切る。docs/extract-agents.md）。
 **下書きは書き込まない**。適用は UI の案件ページ「下書きを取得」→ 差分を見て「この下書きを case.json に適用」（人の操作）だけ。
 
 ```

@@ -34,6 +34,7 @@ DEFAULT_RULES = {
     "bag_to_zst": True,
 }
 DEFAULT_EXTRACT_TIMEOUT_SEC = 600  # extract の子エージェントのタイムアウト（秒）。extract.timeout
+DEFAULT_EXTRACT_AGENT = "claude"
 
 
 @dataclass
@@ -182,7 +183,7 @@ def _parse(raw: dict, path: Path) -> Config:
     timeout = ext.get("timeout", DEFAULT_EXTRACT_TIMEOUT_SEC)
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise SystemExit(f"kairn: extract.timeout must be a positive integer (seconds), got {timeout!r}")
-    return Config(remote=remote, drive_root=drive.get("root", "ws"), extract_agent=ext.get("agent", "claude"),
+    return Config(remote=remote, drive_root=drive.get("root", "ws"), extract_agent=ext.get("agent", DEFAULT_EXTRACT_AGENT),
                   rules=rules, workspaces=wss, path=path, extract_timeout=timeout)
 
 
@@ -193,11 +194,14 @@ def load(path: Path | None = None) -> Config:
     return _parse(yaml.safe_load(path.read_text(encoding="utf-8")) or {}, path)
 
 
-def create(remote: str, agent: str = "claude", path: Path | None = None, drive_root: str = "ws",
+def create(remote: str, agent: str | None = None, path: Path | None = None, drive_root: str = "ws",
            extract_timeout: int | None = None) -> Config:
-    """設定を書く（既存の rules / workspaces / extract.timeout は引き継ぐ）。extract_timeout=None なら既存値（無ければ既定 600）。"""
+    """設定を書く（既存の rules / workspaces / extract.agent / extract.timeout は引き継ぐ）。
+    agent=None / extract_timeout=None なら既存値（無ければ既定 claude / 600）。"""
     path = path or USER_CONFIG_PATH
     existing = load(path) if path.exists() else None
+    if agent is None:
+        agent = existing.extract_agent if existing else DEFAULT_EXTRACT_AGENT
     if extract_timeout is None:
         extract_timeout = existing.extract_timeout if existing else DEFAULT_EXTRACT_TIMEOUT_SEC
     if extract_timeout <= 0:
