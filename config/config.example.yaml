@@ -36,6 +36,7 @@ workspaces:
       - /home/user/acme-robot    # 文字列 = 絶対パス（`- path: /home/user/acme-robot` と同じ）
       - path: /home/user/acme-tools
       - glob: ~/Acme*            # 一致するディレクトリを全部（読み込み時に展開。ファイルは除く）
+      - exclude: /home/user/Acme-old   # glob の展開から外す（glob 由来のリポジトリを `kairn detach` すると書かれる）
     link_name: tmp
   personal:
     description: "顧客横断の個人ログ。他ワークスペースからは明示指定でのみ参照"

@@ -3,7 +3,7 @@
   kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity]
   kairn ws list | ws create <name>
   kairn attach <ws> [<repo path>...]     # 省略時は cwd。<repo>/<link_name> を cases/ へのリンクにする
-  kairn detach [<repo path>]
+  kairn detach [<repo path>]             # 省略時は cwd。glob: 由来なら exclude: を書いて展開から外す
   kairn status
   kairn cases [<ws>] [--all]
   kairn new <case id> "<title>" [--ws <ws>]

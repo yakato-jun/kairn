@@ -2,8 +2,9 @@
 
   drive:      {remote: <rclone remote>, root: ws}          kairn setup --remote が書く
   extract:    {agent: claude|codex|opencode|antigravity}   kairn setup --agent
-  workspaces: {<name>: {repos: [<abs path> | {path: <abs path>} | {glob: <pattern>} ...], link_name: tmp}}
-              kairn attach / detach が書く（glob: は展開時にディレクトリだけ採る。未知のキー・空文字は拒否）
+  workspaces: {<name>: {repos: [<abs path> | {path: <abs path>} | {glob: <pattern>} | {exclude: <abs path>} ...], link_name: tmp}}
+              kairn attach / detach が書く（glob: は展開時にディレクトリだけ採る。exclude: は glob: の展開から外す（detach が書く）。
+              未知のキー・空文字は拒否）
   rules:      同期・退避規則（既定値あり）
 
 規則:
@@ -39,7 +40,7 @@ class Workspace:
     name: str
     description: str = ""
     repos: list[Path] = field(default_factory=list)            # 展開済み（glob: はディレクトリに展開）
-    repo_specs: list = field(default_factory=list)             # 設定ファイルに書く形（文字列 / {path} / {glob}）
+    repo_specs: list = field(default_factory=list)             # 設定ファイルに書く形（文字列 / {path} / {glob} / {exclude}）
     link_name: str = "tmp"
     data_root: Path | None = None  # None なら DATA_ROOT（KAIRN_DATA_ROOT）
 
@@ -49,17 +50,22 @@ class Workspace:
             self.repo_specs.append(str(repo))
 
     def remove_repo(self, repo: Path) -> None:
-        """path 指定の登録を外す。glob: で拾われたものは外せない（設定の glob 行を消す必要がある）。"""
+        """path 指定の登録を外す。glob: で拾われたものは `{exclude: <path>}` を追記して展開から外す（glob 行は残す）。"""
         keep = []
+        via_glob = False
         for spec in self.repo_specs:
             if isinstance(spec, dict) and "glob" in spec:
                 if any(r.resolve() == repo for r in _expand_repo_spec(spec, self.name)):
-                    raise SystemExit(f"kairn: {repo} is registered via glob {spec['glob']!r}; cannot detach a single directory")
+                    via_glob = True
+                keep.append(spec)
+            elif isinstance(spec, dict) and "exclude" in spec:
                 keep.append(spec)
             elif Path(os.path.expanduser(spec if isinstance(spec, str) else spec["path"])).resolve() == repo:
                 continue
             else:
                 keep.append(spec)
+        if via_glob and not any(isinstance(sp, dict) and "exclude" in sp and Path(os.path.expanduser(sp["exclude"])).resolve() == repo for sp in keep):
+            keep.append({"exclude": str(repo)})
         self.repo_specs = keep
         self.repos = [r for r in self.repos if r.resolve() != repo]
 
@@ -120,21 +126,42 @@ class Config:
 
 
 def _expand_repo_spec(spec, ws_name: str) -> list[Path]:
-    """repos の 1 要素を Path のリストに。文字列 / {path: ...} はそのまま 1 件、{glob: ...} は一致するディレクトリだけ。
-    未知のキー・複数キー・空文字は SystemExit（Path("") がカレントディレクトリに化けるのを防ぐ）。"""
+    """repos の 1 要素を Path のリストに。文字列 / {path: ...} はそのまま 1 件、{glob: ...} は一致するディレクトリだけ、
+    {exclude: ...} は空（除外は expand_repos で引く）。未知のキー・複数キー・空文字は SystemExit
+    （Path("") がカレントディレクトリに化けるのを防ぐ）。"""
     where = f"workspaces.{ws_name}.repos"
     if isinstance(spec, str):
         spec = {"path": spec}
     if not isinstance(spec, dict) or len(spec) != 1:
-        raise SystemExit(f"kairn: {where}: each entry must be a path string, {{path: ...}} or {{glob: ...}} (got {spec!r})")
+        raise SystemExit(f"kairn: {where}: each entry must be a path string, {{path: ...}}, {{glob: ...}} or {{exclude: ...}} (got {spec!r})")
     (key, val), = spec.items()
-    if key not in ("path", "glob"):
-        raise SystemExit(f"kairn: {where}: unknown key {key!r} (expected path or glob)")
+    if key not in ("path", "glob", "exclude"):
+        raise SystemExit(f"kairn: {where}: unknown key {key!r} (expected path, glob or exclude)")
     if not isinstance(val, str) or not val.strip():
         raise SystemExit(f"kairn: {where}: {key} must be a non-empty string (got {val!r})")
     if key == "path":
         return [Path(os.path.expanduser(val))]
+    if key == "exclude":
+        return []
     return [Path(p) for p in sorted(_glob.glob(os.path.expanduser(val))) if os.path.isdir(p)]
+
+
+def expand_repos(specs: list, ws_name: str) -> list[Path]:
+    """repos 全体を展開する（重複なし）。{exclude: <path>} に一致するものは glob: の展開から外す（path: の明示登録は外さない）。"""
+    excluded = set()
+    for spec in specs:
+        if isinstance(spec, dict) and len(spec) == 1 and "exclude" in spec:
+            _expand_repo_spec(spec, ws_name)  # 検証のみ
+            excluded.add(Path(os.path.expanduser(spec["exclude"])).resolve())
+    repos: list[Path] = []
+    for spec in specs:
+        is_glob = isinstance(spec, dict) and "glob" in spec
+        for r in _expand_repo_spec(spec, ws_name):
+            if is_glob and r.resolve() in excluded:
+                continue
+            if r not in repos:
+                repos.append(r)
+    return repos
 
 
 def _parse(raw: dict, path: Path) -> Config:
@@ -146,11 +173,7 @@ def _parse(raw: dict, path: Path) -> Config:
     for name, w in (raw.get("workspaces") or {}).items():
         w = w or {}
         specs = list(w.get("repos") or [])
-        repos: list[Path] = []
-        for spec in specs:
-            for r in _expand_repo_spec(spec, name):
-                if r not in repos:
-                    repos.append(r)
+        repos = expand_repos(specs, name)
         wss[name] = Workspace(name=name, description=w.get("description", ""), repos=repos, repo_specs=specs, link_name=w.get("link_name", "tmp"))
     rules = {**DEFAULT_RULES, **(raw.get("rules") or {})}
     return Config(remote=remote, drive_root=drive.get("root", "ws"), extract_agent=(raw.get("extract") or {}).get("agent", "claude"),
