@@ -37,6 +37,30 @@ skills/kairn/SKILL.md  各エージェント共通の運用手順（`kairn insta
 docs/                  データモデル・MCP ツール・UI の仕様
 ```
 
+## CLI（`kairn --help`）
+
+設定ファイル `~/.config/kairn/config.yaml` はこれらのコマンドが書く（人は編集しない）。`<ws>` 省略時は cwd が属するワークスペース。
+
+```
+kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity] [--extract-timeout <sec>]   # 使う remote（これ以外は使わない）と抽出エージェント
+kairn ws list | kairn ws create <name> [--description "…"]   # ワークスペース一覧（Drive 上の有無つき）／作成
+kairn attach <ws> [<repo path>...]        # リポジトリを所属させ <repo>/<link_name>（既定 tmp）を cases/ へのリンクにする（省略時は cwd）
+kairn detach [<repo path>]                # 所属を外す（glob: 由来なら exclude: を書く）
+kairn status                              # 設定・cwd の所属・各ワークスペースの案件数とリンク状態
+kairn cases [<ws>] [--all]                # 案件一覧（既定は open のみ）
+kairn new <case id> "<title>" [--ws <ws>] # 案件を作る（case.json）
+kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新
+kairn checkin <ws> [<case>] [--dry-run]   # ローカル → Drive（rclone sync。last_checkin_at 更新）
+kairn index <ws> [--full]                 # 索引（SQLite FTS5）の差分再生成（--full で全部）
+kairn drive-index <ws>                    # Drive 上の全ファイル一覧を index/drive-index.txt に
+kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮
+kairn raw-move <ws> [<case>] [--dry-run]  # 生データを Drive へ移動し所在を記録
+kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move → drive-index → index
+kairn extract <case> [--ws <ws>] [--agent …] [--json]   # 子エージェントで case.json の下書き（書き込まない）
+kairn serve [--host 127.0.0.1] [--port 8765]            # MCP（/mcp）＋ UI（/ui）
+kairn install-skill [--home <dir>]        # skills/kairn を ~/.agents/skills と ~/.claude/skills からリンク
+```
+
 ## 各エージェントへの適用
 
 ### 1. サーバーを常駐させる（`kairn serve`）
@@ -143,4 +167,6 @@ MCP からは `extract_card(case)`（失敗も `ok=false` の結果として返�
 ## 状態
 
 段階 1（config / store / index / server(MCP, mcp 2.x) / ui）完了（2026-09-02）。段階 5（sync: bag2zst / raw-move / daily / systemd timer）完了（2026-09-02）。
-段階 7（extract: MCP `extract_card` / `kairn extract` / UI の取得・適用）完了（2026-09-02）。skill 配置（6）と各 CLI の登録手順は未着手。実装順は docs/roadmap.md。
+段階 7（extract: MCP `extract_card` / `kairn extract` / UI の取得・適用）完了（2026-09-02）。
+段階 6（skill の最終化、`kairn install-skill`、各エージェントの MCP 登録手順、opencode agent、`kairn-serve.service`）完了（2026-09-02）。
+実装順は docs/roadmap.md（8 の既存 worklog の移行は別件）。

@@ -40,5 +40,7 @@
 ## 起動と登録
 
 - `kairn serve [--host 127.0.0.1] [--port 8765]` → MCP `http://127.0.0.1:8765/mcp`、UI `http://127.0.0.1:8765/ui`
-- Claude Code: `claude mcp add --transport http kairn http://127.0.0.1:8765/mcp`（Codex / OpenCode は README）
+- 常駐: `contrib/systemd/kairn-serve.service`（README「各エージェントへの適用」）
+- Claude Code: `claude mcp add --transport http kairn http://127.0.0.1:8765/mcp -s user`（Codex / OpenCode は README）
+- ツール名と必須引数は tests/test_docs.py がこの表と server.py を照合する
 - テスト: `mcp.client.Client(server)` で in-process、`Client("http://…/mcp")` で HTTP（tests/test_server.py, tests/test_e2e.py）

@@ -45,4 +45,5 @@
   UI 案件ページの「下書きを取得」（結果画面で現在値との差分を見て「この下書きを case.json に適用」）。適用は UI からだけ
   （`extract.apply_card`: title / summary / elements / related / causal を置き換え、`{actor: human, action: decision, note: "applied extract draft"}`）。
 - 結果は毎回 events に `{actor: kairn, agent: "extract:<name>", action: extract, note: "ok (confidence …)" | 失敗理由, elapsed_sec, exit_code, timeout_sec}`。
-- opencode の agent `kairn-extract`（tools を read / grep / glob に制限した定義）の配置は段階 6（skill・登録手順）で扱う。未配置なら opencode が失敗し `ok=false` になる。
+- opencode の agent `kairn-extract`（`permission:` で read / grep / glob / list 以外を deny した定義）は `contrib/opencode/agents/kairn-extract.md`。
+  `~/.config/opencode/agents/` に置く（README）。未配置なら opencode が失敗し `ok=false` になる。
