@@ -28,7 +28,8 @@
 kairn/                 パッケージ（config / store / index / server(MCP) / ui / sync / extract）
 kairn/extract/         案件カードの下書き抽出: prompt.md（子エージェントへの指示）/ schema.json（出力の JSON Schema）/ adapters.py（claude / codex / opencode / antigravity）
 config/config.example.yaml  環境ローカル設定の書式例（架空名）。実体は ~/.config/kairn/config.yaml（kairn のコマンドが書く。コミットしない）
-contrib/systemd/       日次同期の systemd user unit（kairn-daily.service / .timer）
+contrib/systemd/       systemd user unit（kairn-serve.service: MCP+UI 常駐 / kairn-daily.service + .timer: 日次同期）
+contrib/opencode/agents/kairn-extract.md  OpenCode 用の読み取り専用エージェント定義（extract の opencode アダプタが `--agent kairn-extract` で使う）
 workspaces/<ws>/       データ実体（.gitignore、Drive 同期）
   cases/<case>/        worklog.md、作業ファイル、plan/、events.jsonl
   index/               各環境で再生成する索引（kairn.sqlite）、drive-index.txt、daily.log、raw-moved-YYYYMMDD.txt
