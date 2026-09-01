@@ -12,7 +12,7 @@ workspaces/<ws>/
     events.jsonl         追記専用のイベント（下記）
     …                    作業ファイル（MMdd_hhmm_ prefix 等、従来どおり）
   index/kairn.sqlite     索引（case / plan / task / event / section の検索用）。再生成可
-  drive-index.txt        Drive 上の全ファイル一覧（path, size, mtime）
+  index/drive-index.txt  Drive 上の全ファイル一覧（path, size, mtime）。`kairn drive-index` / `kairn daily` が生成
 ```
 
 ## case.json
@@ -28,9 +28,13 @@ workspaces/<ws>/
   "elements": {"machine": ["unit-2"], "component": ["acme-plc"], "symptom": ["起動時に driver init 未完了"]},
   "data": [{"drive": "my-drive:ws/acme/cases/CASE-123/", "files": 3, "bytes": 1234567890,
             "moved_at": "2026-09-01T12:30:00+09:00", "list": "index/raw-moved-20260901.txt"}],
-  "created_at": "...", "updated_at": "...", "current_plan": 3
+  "created_at": "...", "updated_at": "...", "current_plan": 3,
+  "last_checkin_at": "2026-09-01T18:00:00+09:00"   // この案件を最後に checkin した時刻（checkin ツール / kairn checkin / daily が更新）
 }
 ```
+- `last_checkin_at`: `open_case` は、これより新しいローカル変更（`case.json` / `events.jsonl` / `worklog.md` / `plan/*.json` の mtime）が
+  あれば Drive からの checkout を skip し `drive={"skipped": "local changes newer than last checkin"}` を返す（未 checkin の変更を Drive で上書きしない）。
+  未記録なら checkout する（`--update` なのでローカルの方が新しいファイルは上書きされない）。
 
 ### data[]（生データの所在。`kairn raw-move` / `kairn daily` が追記する）
 - `drive`: 移動先（`<remote>:<root>/<ws>/cases/<case>/`。案件ディレクトリの相対構造をそのまま保つ）
@@ -55,7 +59,10 @@ workspaces/<ws>/
 - 新版を作ると、**旧版の open タスクのうち新版に `carried_from` で引き継がれなかったものは
   自動的に `superseded`（by vN）** になる。閉じる操作は存在しない。
 - タスク ID は案件内で単調増加。同じ ID が版をまたいで引き継がれる。
-- `status`: open | done | dropped | superseded。`done` は `evidence` が空だと MCP が拒否する。
+- `status`: open | doing | blocked | done | dropped | superseded。`done` は `evidence` が空だと MCP が拒否する。
+- `owner`: ai | human（それ以外は拒否）。新版の各要素は `title` か `carried_from` のどちらかが必須。同じタスクを 2 回 `carried_from` すると拒否。
+- MCP `plan` で `done` のタスクを `carried_from` しなかった場合、そのタスクは旧版にだけ残る（superseded にはならないが新版の進捗には数えない）。
+  UI のタスク追加は open/doing/blocked/done を全部引き継ぐ。
 
 ## events.jsonl（追記専用）
 ```json
@@ -65,7 +72,10 @@ workspaces/<ws>/
 {"t": "…", "actor": "human", "action": "sendback", "task": "T012", "note": "unit-6 でも確認"}
 {"t": "…", "actor": "ai", "action": "plan", "plan": 3, "note": "指摘を受けて再計画"}
 ```
-`action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | checkout
+`action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | checkout | status | extract
+`actor`: ai | human | kairn（kairn の自動処理: raw-move 等。UI では既定色）
 
 ## 証拠（evidence）の型
-commit(repo,id) / pr(repo,id) / file(path) / test(cmd, result) / url / note（human のみ）
+`type` は commit / pr / file / test / url。`note` は actor=human のみ（AI の証拠にはならない）。型ごとの必須キー:
+commit → `id`（`repo` 任意）/ pr → `id`（`repo` 任意）/ file → `path` / test → `cmd`（`result` 任意）/ url → `url`。
+不正な型・必須キー欠落は `update_task` / `log_event` とも拒否する（`kairn/store.py` `validate_evidence`）。

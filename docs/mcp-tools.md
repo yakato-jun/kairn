@@ -13,19 +13,21 @@
   （エージェントが読める。JSON-RPC エラーにはしない）。
 - **索引**: `search` / `find_cases` は呼び出しのたびに SQLite FTS5（trigram）索引を差分更新してから検索する（`kairn/index.py`）。
   シンボリックリンクと生成物ディレクトリ（target / build / node_modules / .venv / __pycache__）は索引しない。
+  **trigram の制約**: 3 文字未満の語は索引に載らない（MATCH に渡せない）。3 文字未満の語だけの問いは LIKE（`search`: 節本文・案件 ID、
+  `find_cases`: `case_id` / `title`）で補う。3 文字以上の語と混在する場合は、長い語で MATCH してから短い語を本文の部分一致で絞る。
 
 ## ツール
 
 | ツール | 引数 | 返り値 | 実装で強制する規則 |
 |---|---|---|---|
-| `open_case(case, workspace?, agent?)` | | `{case, plan, open_tasks, recent_events(直近20), human_feedback(人の sendback/comment 直近5), related, worklog_tail(末尾3000字), drive, paths}` | 先に Drive から取り寄せ（`sync.checkout`、`rclone copy --update`: ローカルの方が新しいファイルは上書きしない）。失敗してもローカル写しで続行し `drive={fetched:false, error, note}` で返す。`checkout` event を追記 |
+| `open_case(case, workspace?, agent?)` | | `{case, plan, open_tasks, recent_events(直近20), human_feedback(人の sendback/comment 直近5), related, worklog_tail(末尾3000字), drive, paths}` | 順序: ワークスペース解決 → Drive から取り寄せ（`sync.checkout`、`rclone copy --update`: ローカルの方が新しいファイルは上書きしない）→ 読み込み。返り値はすべて取り寄せ後のディスクから読む（Drive にしか無い案件も開ける）。`case.json.last_checkin_at` より新しいローカル変更があれば取り寄せを skip し `drive={fetched:false, skipped:"local changes newer than last checkin", files:[…]}`。rclone 失敗はローカル写しで続行し `drive={fetched:false, error, note}`。`checkout` event を追記 |
 | `list_cases(workspace?, status="open", query="")` | `status`: open\|closed\|suspended\|all。`query` は id/title 部分一致 | `[{case, title, status, progress{total,done,open,plan}, last_event}]` | |
-| `plan(case, objective, tasks[], reason, workspace?, agent?)` | `tasks: [{title, owner?: ai\|human, carried_from?: "T012"}]` | 新版の plan（`superseded: [...]` を含む） | 版番号は自動。`carried_from` で引き継がれなかった open/doing/blocked は前版で `superseded`。未知の `carried_from` は拒否 |
-| `update_task(case, task, status, evidence[]?, note?, workspace?, agent?)` | `status`: open\|doing\|blocked\|done\|dropped | 更新後の task | `done` は `evidence` 必須（各要素は `{type: commit\|pr\|file\|test\|url, ...}`）。存在しない task・計画未作成は拒否。event（started/done/dropped/progress）を追記 |
-| `log_event(case, action, note, evidence[]?, workspace?, agent?)` | `action`: progress\|decision\|comment | 追記した event | actor/agent 自動付与。他の action は拒否 |
-| `search(query, cases[]?, workspace?, limit=10)` | | `[{case, file, heading, snippet, score}]` | worklog 等の `## ` 節単位の全文検索。語は AND。3 文字未満の語は本文の部分一致で絞る。ワークスペース内のみ |
-| `find_cases(query, workspace?, k=5)` | | `[{case, score, reasons[]}]` | 案件カード（title/tickets/related/elements）×3 ＋ 本文節の bm25 を合算。語は OR（問いの一部にでも当たる案件を拾う）。案件を選ぶのは人 |
-| `checkin(case, workspace?, agent?)` | | `{ok, rclone}` | ローカル → Drive（`sync.checkin`、設定済み remote のみ）＋ `checkin` event |
+| `plan(case, objective, tasks[], reason, workspace?, agent?)` | `tasks: [{title, owner?: ai\|human, carried_from?: "T012"}]` | 新版の plan（`superseded: [...]` を含む） | 版番号は自動。`carried_from` で引き継がれなかった open/doing/blocked は前版で `superseded`。未知の `carried_from`・同じタスクの二重 `carried_from`・`title` も `carried_from` も無い要素・`owner` が ai/human 以外は拒否。**`done` を `carried_from` しないと旧版にだけ残る**（UI のタスク追加は done も引き継ぐ） |
+| `update_task(case, task, status, evidence[]?, note?, workspace?, agent?)` | `status`: open\|doing\|blocked\|done\|dropped | 更新後の task | `done` は `evidence` 必須。各要素は `{type: commit\|pr\|file\|test\|url, ...}` で型ごとの必須キー（commit/pr→`id`、file→`path`、test→`cmd`、url→`url`）を検証、`note` 型は human のみ（docs/data-model.md）。存在しない task・計画未作成は拒否。event（started/done/dropped/progress）を追記 |
+| `log_event(case, action, note, evidence[]?, workspace?, agent?)` | `action`: progress\|decision\|comment | 追記した event | actor/agent 自動付与。他の action は拒否。`evidence` は update_task と同じ検証 |
+| `search(query, cases[]?, workspace?, limit=10)` | | `[{case, file, heading, snippet, score}]` | worklog 等の `## ` 節単位の全文検索。語は AND。3 文字未満の語は本文・案件 ID の部分一致（LIKE）で絞る。ワークスペース内のみ |
+| `find_cases(query, workspace?, k=5)` | | `[{case, score, reasons[]}]` | 案件カード（title/tickets/related/elements）×3 ＋ 本文節の bm25 を合算。語は OR（問いの一部にでも当たる案件を拾う）。3 文字未満の語だけなら `case_id` / `title` の LIKE で補う。案件を選ぶのは人 |
+| `checkin(case, workspace?, agent?)` | | `{ok, rclone, last_checkin_at}` | ローカル → Drive（`sync.checkin`、設定済み remote のみ）＋ `case.json.last_checkin_at` 更新＋ `checkin` event。**Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする**（rclone sync）。他環境で作業した後は先に `checkout` する運用 |
 | `drive_index(pattern, workspace?, limit=50)` | 正規表現 | `[{path, size, mtime}]` | `index/drive-index.txt`（`kairn drive-index` で生成）を検索。無ければ空 |
 
 `extract_card(case)`（`claude -p` 等の子プロセスで case.json の下書きを返す。読み取り専用・書き込まない）は段階 7 の担当で未実装（docs/roadmap.md）。

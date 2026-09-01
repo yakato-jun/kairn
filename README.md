@@ -59,13 +59,17 @@ kairn raw-move <ws> [<case>] [--dry-run]  # rclone move → <remote>:<root>/<ws>
 kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move → drive-index → index を順に実行。段が失敗しても次へ進み、index/daily.log に記録
 ```
 
+- 所在の記録先: `worklog.md` があればその `## Data location` 節、無ければ `DATA.md`（case.json の有無に関わらず）。case.json があれば `data[]` と progress event にも記録。
 - 復元: `rclone copy <remote>:<root>/<ws>/cases/<case>/<file> <案件ディレクトリ>/`（Data location の行と UI に表示）。
 - `checkout` は `rclone copy --update`（ローカルの方が新しいファイルは上書きしない）。`open_case` が毎回 checkout するため。
+  `open_case` は `case.json.last_checkin_at`（checkin が更新）より新しいローカル変更があれば checkout を skip する。
+- `checkin` は `rclone sync`: Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする。**他環境で作業した後は先に `checkout` する**。
+- `daily --dry-run` は rclone に `--dry-run` を渡し、`drive-index.txt` と索引（`kairn.sqlite`）を書き換えない。
 - 帯域制限は `rules.bwlimit`（例 `"08:00,4M 20:00,off"`。rclone の `--bwlimit` にそのまま渡す）。
 - 日次実行（systemd user timer、毎日 12:30 ± 10 分、停止中だった分は次回起動時に実行）:
   ```
   cp contrib/systemd/kairn-daily.{service,timer} ~/.config/systemd/user/
-  sed -i 's/<workspace>/acme/' ~/.config/systemd/user/kairn-daily.service   # 自分のワークスペース名に
+  sed -i 's/<workspace>/acme/' ~/.config/systemd/user/kairn-daily.service   # 自分のワークスペース名に（clone 先が %h/kairn でなければ ExecStart も書き換える）
   systemctl --user daemon-reload && systemctl --user enable --now kairn-daily.timer
   systemctl --user list-timers kairn-daily.timer; journalctl --user -u kairn-daily
   ```

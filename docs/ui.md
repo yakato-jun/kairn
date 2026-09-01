@@ -16,7 +16,7 @@
   - 計画の版履歴（各版の reason / objective / タスクと状態、`carried_from` と、どの版で何が superseded になったか）
   - データ所在（case.json の `data[]`: Drive パスと復元コマンド `rclone copy <remote>:<path> <case_dir>/`）
   - worklog.md（折りたたみ。全文）
-  - 時系列（events。actor で色分け、agent、task、note、証拠）
+  - 時系列（events の直近 100 件、新しい順。actor で色分け（human / ai。kairn 等その他は既定色）、agent、task、note、証拠）
   - related（存在する案件はリンク）、elements（タグ。クリックで一覧の絞り込み）
 
 ## 操作（すべて event として記録。AI は次に open_case した時に `human_feedback` で受け取る）
@@ -29,6 +29,12 @@
 | 案件の close/suspend | `/ui/<ws>/<case>/status` `status, note` | case.json の status 更新＋ `{actor: human, action: status}` |
 
 フォームは `application/x-www-form-urlencoded`（UTF-8、percent-encoding）。日本語・記号は復号してそのまま記録する。成功時は 303 で案件ページへ戻る。
+`owner` は ai | human 以外を 400 で拒否する。
+
+**CSRF**: POST は `Sec-Fetch-Site` が `same-origin` / `none` 以外、または `Origin` / `Referer` のホストがリクエストの `Host` と異なれば 403（`ui.same_origin`）。
+どちらのヘッダも無いリクエスト（curl 等）は通す。
+
+**不正な入力**: 未知のワークスペース／案件、不正な案件 ID（`..`、`.` 始まり等）は 404。一覧の `status` は open/closed/suspended/all 以外を open に正規化する（値を HTML に反射するため）。
 優先度の操作はデータモデルに項目が無いため未実装（要判断: 段階 1 で追加していない）。
 
 ## 鮮度
