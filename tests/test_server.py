@@ -224,6 +224,53 @@ def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, mo
     run(main)
 
 
+def test_open_case_own_checkout_event_does_not_block_next_checkout(conf, monkeypatch):
+    """H-1: open_case が追記する checkout event で events.jsonl の mtime が進んでも（CHECKIN_SLACK_SEC を超えても）、
+    次の open_case は checkout する。人／AI の実質的な変更（log_event / update_task / UI 操作）があれば skip する。"""
+    import os, subprocess, time
+    calls = []
+    monkeypatch.setattr(sync, "_run", lambda cmd, dry=False: calls.append(cmd[1]) or subprocess.CompletedProcess(cmd, 0, "fake", ""))
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    st.new_plan_version("CASE-1", "o", [{"title": "a"}], reason="r", actor="ai")
+    ev = ws.cases_dir / "CASE-1" / "events.jsonl"
+
+    def bump(p):  # slack（2 秒）に隠れないよう mtime を +5s
+        t = time.time() + 5
+        os.utime(p, (t, t))
+
+    mcp = srv.create_server(conf)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            await c.call_tool("checkin", {"case": "CASE-1"})
+            for i in range(3):
+                bump(ev)
+                r = await c.call_tool("open_case", {"case": "CASE-1"})
+                assert r.structured_content["drive"]["fetched"] is True, (i, r.structured_content["drive"])
+            assert calls.count("copy") == 3 and st.events("CASE-1")[-1]["action"] == "checkout"
+            # AI の実質的な変更 → skip
+            await c.call_tool("log_event", {"case": "CASE-1", "action": "progress", "note": "worked"})
+            bump(ev)
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            d = r.structured_content["drive"]
+            assert d["fetched"] is False and d["skipped"] == "local changes newer than last checkin" and d["files"] == ["events.jsonl"]
+            # checkin で解け、UI 操作（人の comment）で再び skip、update_task でも skip
+            await c.call_tool("checkin", {"case": "CASE-1"})
+            bump(ev)
+            assert (await c.call_tool("open_case", {"case": "CASE-1"})).structured_content["drive"]["fetched"] is True
+            st.append_event("CASE-1", {"actor": "human", "action": "comment", "note": "check unit-6"})
+            bump(ev)
+            assert (await c.call_tool("open_case", {"case": "CASE-1"})).structured_content["drive"]["fetched"] is False
+            await c.call_tool("checkin", {"case": "CASE-1"})
+            await c.call_tool("update_task", {"case": "CASE-1", "task": "T001", "status": "doing"})
+            bump(ev); bump(ws.cases_dir / "CASE-1" / "plan" / "v0001.json")
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            assert r.structured_content["drive"]["fetched"] is False and "plan/v0001.json" in r.structured_content["drive"]["files"]
+    run(main)
+
+
 # ---------- 証拠の型検証（項目 2）・計画の検証（項目 5）: MCP 経由で is_error ----------
 
 def test_evidence_type_validation_via_mcp(conf):

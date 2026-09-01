@@ -188,6 +188,21 @@ def test_checkout_uses_update_and_bwlimit(conf, fake):
     assert cmd[:2] == ["rclone", "sync"] and "--bwlimit" in cmd and "--backup-dir" in cmd
 
 
+def test_checkin_workspace_copies_but_case_syncs(conf, fake):
+    """H-2: ワークスペース全体の checkin（daily）は rclone copy（ローカルに無い案件を Drive から消さない）。案件単位は sync のまま。"""
+    ws = conf.workspaces["acme"]
+    CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
+    sync.checkin(conf, ws)
+    cmd = fake.calls[-1]
+    assert cmd[:4] == ["rclone", "copy", str(ws.cases_dir), "my-drive:ws/acme/cases"]
+    assert cmd[cmd.index("--backup-dir") + 1].startswith("my-drive:ws/acme/_deleted/")
+    sync.checkin(conf, ws, "CASE-1")
+    cmd = fake.calls[-1]
+    assert cmd[:4] == ["rclone", "sync", str(ws.cases_dir / "CASE-1"), "my-drive:ws/acme/cases/CASE-1"] and "--backup-dir" in cmd
+    sync.daily(conf, ws)
+    assert [c[1] for c in fake.calls if c[1] in ("sync", "copy")][-1] == "copy"
+
+
 def test_raw_move_command_and_dry_run(conf, fake):
     ws = conf.workspaces["acme"]
     conf.rules["bwlimit"] = "4M"
@@ -298,7 +313,7 @@ def test_daily_passes_dry_run(conf, fake):
     assert r["ok"] is True and r["dry"] is True
     assert r["steps"]["bag2zst"]["result"]["dry"] and r["steps"]["raw_move"]["result"]["dry"]
     assert (ws.cases_dir / "CASE-123" / "run.bag").exists()
-    assert [c for c in fake.calls if c[1] == "sync"][0][-1] == "--dry-run"
+    assert [c for c in fake.calls if c[1] == "copy"][0][-1] == "--dry-run"  # ワークスペース全体は copy
 
 
 # ---------- rclone 除外パターン（項目 8）: 実 rclone でローカル間コピー（クラウド接続なし） ----------

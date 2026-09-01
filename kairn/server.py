@@ -195,6 +195,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
 
 def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, st: CaseStore, case: str) -> dict[str, Any]:
     """open_case の取り寄せ。case.json.last_checkin_at より新しいローカル変更があれば skip（未 checkin の変更を Drive で上書きしない）。
+    open_case 自身が追記する checkout event で events.jsonl が伸びた分は変更に数えない（store.local_changes_since_checkin）。
     失敗してもローカル写しで続行し、その旨を返す（docs/mcp-tools.md）。"""
     from . import sync
     changed = st.local_changes_since_checkin(case)

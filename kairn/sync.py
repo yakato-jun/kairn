@@ -1,8 +1,10 @@
 """Drive 同期（rclone）。ワークスペース単位。remote は設定済みのものだけ使う。
 
 - checkout(ws[, case]):  <remote>:<root>/<ws>/cases[/<case>] -> local（テキスト層のみ、削除は追従しない）
-- checkin(ws[, case]):   local -> remote（テキスト層 sync。削除・Drive 側の新しい版は _deleted/<日付>/ へ退避）。成功時に
-                         各案件の case.json.last_checkin_at を更新（open_case の checkout skip 判定に使う）
+- checkin(ws[, case]):   local -> remote（テキスト層）。案件単位は rclone sync（削除・Drive 側の新しい版は _deleted/<日付>/ へ退避）、
+                         ワークスペース全体（daily）は rclone copy（ローカルに無い案件ディレクトリを Drive から消さない。
+                         上書きされる Drive 側の版は同じく _deleted/ へ）。成功時に各案件の case.json.last_checkin_at を更新
+                         （open_case の checkout skip 判定に使う）
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
 - bag2zst(ws[, case]):   *.bag / *.bag.active を zstd 圧縮（<name>.zst、mtime 引き継ぎ、元は削除）
 - raw_move(ws[, case]):  生データ（rules.raw_data）を rclone move で Drive へ移動し、所在を case.json / worklog に記録
@@ -70,12 +72,16 @@ def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
 
 
 def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False) -> str:
+    """ローカル → Drive。case 指定は `rclone sync`（案件内の削除を追従）、ワークスペース全体は `rclone copy`
+    （ローカルに無い案件ディレクトリは消してよい＝Drive から削除しない。README 原則 2）。どちらも上書きされる Drive 側の版は
+    `_deleted/<日付>/` に退避する（--backup-dir）。"""
     src = ws.cases_dir / case if case else ws.cases_dir
     if not src.exists():
         raise RcloneError(f"nothing to check in: {src} does not exist")
     dst = conf.drive_path(ws.name, "cases", *( [case] if case else [] ))
     backup = conf.drive_path(ws.name, "_deleted", _dt.date.today().isoformat())
-    r = _run(["rclone", "sync", str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
+    verb = "sync" if case else "copy"
+    r = _run(["rclone", verb, str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
               "--stats-one-line", "-v", *_filters(conf), *_bw(conf)], dry)
     if not dry:
         store = CaseStore(ws.cases_dir)

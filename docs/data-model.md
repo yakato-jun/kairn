@@ -32,11 +32,13 @@ workspaces/<ws>/
   "data": [{"drive": "my-drive:ws/acme/cases/CASE-123/", "files": 3, "bytes": 1234567890,
             "moved_at": "2026-09-01T12:30:00+09:00", "list": "index/raw-moved-20260901.txt"}],
   "created_at": "...", "updated_at": "...", "current_plan": 3,
-  "last_checkin_at": "2026-09-01T18:00:00+09:00"   // この案件を最後に checkin した時刻（checkin ツール / kairn checkin / daily が更新）
+  "last_checkin_at": "2026-09-01T18:00:00+09:00",  // この案件を最後に checkin した時刻（checkin ツール / kairn checkin / daily が更新）
+  "last_checkin_events": 42                          // その時点の events.jsonl の行数（同上。open_case の checkout skip 判定に使う）
 }
 ```
 - `last_checkin_at`: `open_case` は、これより新しいローカル変更（`case.json` / `events.jsonl` / `worklog.md` / `plan/*.json` の mtime）が
   あれば Drive からの checkout を skip し `drive={"skipped": "local changes newer than last checkin"}` を返す（未 checkin の変更を Drive で上書きしない）。
+  `events.jsonl` は、checkin 時点（`last_checkin_events` 行）以後に増えた行が kairn 自身の `checkin` / `checkout` event だけなら変更と数えない（`open_case` 自体が `checkout` event を追記するため）。
   未記録なら checkout する（`--update` なのでローカルの方が新しいファイルは上書きされない）。
 
 ### summary / elements / related / causal（抽出の下書きの適用先）
