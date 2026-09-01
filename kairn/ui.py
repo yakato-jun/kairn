@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import html
+import json
 from datetime import datetime
 from urllib.parse import quote, urlsplit
 
@@ -172,6 +173,9 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
         data = "".join(f"<li><code>{_esc(d.get('drive', ''))}</code> <small>moved {_esc(d.get('moved_at', ''))}</small><br>"
                        f"<small>復元: <code>rclone copy {_esc(conf.remote)}:{_esc(d.get('drive', ''))} {_esc(ws.cases_dir / cid)}/</code></small></li>"
                        for d in c.get("data", []))
+        summary = f"<p><small>summary: {_esc(c['summary'])}</small></p>" if c.get("summary") else ""
+        causal = "".join(f"<li>{_esc(x.get('symptom', ''))} → {_esc(x.get('component', ''))} → {_esc(x.get('cause', ''))}"
+                         f" <small class='muted'>({_esc(x.get('evidence', ''))})</small></li>" for x in c.get("causal", []) if isinstance(x, dict))
         wl = ws.cases_dir / cid / "worklog.md"
         worklog = _esc(wl.read_text(encoding="utf-8", errors="replace")) if wl.exists() else "(no worklog.md)"
         forms = (f"<h3>操作</h3>"
@@ -180,12 +184,16 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
                  f"<form method=post action='{_url(ws, cid, 'comment')}' accept-charset='utf-8'><input name=note placeholder='コメント／指示' size=50><button>記録</button></form>"
                  f"<form method=post action='{_url(ws, cid, 'status')}' accept-charset='utf-8'><select name=status>"
                  + "".join(f"<option{' selected' if s == c.get('status') else ''}>{s}</option>" for s in ("open", "closed", "suspended"))
-                 + f"</select><input name=note placeholder='理由' size=30><button>案件の状態を変更</button></form>")
+                 + f"</select><input name=note placeholder='理由' size=30><button>案件の状態を変更</button></form>"
+                 f"<form method=post action='{_url(ws, cid, 'extract')}'><button>下書きを取得</button> "
+                 f"<small>extract.agent={_esc(conf.extract_agent)} の子エージェントが案件ディレクトリを読んで case.json の下書きを返す（書き込まない。適用は次の画面で）</small></form>")
         body = (f"<h2>{_esc(cid)} <small>{_esc(c.get('title', ''))}</small></h2><p><small>{meta}</small></p>"
-                f"<p><small>objective: {_esc((plan or {}).get('objective', ''))}</small></p>"
+                f"<p><small>objective: {_esc((plan or {}).get('objective', ''))}</small></p>{summary}"
                 f"<div class='kanban'>{kanban}</div>{forms}"
                 f"<h3>計画の版履歴</h3>{plans or '<small>(no plan)</small>'}"
                 f"<h3>データ所在</h3><ul>{data or '<li><small>(none)</small></li>'}</ul>"
+                + (f"<h3>症状 → 部品 → 原因</h3><ul>{causal}</ul>" if causal else "")
+                +
                 f"<details><summary>worklog.md</summary><pre>{worklog}</pre></details>"
                 f"<h3>時系列</h3>{evs}")
         return _page(cid, body)
@@ -226,9 +234,46 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
                 st.set_case_status(cid, str(form.get("status")), actor="human", note=note)
             except ValueError as e:
                 return PlainTextResponse(str(e), status_code=400)
+        elif kind == "extract":  # 子エージェントで下書きを作り、差分と適用ボタンを表示する（case.json は書かない）
+            from . import extract
+            r = extract.extract_card(conf, ws, cid)
+            return _page(f"{cid} draft", _draft_view(ws, cid, st.load_case(cid), r))
+        elif kind == "apply":  # 人が確認した下書きを case.json に適用（title / summary / elements / related / causal）
+            from . import extract
+            try:
+                card = json.loads(str(form.get("card", "")))
+                extract.apply_card(st, cid, card)
+            except (ValueError, TypeError) as e:
+                return PlainTextResponse(f"invalid draft: {e}", status_code=400)
         else:
             return PlainTextResponse("unknown action", status_code=404)
         return RedirectResponse(_url(ws, cid), status_code=303)
+
+    def _draft_view(ws: cfg.Workspace, cid: str, c: dict, r: dict) -> str:
+        head = (f"<h2><a href='{_url(ws, cid)}'>{_esc(cid)}</a> <small>下書き</small></h2>"
+                f"<p>agent: <b>{_esc(r.get('agent'))}</b> · {_esc(r.get('elapsed_sec'))}s · "
+                + (f"<b style='color:#3a8'>ok</b>" if r.get("ok") else f"<b class='stale'>失敗</b>: {_esc(r.get('error'))}") + "</p>")
+        if not r.get("ok"):
+            return head + f"<details open><summary>出力の抜粋</summary><pre>{_esc(r.get('raw_excerpt') or '(empty)')}</pre></details>"
+        card = r["card"]
+
+        def _v(x: object) -> str:
+            if isinstance(x, dict):
+                return "; ".join(f"{k}: {', '.join(map(str, v))}" for k, v in x.items() if v)
+            if isinstance(x, list):
+                return ", ".join(map(str, x))
+            return str(x or "")
+        rows = "".join(f"<tr><th>{k}</th><td>{_esc(_v(c.get(k)))}</td><td>{_esc(_v(card.get(k)))}</td></tr>"
+                       for k in ("title", "summary", "elements", "related"))
+        causal = "".join(f"<li>{_esc(x['symptom'])} → {_esc(x['component'])} → {_esc(x['cause'])} <small class='muted'>({_esc(x['evidence'])})</small></li>"
+                         for x in card.get("causal", []))
+        return (head + f"<p><small>confidence: {_esc(card.get('confidence'))}</small></p>"
+                f"<table><tr><th></th><th>現在の case.json</th><th>下書き</th></tr>{rows}</table>"
+                f"<h3>症状 → 部品 → 原因（下書き）</h3><ul>{causal or '<li><small>(none)</small></li>'}</ul>"
+                f"<form method=post action='{_url(ws, cid, 'apply')}' accept-charset='utf-8'>"
+                f"<input type=hidden name=card value='{_esc(json.dumps(card, ensure_ascii=False))}'>"
+                f"<button>この下書きを case.json に適用</button> <small>title / summary / elements / related / causal を置き換え、decision として記録する</small></form>"
+                f"<details><summary>下書き JSON</summary><pre>{_esc(json.dumps(card, ensure_ascii=False, indent=1))}</pre></details>")
 
     return [Route(P, index), Route(P + "/", index), Route(P + "/{ws}/{case}", case_page),
             Route(P + "/{ws}/{case}/{kind}", act, methods=["POST"])]
