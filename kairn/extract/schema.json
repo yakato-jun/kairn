@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "kairn extract card",
+  "description": "case.json の下書き（kairn/extract/prompt.md の出力）。確定は人が UI で行う。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "summary", "elements", "related", "causal", "confidence"],
+  "properties": {
+    "title": {"type": "string"},
+    "summary": {"type": "string"},
+    "elements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine", "component", "symptom", "ticket", "site", "external"],
+      "properties": {
+        "machine": {"type": "array", "items": {"type": "string"}},
+        "component": {"type": "array", "items": {"type": "string"}},
+        "symptom": {"type": "array", "items": {"type": "string"}},
+        "ticket": {"type": "array", "items": {"type": "string"}},
+        "site": {"type": "array", "items": {"type": "string"}},
+        "external": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "related": {"type": "array", "items": {"type": "string"}},
+    "causal": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symptom", "component", "cause", "evidence"],
+        "properties": {
+          "symptom": {"type": "string"},
+          "component": {"type": "string"},
+          "cause": {"type": "string"},
+          "evidence": {"type": "string"}
+        }
+      }
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+  }
+}
