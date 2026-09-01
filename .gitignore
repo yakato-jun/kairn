@@ -1,0 +1,10 @@
+# データ（Drive と同期する実体）。コードと同じツリーに置くが、決してコミットしない
+workspaces/
+# python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+# local
+.env
+*.sqlite

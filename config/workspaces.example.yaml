@@ -1,0 +1,37 @@
+# kairn ワークスペース定義の【例】（書式のみ。架空名）。
+# 実体は ~/.config/kairn/workspaces.yaml に置く（リポジトリにはコミットしない。顧客名・ローカルパスを含むため）。
+# 他環境へは Drive の ws/_config/workspaces.yaml 経由で配布する（kairn setup）。
+# drive.remote は `kairn setup --remote <name>` が書く。kairn はここに書かれた remote 以外を使わない。
+drive:
+  remote: my-drive                 # rclone の remote 名（利用者ごと）
+  root: ws                       # <remote>:ws/<workspace>/ に各ワークスペースを置く
+
+# 同期・退避の共通規則
+rules:
+  exclude:                       # 同期しない（ビルド産物等）
+    - "**/target/**"
+    - "**/build/**"
+    - "**/__pycache__/**"
+    - "**/node_modules/**"
+    - "**/.venv/**"
+    - "*.o"
+    - "*.rlib"
+    - "*.pyc"
+  raw_data:                      # 生データ層: Drive へ移動（ローカルから削除）する対象
+    extensions: [bag, zst, pgm, npz, zip, gz, tar, active, pcd, mp4]
+    min_size: 50M                # 拡張子に関わらずこのサイズ超は生データ扱い
+    min_age: 14d                 # 更新からこの期間を過ぎたものだけ移動
+  bag_to_zst: true               # *.bag / *.bag.active は zstd 圧縮してから扱う
+
+# ワークスペース。対応表（どのローカルリポジトリがどこに属するか）は和田さんが記入する。
+# kairn は、ここに載っていないパスに対しては何もしない。
+workspaces:
+  acme:                          # 顧客・会社ごとに 1 つ
+    description: "ACME 向けの開発（複数リポジトリで 1 ワークスペース）"
+    repos:                       # 所属リポジトリ。path か glob。各リポジトリの <link_name>/ を cases/ へのリンクにする
+      - glob: ~/Acme*
+      - path: ~/acme-tools
+    link_name: tmp
+  personal:
+    description: "顧客横断の個人ログ。他ワークスペースからは明示指定でのみ参照"
+    repos: []

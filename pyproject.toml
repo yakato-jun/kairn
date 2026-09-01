@@ -1,0 +1,18 @@
+[project]
+name = "kairn"
+version = "0.0.1"
+description = "Case-based worklog operations: MCP server, local UI, Drive sync, shared agent skill"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.20",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+kairn = "kairn.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
