@@ -19,7 +19,7 @@ from starlette.routing import Mount, Route
 
 from . import config as cfg
 from .index import Index
-from .store import CaseNotFound, CaseStore, validate_case_id
+from .store import CaseNotFound, CaseStore, append_access_log, validate_case_id
 
 INSTRUCTIONS = (
     "kairn: 案件（case）単位の作業ログ。案件を開くときは open_case（無ければ find_cases / list_cases で選ぶ。選ぶのは人）。"
@@ -77,7 +77,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
         ws = _ws(workspace, case); st = _store(ws)
         try:
             st.case_dir(case)  # ID の検証（Drive 取り寄せの前）
-            # 順序: ワークスペース解決 → checkout（--update）→ 読み込み。返り値はすべて取り寄せ後のディスクから読む
+            # 順序: ワークスペース解決 → checkout（events.jsonl はマージ、他は --update）→ 読み込み。返り値はすべて取り寄せ後のディスクから読む
             fetched = _fetch_from_drive(conf, ws, st, case)
             try:
                 c = st.load_case(case)
@@ -88,7 +88,8 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
             feedback = [e for e in all_events if e.get("actor") == "human" and e.get("action") in ("sendback", "comment")][-5:]
             wl = ws.cases_dir / case / "worklog.md"
             tail = wl.read_text(encoding="utf-8", errors="replace")[-3000:] if wl.exists() else ""
-            st.append_event(case, {"actor": "ai", "agent": _agent(agent), "action": "checkout", "note": "open_case"})
+            # 閲覧記録はローカルの index/access.log へ（events.jsonl には書かない: 閲覧で Drive との差分を作らない）
+            append_access_log(ws.index_dir / "access.log", case, _agent(agent))
             return {"case": c, "plan": plan, "open_tasks": st.open_tasks(case), "recent_events": all_events[-20:],
                     "human_feedback": feedback, "related": c.get("related", []), "worklog_tail": tail,
                     "drive": fetched, "paths": {"case_dir": str(ws.cases_dir / case), "worklog": str(wl)}}
@@ -200,7 +201,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
 
 def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, st: CaseStore, case: str) -> dict[str, Any]:
     """open_case の取り寄せ。case.json.last_checkin_at より新しいローカル変更があれば skip（未 checkin の変更を Drive で上書きしない）。
-    open_case 自身が追記する checkout event で events.jsonl が伸びた分は変更に数えない（store.local_changes_since_checkin）。
+    open_case 自身は events.jsonl に書かない（閲覧記録は index/access.log）ので、繰り返し開いても skip にならない。
     失敗してもローカル写しで続行し、その旨を返す（docs/mcp-tools.md）。"""
     from . import sync
     changed = st.local_changes_since_checkin(case)

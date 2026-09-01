@@ -89,13 +89,25 @@ def test_mark_checkin_and_local_changes(store):
         os.utime(p, (t, t))
     assert store.local_changes_since_checkin("CASE-1") == ["events.jsonl", "plan/v0001.json"]
     assert store.mark_checkin("CASE-404") is None
-    # kairn 自身の checkin / checkout event だけで events.jsonl が伸びた場合は変更と数えない（H-1）
+    # kairn 自身の checkin event だけで events.jsonl が伸びた場合は変更と数えない（H-1）。checkout action はもう無い
     os.utime(d / "plan" / "v0001.json", None)  # 偽装した未来の mtime を戻す
     store.mark_checkin("CASE-1")
-    for a in ("checkin", "checkout", "checkout"):
-        store.append_event("CASE-1", {"actor": "ai", "agent": "x", "action": a, "note": "open_case"})
+    store.append_event("CASE-1", {"actor": "ai", "agent": "x", "action": "checkin", "note": "fake"})
+    with pytest.raises(ValueError, match="invalid event action: checkout"):
+        store.append_event("CASE-1", {"actor": "ai", "agent": "x", "action": "checkout", "note": "open_case"})
     os.utime(d / "events.jsonl", (t, t))
     assert store.local_changes_since_checkin("CASE-1") == []
     store.append_event("CASE-1", {"actor": "human", "action": "comment", "note": "real change"})
     os.utime(d / "events.jsonl", (t, t))
     assert store.local_changes_since_checkin("CASE-1") == ["events.jsonl"]
+
+
+def test_append_access_log(tmp_path):
+    from kairn.store import append_access_log
+    log = tmp_path / "index" / "access.log"
+    l1 = append_access_log(log, "CASE-1", "agent-a")
+    l2 = append_access_log(log, "CASE-2", "agent-b")
+    assert log.read_text(encoding="utf-8") == l1 + "\n" + l2 + "\n"
+    assert l1.split("\t")[1:] == ["CASE-1", "agent-a"] and l2.split("\t")[1:] == ["CASE-2", "agent-b"]
+    with pytest.raises(ValueError):
+        append_access_log(log, "../x", "agent-a")

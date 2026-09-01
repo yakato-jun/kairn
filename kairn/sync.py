@@ -1,10 +1,14 @@
 """Drive 同期（rclone）。ワークスペース単位。remote は設定済みのものだけ使う。
 
-- checkout(ws[, case]):  <remote>:<root>/<ws>/cases[/<case>] -> local（テキスト層のみ、削除は追従しない）
-- checkin(ws[, case]):   local -> remote（テキスト層）。案件単位は rclone sync（削除・Drive 側の新しい版は _deleted/<日付>/ へ退避）、
+- checkout(ws[, case]):  <remote>:<root>/<ws>/cases[/<case>] -> local（テキスト層のみ、削除は追従しない）。
+                         events.jsonl は「新しい方で上書き」せず、Drive 版を取り寄せてローカル版と行の和集合にマージする
+                         （merge_case_events → 他ファイルを rclone copy --update）
+- checkin(ws[, case]):   local -> remote（テキスト層）。先に events.jsonl を同じくマージしてから転送する。
+                         案件単位は rclone sync（削除・Drive 側の新しい版は _deleted/<日付>/ へ退避）、
                          ワークスペース全体（daily）は rclone copy（ローカルに無い案件ディレクトリを Drive から消さない。
                          上書きされる Drive 側の版は同じく _deleted/ へ）。成功時に各案件の case.json.last_checkin_at を更新
                          （open_case の checkout skip 判定に使う）
+- merge_events(local_path, remote_lines): 行の文字列一致で重複除去した和集合を `t` で安定ソートし、内容が変わる時だけ書き戻す
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
 - bag2zst(ws[, case]):   *.bag / *.bag.active を zstd 圧縮（<name>.zst、mtime 引き継ぎ、元は削除）
 - raw_move(ws[, case]):  生データ（rules.raw_data）を rclone move で Drive へ移動し、所在を case.json / worklog に記録
@@ -23,12 +27,13 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import traceback
 from pathlib import Path
 
 from .config import Config, Workspace
-from .store import CaseStore, now_iso
+from .store import CaseStore, _atomic_write, now_iso, parse_iso
 
 
 class RcloneError(RuntimeError):
@@ -62,33 +67,113 @@ def _run(cmd: list[str], dry: bool = False) -> subprocess.CompletedProcess:
     return r
 
 
+# ---------------------------------------------------------------------------
+# events.jsonl のマージ（追記専用ログを複数環境で持ち寄る）
+# ---------------------------------------------------------------------------
+
+def _event_sort_key(line: str) -> float:
+    """行の `t`（ISO 8601）→ epoch 秒。JSON でない／`t` が読めない行は 0（先頭に寄せる。安定ソートなので相対順は保つ）。"""
+    try:
+        t = parse_iso(json.loads(line).get("t", ""))
+    except (ValueError, AttributeError):
+        t = None
+    return t.timestamp() if t else 0.0
+
+
+def merge_events(local_path: Path, remote_lines: list[str]) -> list[str]:
+    """ローカル版 events.jsonl と Drive 版の行（remote_lines）の和集合を作る。重複は行の文字列一致で 1 つにし、
+    `t` で安定ソート（同時刻はローカルの行 → Drive にしか無い行の順）。内容が変わる時だけ local_path に書き戻す
+    （変わらなければ mtime も触らない）。返り値: マージ後の行（改行なし）。"""
+    local = [l for l in local_path.read_text(encoding="utf-8").splitlines() if l.strip()] if local_path.exists() else []
+    seen = set(local)
+    merged = list(local)
+    for l in remote_lines:
+        l = l.rstrip("\r\n")
+        if l.strip() and l not in seen:
+            seen.add(l)
+            merged.append(l)
+    merged.sort(key=_event_sort_key)
+    if merged != local:
+        _atomic_write(local_path, "".join(l + "\n" for l in merged))
+    return merged
+
+
+def fetch_remote_events(conf: Config, ws: Workspace, case: str) -> list[str] | None:
+    """Drive 版 events.jsonl を一時ファイルに取り寄せ（rclone copyto）、行を返す。
+    rclone が無い・remote 不達・Drive にその案件／ファイルが無い等で取得できなければ None（呼び出し側はマージを飛ばす）。"""
+    src = conf.drive_path(ws.name, "cases", case, "events.jsonl")
+    with tempfile.TemporaryDirectory(prefix="kairn-events-") as td:
+        tmp = Path(td) / "events.jsonl"
+        try:
+            _run(["rclone", "copyto", src, str(tmp), *_bw(conf)])
+        except (RcloneError, OSError):  # OSError: rclone コマンド不在
+            return None
+        if not tmp.exists():
+            return None
+        return [l for l in tmp.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def merge_case_events(conf: Config, ws: Workspace, case: str) -> bool:
+    """1 案件の events.jsonl を Drive 版とマージして書き戻す。取得できなければ何もせず False。"""
+    remote = fetch_remote_events(conf, ws, case)
+    if remote is None:
+        return False
+    merge_events(ws.cases_dir / case / "events.jsonl", remote)
+    return True
+
+
+def _local_case_dirs(ws: Workspace) -> list[str]:
+    if not ws.cases_dir.exists():
+        return []
+    return sorted(p.name for p in ws.cases_dir.iterdir() if p.is_dir() and not p.is_symlink() and not p.name.startswith("."))
+
+
 def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False) -> str:
+    """Drive → ローカル。events.jsonl は先に Drive 版を取り寄せてマージし（merge_case_events）、転送から除外する
+    （--update の mtime 比較でマージ済みの行を失わないため）。他のファイルは rclone copy --update（ローカルの方が新しいファイルは
+    上書きしない）。ワークスペース全体では、ローカルにある案件を先にマージ → 転送 → 転送で新しく現れた案件をマージする。
+    取得できない案件（Drive に無い・rclone 不在）はマージを飛ばして従来どおり転送する。dry ではマージしない（ローカルを書かない）。"""
     src = conf.drive_path(ws.name, "cases", *( [case] if case else [] ))
     dst = ws.cases_dir / case if case else ws.cases_dir
     dst.mkdir(parents=True, exist_ok=True)
-    # --update: 宛先（ローカル）の方が新しいファイルは上書きしない（open_case が毎回 checkout するため）
+    merged: list[str] = []
+    exclude: list[str] = []
+    if case:
+        if not dry and merge_case_events(conf, ws, case):
+            merged.append(case)
+            exclude = ["--exclude", "/events.jsonl"]
+    elif not dry:
+        before = _local_case_dirs(ws)
+        merged += [c for c in before if merge_case_events(conf, ws, c)]
+        exclude = ["--exclude", "/*/events.jsonl"]
     r = _run(["rclone", "copy", src, str(dst), "--update", "--fast-list", "--transfers", "8", "--stats-one-line", "-v",
-              *_filters(conf), *_bw(conf)], dry)
-    return (r.stderr or r.stdout).strip()[-400:]
+              *exclude, *_filters(conf), *_bw(conf)], dry)
+    if not case and not dry:
+        merged += [c for c in _local_case_dirs(ws) if c not in before and merge_case_events(conf, ws, c)]
+    msg = (r.stderr or r.stdout).strip()[-400:]
+    return f"{msg} [events merged: {len(merged)}]" if merged else msg
 
 
 def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False) -> str:
-    """ローカル → Drive。case 指定は `rclone sync`（案件内の削除を追従）、ワークスペース全体は `rclone copy`
+    """ローカル → Drive。先に各案件の events.jsonl を Drive 版とマージしてから転送する（Drive にしか無い行を消さない）。
+    case 指定は `rclone sync`（案件内の削除を追従）、ワークスペース全体は `rclone copy`
     （ローカルに無い案件ディレクトリは消してよい＝Drive から削除しない。README 原則 2）。どちらも上書きされる Drive 側の版は
-    `_deleted/<日付>/` に退避する（--backup-dir）。"""
+    `_deleted/<日付>/` に退避する（--backup-dir）。dry ではマージしない。"""
     src = ws.cases_dir / case if case else ws.cases_dir
     if not src.exists():
         raise RcloneError(f"nothing to check in: {src} does not exist")
     dst = conf.drive_path(ws.name, "cases", *( [case] if case else [] ))
     backup = conf.drive_path(ws.name, "_deleted", _dt.date.today().isoformat())
     verb = "sync" if case else "copy"
+    merged = [] if dry else [c for c in ([case] if case else _local_case_dirs(ws)) if merge_case_events(conf, ws, c)]
     r = _run(["rclone", verb, str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
               "--stats-one-line", "-v", *_filters(conf), *_bw(conf)], dry)
     if not dry:
         store = CaseStore(ws.cases_dir)
         for cid in ([case] if case else store.list_case_ids()):
             store.mark_checkin(cid)
-    return (r.stderr or r.stdout).strip()[-400:]
+    msg = (r.stderr or r.stdout).strip()[-400:]
+    return f"{msg} [events merged: {len(merged)}]" if merged else msg
 
 
 def drive_index(conf: Config, ws: Workspace, dry: bool = False) -> Path:

@@ -138,11 +138,15 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 
 - 所在の記録先: `worklog.md` があればその `## Data location` 節、無ければ `DATA.md`（case.json の有無に関わらず）。case.json があれば `data[]` と progress event にも記録。
 - 復元: `rclone copy <remote>:<root>/<ws>/cases/<case>/<file> <案件ディレクトリ>/`（Data location の行と UI に表示）。
-- `checkout` は `rclone copy --update`（ローカルの方が新しいファイルは上書きしない）。`open_case` が毎回 checkout するため。
+- `events.jsonl`（追記専用ログ）は `checkout` / `checkin` のどちらでも「新しい方で上書き」せず、Drive 版を取り寄せてローカル版と**行の和集合**にマージしてから転送する
+  （`rclone copyto` で一時ファイルへ → 文字列一致で重複除去 → `t` で安定ソート → 書き戻し）。複数環境で書いた event が失われない。
+  Drive にその案件が無い・rclone が無い等で取得できなければマージを飛ばして従来どおり転送する。
+- `checkout` は events 以外を `rclone copy --update`（ローカルの方が新しいファイルは上書きしない）。`open_case` が毎回 checkout するため。
   `open_case` は `case.json.last_checkin_at`（checkin が更新）より新しいローカル変更があれば checkout を skip する。
-- `checkin <ws> <case>`（MCP の `checkin(case)` も）は `rclone sync`: 案件内の削除を追従し、Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする。**他環境で作業した後は先に `checkout` する**。
+- `open_case` は `events.jsonl` に書かない。閲覧記録はワークスペースの `index/access.log`（ローカルのみ、同期しない）に 1 行追記する。
+- `checkin <ws> <case>`（MCP の `checkin(case)` も）は `rclone sync`: 案件内の削除を追従し、Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする（events.jsonl はマージ済み）。**他環境で作業した後は先に `checkout` する**。
 - `checkin <ws>`（案件指定なし。`daily` が毎日呼ぶ）は `rclone copy`: ローカルに無い案件ディレクトリを Drive から消さない（原則 2「ローカルの案件ディレクトリは消してよい」）。上書きされる Drive 側の版は同じく `_deleted/` へ。
-- `open_case` の checkout skip 判定は人／AI の実質的な変更だけを見る: `events.jsonl` が checkin 時点（`case.json.last_checkin_events` 行）以後に kairn 自身の `checkin` / `checkout` event で伸びただけなら変更と数えない。
+- `open_case` の checkout skip 判定は人／AI の実質的な変更だけを見る: `events.jsonl` が checkin 時点（`case.json.last_checkin_events` 行）以後に kairn 自身の `checkin` event で伸びただけなら変更と数えない。
 - `daily --dry-run` は rclone に `--dry-run` を渡し、`drive-index.txt` と索引（`kairn.sqlite`）を書き換えない。
 - 帯域制限は `rules.bwlimit`（例 `"08:00,4M 20:00,off"`。rclone の `--bwlimit` にそのまま渡す）。
 - 日次実行（systemd user timer、毎日 12:30 ± 10 分、停止中だった分は次回起動時に実行）:

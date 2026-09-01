@@ -9,10 +9,11 @@ workspaces/<ws>/
     case.json            案件の正本（下記）
     worklog.md           AI が書く経緯・調査・決定（従来の worklog。Tasks 節は持たない）
     plan/v0001.json …    計画の版（下記）。最新版が「今やること」
-    events.jsonl         追記専用のイベント（下記）
+    events.jsonl         追記専用のイベント（下記）。checkout / checkin で Drive 版と行の和集合にマージされる
     …                    作業ファイル（MMdd_hhmm_ prefix 等、従来どおり）
   index/kairn.sqlite     索引（case / plan / task / event / section の検索用）。再生成可
   index/drive-index.txt  Drive 上の全ファイル一覧（path, size, mtime）。`kairn drive-index` / `kairn daily` が生成
+  index/access.log       open_case の閲覧記録（1 行 `<時刻>\t<案件>\t<agent>`）。ローカルのみ、Drive に同期しない
 ```
 
 ## case.json
@@ -33,13 +34,15 @@ workspaces/<ws>/
             "moved_at": "2026-09-01T12:30:00+09:00", "list": "index/raw-moved-20260901.txt"}],
   "created_at": "...", "updated_at": "...", "current_plan": 3,
   "last_checkin_at": "2026-09-01T18:00:00+09:00",  // この案件を最後に checkin した時刻（checkin ツール / kairn checkin / daily が更新）
-  "last_checkin_events": 42                          // その時点の events.jsonl の行数（同上。open_case の checkout skip 判定に使う）
+  "last_checkin_events": 42                          // その時点の events.jsonl の行数（同上。マージ後の行数。open_case の checkout skip 判定に使う）
 }
 ```
 - `last_checkin_at`: `open_case` は、これより新しいローカル変更（`case.json` / `events.jsonl` / `worklog.md` / `plan/*.json` の mtime）が
   あれば Drive からの checkout を skip し `drive={"skipped": "local changes newer than last checkin"}` を返す（未 checkin の変更を Drive で上書きしない）。
-  `events.jsonl` は、checkin 時点（`last_checkin_events` 行）以後に増えた行が kairn 自身の `checkin` / `checkout` event だけなら変更と数えない（`open_case` 自体が `checkout` event を追記するため）。
-  未記録なら checkout する（`--update` なのでローカルの方が新しいファイルは上書きされない）。
+  `events.jsonl` は、checkin 時点（`last_checkin_events` 行）以後に増えた行が kairn 自身の `checkin` event だけなら変更と数えない
+  （`checkin` ツールは行数を記録した後に `checkin` event を 1 行追記する）。`open_case` は `events.jsonl` に書かない（閲覧記録は `index/access.log`）ので、
+  checkin 後に繰り返し開いても skip にならない。未記録なら checkout する（`--update` なのでローカルの方が新しいファイルは上書きされない）。
+  checkout で Drive 版の行がマージされ `events.jsonl` が変わった場合は、次の checkin までローカル変更として扱われる（skip）。
 
 ### summary / elements / related / causal（抽出の下書きの適用先）
 - `kairn/extract`（MCP `extract_card` / `kairn extract` / UI「下書きを取得」）は下書きを返すだけで case.json には書かない。
@@ -76,7 +79,11 @@ workspaces/<ws>/
 - MCP `plan` で `done` のタスクを `carried_from` しなかった場合、そのタスクは旧版にだけ残る（superseded にはならないが新版の進捗には数えない）。
   UI のタスク追加は open/doing/blocked/done を全部引き継ぐ。
 
-## events.jsonl（追記専用）
+## events.jsonl（追記専用・環境間でマージ）
+追記専用ログを「新しい方で上書き」すると複数環境の行が失われるため、`checkout` / `checkin` の前に Drive 版を取り寄せて
+**ローカル版と行の和集合**（行の文字列一致で重複除去）を `t` で安定ソートして書き戻す（`kairn/sync.py` `merge_events`）。
+同時刻の行はローカルの行 → Drive にしか無い行の順。内容が変わらなければ書き戻さない（mtime を触らない）。
+`open_case` はこのファイルに書かない（閲覧記録は `index/access.log`、ローカルのみ）。
 ```json
 {"t": "2026-08-20T15:10:00+09:00", "actor": "ai", "agent": "claude-code", "case": "CASE-123_…",
  "task": "T012", "action": "done", "note": "実装完了、PR #42",
@@ -84,7 +91,8 @@ workspaces/<ws>/
 {"t": "…", "actor": "human", "action": "sendback", "task": "T012", "note": "unit-6 でも確認"}
 {"t": "…", "actor": "ai", "action": "plan", "plan": 3, "note": "指摘を受けて再計画"}
 ```
-`action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | checkout | status | extract
+`action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | status | extract
+（`checkout` は旧版が `open_case` のたびに書いていた action。読めるが、もう書かない）
 `actor`: ai | human | kairn（kairn の自動処理: raw-move・extract 等。UI では既定色）。extract の event は `agent: "extract:<name>"`、`note`（ok / 失敗理由）、`elapsed_sec`、`exit_code`、`timeout_sec` を持つ
 
 ## 証拠（evidence）の型

@@ -15,3 +15,4 @@
 | 11 | 生データの判定は「（拡張子が対象 OR サイズが min_size 超）AND 更新から min_age 超」。rclone へは `--filter` 規則（`- <exclude>` → `+ *.{ext}` → `- **`）で渡し、拡張子パスとサイズパスの 2 回に分ける | `--include` と `--exclude` の併用は rclone が順序不定と警告し、実測で除外が効かない。1 回の呼び出しでは include と min-size が AND になる（2026-09-02 段階 2 で確定） |
 | 12 | 生データの所在は `worklog.md` があればその `## Data location` 節、無ければ `DATA.md` に書く（case.json の有無に関わらず）。`daily --dry-run` は drive-index.txt と索引を書き換えない | 記録先を「AI が書く経緯の文書」に寄せつつ、案件化前のディレクトリでも所在を失わない。dry-run は観察のみで副作用を残さない |
 | 13 | 案件ごとに `last_checkin_at` を持ち、`open_case` はそれより新しいローカル変更があれば checkout を skip する。`open_case` は取り寄せ → 読み込みの順 | 未 checkin の変更を Drive の版で上書きしない。Drive にしか無い案件も開ける。返り値とディスクの食い違いを無くす |
+| 14 | `events.jsonl` は checkout / checkin の前に Drive 版と行の和集合にマージする（重複は文字列一致、`t` で安定ソート）。`open_case` は events に書かず、閲覧記録はローカルの `index/access.log` へ | 追記専用ログを「新しい方で上書き」すると複数環境の行が失われる。閲覧のたびに追記するとローカルが常に新しくなり他環境の event を取り込めない（2026-09-02） |

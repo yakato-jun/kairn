@@ -4,9 +4,11 @@ MCP が呼ぶ規則の実体はここ（エージェントの文章には頼ら�
 - new_plan_version(): 新版に carried_from で引き継がれなかった open タスクを superseded にする
 - set_task_status(done): evidence が空なら ValueError
 - validate_evidence(): 証拠の型と必須キーを検証（update_task / log_event / append_event 共通）
-- すべての変更は events.jsonl に追記する
+- すべての変更は events.jsonl に追記する（追記専用。checkout / checkin で Drive 版と行の和集合にマージされる: kairn/sync.py）
+- open_case の閲覧記録は events.jsonl ではなく index/access.log（append_access_log。ローカルのみ、同期対象外）に書く。
+  閲覧だけで events.jsonl に差分を作らないため（複数環境の events をマージする前提）
 - last_checkin_at / last_checkin_events: 案件単位の最終 checkin 時刻とその時点の events.jsonl 行数（case.json）。
-  open_case はこれより新しいローカル変更（kairn 自身の checkin / checkout event は除く）があれば checkout を skip する
+  open_case はこれより新しいローカル変更（kairn 自身の checkin event は除く）があれば checkout を skip する
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ JST = timezone(timedelta(hours=9))
 TASK_STATUSES = {"open", "doing", "blocked", "done", "dropped", "superseded"}
 CASE_STATUSES = {"open", "closed", "suspended"}
 EVENT_ACTIONS = {"opened", "plan", "started", "progress", "done", "dropped", "sendback", "comment", "decision",
-                 "checkin", "checkout", "status", "extract"}
+                 "checkin", "status", "extract"}  # 旧版が書いた "checkout" 行は読めるが、もう書かない（open_case は access.log へ）
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 TASK_OWNERS = {"ai", "human"}
 EVIDENCE_TYPES = {"commit", "pr", "file", "test", "url"}
@@ -29,8 +31,8 @@ EVIDENCE_REQUIRED_KEY = {"commit": "id", "pr": "id", "file": "path", "test": "cm
 CHECKIN_SLACK_SEC = 2.0
 LOCAL_CHANGE_FILES = ("case.json", "events.jsonl", "worklog.md")
 # kairn 自身が同期の記録として書く event。これだけが last_checkin_at 以後に増えた events.jsonl は「ローカル変更」とみなさない
-# （open_case が毎回 checkout event を追記するため、これを変更と数えると 2 回目以降の open_case が常に checkout を skip する）
-SYNC_EVENT_ACTIONS = ("checkin", "checkout")
+# （checkin ツールは mark_checkin で行数を記録した後に checkin event を追記するため、その 1 行を変更と数えない）
+SYNC_EVENT_ACTIONS = ("checkin",)
 
 
 def now_iso() -> str:
@@ -73,6 +75,17 @@ def validate_evidence(evidence: list | None, actor: str) -> list[dict]:
         if ev.get(key) in (None, ""):
             raise ValueError(f"evidence type {t!r} requires {key!r}")
     return evidence
+
+
+def append_access_log(path: Path, case_id: str, agent: str) -> str:
+    """open_case の閲覧記録を 1 行追記する（`<時刻>\t<案件>\t<agent>`）。置き場所はワークスペースの index/access.log
+    （ローカルのみ、Drive に同期しない）。events.jsonl には書かない: 閲覧のたびに追記するとローカルの events.jsonl が
+    常に Drive 版より新しくなり、他環境の events を取り込めないため。返り値: 書いた行。"""
+    line = f"{now_iso()}\t{validate_case_id(case_id)}\t{agent}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    return line
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -156,7 +169,7 @@ class CaseStore:
         """last_checkin_at より新しいローカル変更（case.json / events.jsonl / worklog.md / plan/*.json の mtime）。
         case.json が無い、または last_checkin_at 未記録なら None（判定不能＝checkout してよい）。
         events.jsonl は mtime が新しくても、checkin 時点（last_checkin_events 行）以後に増えた行が kairn 自身の同期記録
-        （SYNC_EVENT_ACTIONS: checkin / checkout）だけなら変更と数えない（人／AI の実質的な変更だけを見る）。
+        （SYNC_EVENT_ACTIONS: checkin）だけなら変更と数えない（人／AI の実質的な変更だけを見る）。
         last_checkin_events が無い（古い case.json）場合は mtime だけで判定する。"""
         f = self._case_file(case_id)
         if not f.exists():

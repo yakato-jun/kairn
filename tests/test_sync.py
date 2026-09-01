@@ -28,9 +28,11 @@ def _touch(p: Path, size: int = 10, age_sec: float = 0) -> Path:
 class FakeRun:
     """subprocess.run の代役。rclone: 引数を記録し、lsf はローカルを自前で列挙、move は対象ファイルを削除して成功を返す。"""
 
-    def __init__(self, rules, fail_move: bool = False, fail: set[str] | None = None, fail_move_nth: int | None = None):
+    def __init__(self, rules, fail_move: bool = False, fail: set[str] | None = None, fail_move_nth: int | None = None,
+                 remote_events: dict[str, list[str]] | None = None):
         self.calls: list[list[str]] = []
         self.rules = rules
+        self.remote_events = remote_events or {}  # copyto: {case: Drive 版 events.jsonl の行}。無い案件は失敗（object not found）
         self.fail_move = fail_move
         self.fail_move_nth = fail_move_nth  # n 回目の move だけ失敗させる（1 始まり）
         self.moves = 0
@@ -41,6 +43,12 @@ class FakeRun:
         prog, sub = cmd[0], cmd[1]
         if prog == "rclone" and sub in self.fail:
             return subprocess.CompletedProcess(cmd, 1, "", f"fake rclone {sub} failed")
+        if prog == "rclone" and sub == "copyto":
+            case = cmd[2].rsplit("/", 2)[-2]
+            if case not in self.remote_events:
+                return subprocess.CompletedProcess(cmd, 3, "", "fake rclone copyto: object not found")
+            Path(cmd[3]).write_text("".join(l + "\n" for l in self.remote_events[case]), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, "", "fake rclone copyto ok")
         if prog == "rclone" and sub == "lsf":
             src = Path(cmd[cmd.index("--separator") + 2])
             include = any(x.startswith("+ *.{") for x in cmd)
@@ -436,3 +444,140 @@ def test_daily_dry_run_does_not_write_drive_index_or_sqlite(conf, fake):
     assert "last_checkin_at" not in CaseStore(ws.cases_dir).load_case("CASE-1")
     r = sync.daily(conf, ws)
     assert (ws.index_dir / "drive-index.txt").exists() and (ws.index_dir / "kairn.sqlite").exists() and r["steps"]["index"]["result"]["cases"] == 1
+
+
+# ---------- events.jsonl のマージ ----------
+
+def _ev(t: str, note: str, action: str = "progress") -> str:
+    return json.dumps({"t": t, "case": "CASE-123", "actor": "ai", "agent": "x", "action": action, "note": note}, ensure_ascii=False)
+
+
+def test_merge_events_union_dedup_sorted(tmp_path):
+    """両側に固有の行 → 和集合。同一行は 1 つ。`t` で安定ソート（同時刻はローカル → Drive の順）。"""
+    local = tmp_path / "events.jsonl"
+    shared = _ev("2026-09-01T10:00:00+09:00", "opened", "opened")
+    l1 = _ev("2026-09-01T12:00:00+09:00", "local only")
+    l2 = _ev("2026-09-01T13:00:00+09:00", "same time, local")
+    r1 = _ev("2026-09-01T11:00:00+09:00", "remote only")
+    r2 = _ev("2026-09-01T13:00:00+09:00", "same time, remote")
+    local.write_text(shared + "\n" + l1 + "\n" + l2 + "\n", encoding="utf-8")
+    merged = sync.merge_events(local, [shared, r1, r2, ""])
+    assert merged == [shared, r1, l1, l2, r2]
+    assert local.read_text(encoding="utf-8") == "".join(l + "\n" for l in merged)
+    # 変化が無ければ書き戻さない（mtime を触らない）
+    mt = local.stat().st_mtime_ns
+    assert sync.merge_events(local, [shared, r1]) == merged and local.stat().st_mtime_ns == mt
+    # ローカルが無い → Drive 版そのまま。Drive 版が空 → 空のファイルは作らない
+    fresh = tmp_path / "fresh.jsonl"
+    assert sync.merge_events(fresh, [r1, shared]) == [shared, r1] and fresh.exists()
+    none = tmp_path / "none.jsonl"
+    assert sync.merge_events(none, []) == [] and not none.exists()
+    # JSON でない行・t の無い行は捨てず先頭に寄せる
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text("not json\n" + l1 + "\n", encoding="utf-8")
+    assert sync.merge_events(bad, ['{"note": "no t"}']) == ["not json", '{"note": "no t"}', l1]
+
+
+def _events_of(ws, case):
+    return [json.loads(l) for l in (ws.cases_dir / case / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+def _excludes(cmd) -> list[str]:
+    """rclone コマンドの --exclude の値（rules.exclude 由来の target/** 等も含む）。"""
+    return [cmd[i + 1] for i, x in enumerate(cmd) if x == "--exclude"]
+
+
+def test_checkout_case_fetches_merges_then_copies(conf, monkeypatch):
+    """checkout(case): rclone copyto（Drive 版 events を一時ファイルへ）→ マージして書き戻し → rclone copy --update（events.jsonl を除外）の順。"""
+    ws = conf.workspaces["acme"]
+    CaseStore(ws.cases_dir).create_case("CASE-123", "t", "acme", actor="human")
+    remote = [_ev("2026-08-01T00:00:00+09:00", "from another environment")]
+    f = FakeRun(sync.raw_rules(conf), remote_events={"CASE-123": remote})
+    monkeypatch.setattr(subprocess, "run", f)
+    msg = sync.checkout(conf, ws, "CASE-123")
+    assert [c[1] for c in f.calls] == ["copyto", "copy"]
+    copyto, copy = f.calls
+    assert copyto[2] == "my-drive:ws/acme/cases/CASE-123/events.jsonl" and copyto[3].endswith("/events.jsonl")
+    assert not Path(copyto[3]).exists()  # 一時ファイルは消えている
+    assert copy[:4] == ["rclone", "copy", "my-drive:ws/acme/cases/CASE-123", str(ws.cases_dir / "CASE-123")]
+    assert "--update" in copy and "/events.jsonl" in _excludes(copy)
+    ev = _events_of(ws, "CASE-123")
+    assert [e["note"] for e in ev] == ["from another environment", "case created: t"]  # Drive の行が t 順で先頭に入った
+    assert msg.endswith("[events merged: 1]")
+
+
+def test_checkout_case_without_remote_events_falls_back(conf, monkeypatch):
+    """取得失敗（Drive にその案件が無い）: マージを飛ばし、従来どおり events.jsonl を除外せずに copy --update。ローカルは変わらない。"""
+    ws = conf.workspaces["acme"]
+    CaseStore(ws.cases_dir).create_case("CASE-123", "t", "acme", actor="human")
+    ev = ws.cases_dir / "CASE-123" / "events.jsonl"
+    before = (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns)
+    f = FakeRun(sync.raw_rules(conf))
+    monkeypatch.setattr(subprocess, "run", f)
+    msg = sync.checkout(conf, ws, "CASE-123")
+    assert [c[1] for c in f.calls] == ["copyto", "copy"] and "/events.jsonl" not in _excludes(f.calls[1]) and "--update" in f.calls[1]
+    assert (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns) == before and "events merged" not in msg
+    # rclone コマンド不在（FileNotFoundError）でもマージを飛ばして copy を試みる（copy 自体の失敗は従来どおり伝播）
+    def missing(cmd, **kw):
+        raise FileNotFoundError("rclone")
+    monkeypatch.setattr(subprocess, "run", missing)
+    with pytest.raises(FileNotFoundError):
+        sync.checkout(conf, ws, "CASE-123")
+    assert (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns) == before
+    # dry-run ではマージしない（copyto を呼ばない）
+    monkeypatch.setattr(subprocess, "run", f)
+    f.calls.clear()
+    sync.checkout(conf, ws, "CASE-123", dry=True)
+    assert [c[1] for c in f.calls] == ["copy"] and f.calls[0][-1] == "--dry-run"
+
+
+def test_checkin_case_merges_then_syncs(conf, monkeypatch):
+    """checkin(case): copyto → マージ → rclone sync の順。Drive にしか無い行を消さず、last_checkin_events はマージ後の行数。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-123", "t", "acme", actor="human")
+    remote = [_ev("2026-08-01T00:00:00+09:00", "remote only"), _ev("2026-08-02T00:00:00+09:00", "remote only 2")]
+    f = FakeRun(sync.raw_rules(conf), remote_events={"CASE-123": remote})
+    monkeypatch.setattr(subprocess, "run", f)
+    msg = sync.checkin(conf, ws, "CASE-123")
+    assert [c[1] for c in f.calls] == ["copyto", "sync"]
+    assert f.calls[1][:4] == ["rclone", "sync", str(ws.cases_dir / "CASE-123"), "my-drive:ws/acme/cases/CASE-123"]
+    assert not any(x.endswith("events.jsonl") for x in _excludes(f.calls[1]))  # マージ済みの events.jsonl をそのまま Drive へ
+    assert [e["note"] for e in _events_of(ws, "CASE-123")] == ["remote only", "remote only 2", "case created: t"]
+    assert st.load_case("CASE-123")["last_checkin_events"] == 3 and msg.endswith("[events merged: 1]")
+    # 取得失敗 → マージなしで sync（従来どおり）
+    f2 = FakeRun(sync.raw_rules(conf), fail={"copyto"})
+    monkeypatch.setattr(subprocess, "run", f2)
+    sync.checkin(conf, ws, "CASE-123")
+    assert [c[1] for c in f2.calls] == ["copyto", "sync"] and len(_events_of(ws, "CASE-123")) == 3
+
+
+def test_checkout_and_checkin_workspace_merge_per_case(conf, monkeypatch):
+    """ワークスペース全体: checkout はローカルの各案件をマージ → copy --update（/*/events.jsonl を除外）→ 転送で現れた案件をマージ。
+    checkin は各案件をマージ → copy。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "a", "acme", actor="human")
+    st.create_case("CASE-2", "b", "acme", actor="human")
+    remote = {"CASE-1": [_ev("2026-08-01T00:00:00+09:00", "r1")], "CASE-9": [_ev("2026-08-01T00:00:00+09:00", "r9")]}
+    f = FakeRun(sync.raw_rules(conf), remote_events=remote)
+    orig_call = f.__call__
+
+    def call(cmd, **kw):  # copy が Drive にしか無い案件ディレクトリを作る（events.jsonl は除外されている）
+        r = orig_call(cmd, **kw)
+        if cmd[1] == "copy" and "--update" in cmd:  # checkout の転送
+            assert "/*/events.jsonl" in _excludes(cmd)
+            (ws.cases_dir / "CASE-9").mkdir(exist_ok=True)
+        return r
+    monkeypatch.setattr(subprocess, "run", call)
+    sync.checkout(conf, ws)
+    assert [(c[1], c[2].rsplit("/", 2)[-2] if c[1] == "copyto" else "") for c in f.calls] == \
+        [("copyto", "CASE-1"), ("copyto", "CASE-2"), ("copy", ""), ("copyto", "CASE-9")]
+    assert [e["note"] for e in _events_of(ws, "CASE-1")] == ["r1", "case created: a"]
+    assert [e["note"] for e in _events_of(ws, "CASE-2")] == ["case created: b"]
+    assert [e["note"] for e in _events_of(ws, "CASE-9")] == ["r9"]
+    f.calls.clear()
+    sync.checkin(conf, ws)
+    assert [c[1] for c in f.calls] == ["copyto", "copyto", "copyto", "copy"]
+    assert not any(x.endswith("events.jsonl") for x in _excludes(f.calls[-1]))
+    assert st.load_case("CASE-1")["last_checkin_events"] == 2

@@ -40,7 +40,9 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 1. worklog.md を更新（Current State / Decision Log / Notes / Data location）。
 2. `checkin(case)` で Drive に戻す（`case.json.last_checkin_at` が更新される）。
 - `checkin(case)` は rclone sync で Drive 側の案件を上書きする（Drive 側の新しい版は `_deleted/<日付>/` に退避）。
+  `events.jsonl` だけは Drive 版とマージ（行の和集合）されるので、他環境の event は消えない。
   **他の環境で作業した後は、先に `open_case`（Drive から取り寄せる）か `kairn checkout` をしてから作業する**。
+- `open_case` は `events.jsonl` に何も書かない（閲覧記録はローカルの `index/access.log`）。何度開いても Drive との差分にならない。
 
 ## してはいけないこと
 - ファイルを直接編集してタスク状態・計画・イベントを変える（`case.json` / `plan/` / `events.jsonl` は必ず MCP 経由）。

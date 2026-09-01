@@ -85,7 +85,8 @@ def test_full_flow(conf, mocked_rclone):
             assert [t["id"] for t in oc["open_tasks"]] == ["T002"]
             assert oc["human_feedback"][-1]["note"] == "unit-6 でも確認" and oc["related"] == ["CASE-100"]
             assert "460800" in oc["worklog_tail"] and oc["drive"]["fetched"] is True
-            assert st.events("CASE-123")[-1]["action"] == "checkout"
+            assert st.events("CASE-123")[-1]["action"] == "sendback"  # open_case は events.jsonl に書かない
+            assert (ws.index_dir / "access.log").read_text().splitlines()[-1].split("\t")[1:] == ["CASE-123", "test-agent"]
             # re-plan without carrying T002 -> superseded
             r = await c.call_tool("plan", {"case": "CASE-123", "objective": "unit-6 も", "reason": "sendback", "tasks": [{"title": "unit-6 で確認"}]})
             assert r.structured_content["superseded"] == ["T002"]
@@ -171,7 +172,7 @@ def test_open_case_fetches_before_reading(conf, monkeypatch):
     run(main)
     assert calls == [("checkout", "acme", "CASE-9")]
     ev = CaseStore(conf.workspaces["acme"].cases_dir).events("CASE-9")
-    assert ev[-1]["action"] == "checkout"
+    assert [e["action"] for e in ev] == ["opened", "plan"]  # 閲覧では events.jsonl に何も足さない
 
 
 def test_invalid_case_id_is_rejected_before_touching_filesystem(conf, monkeypatch):
@@ -213,7 +214,13 @@ def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, mo
     """rclone は _run の層で偽装し、sync.checkout / sync.checkin 本体（last_checkin_at の記録を含む）を通す。"""
     import os, subprocess, time
     mocked_rclone = []
-    monkeypatch.setattr(sync, "_run", lambda cmd, dry=False: mocked_rclone.append(({"copy": "checkout", "sync": "checkin"}[cmd[1]], "acme", cmd[2].rsplit("/", 1)[-1] if cmd[1] == "sync" else cmd[2].rsplit("/", 1)[-1])) or subprocess.CompletedProcess(cmd, 0, "fake", ""))
+
+    def fake_run(cmd, dry=False):
+        if cmd[1] == "copyto":  # events.jsonl の取り寄せ: Drive に無い → 失敗（マージは飛ばす）
+            raise sync.RcloneError("object not found")
+        mocked_rclone.append(({"copy": "checkout", "sync": "checkin"}[cmd[1]], "acme", cmd[2].rsplit("/", 1)[-1]))
+        return subprocess.CompletedProcess(cmd, 0, "fake", "")
+    monkeypatch.setattr(sync, "_run", fake_run)
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "t", "acme", actor="human")
@@ -239,7 +246,7 @@ def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, mo
             d = r.structured_content["drive"]
             assert d["skipped"] == "local changes newer than last checkin" and d["fetched"] is False and "worklog.md" in d["files"]
             assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2  # 呼ばれていない
-            assert st.events("CASE-1")[-1]["action"] == "checkout"            # open_case 自体の event は記録される
+            assert st.events("CASE-1")[-1]["action"] == "checkin"             # open_case は event を書かない
             # もう一度 checkin すれば skip は解ける（偽装した未来の mtime は現在に戻す）
             os.utime(wl, None)
             await c.call_tool("checkin", {"case": "CASE-1"})
@@ -248,9 +255,9 @@ def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, mo
     run(main)
 
 
-def test_open_case_own_checkout_event_does_not_block_next_checkout(conf, monkeypatch):
-    """H-1: open_case が追記する checkout event で events.jsonl の mtime が進んでも（CHECKIN_SLACK_SEC を超えても）、
-    次の open_case は checkout する。人／AI の実質的な変更（log_event / update_task / UI 操作）があれば skip する。"""
+def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, monkeypatch):
+    """checkin 後に open_case を繰り返しても（events.jsonl の mtime が CHECKIN_SLACK_SEC を超えて進んでも）checkout は skip されない。
+    人／AI の実質的な変更（log_event / update_task / UI 操作）があれば skip する。checkin ツール自身の checkin event は変更に数えない。"""
     import os, subprocess, time
     calls = []
     monkeypatch.setattr(sync, "_run", lambda cmd, dry=False: calls.append(cmd[1]) or subprocess.CompletedProcess(cmd, 0, "fake", ""))
@@ -273,7 +280,7 @@ def test_open_case_own_checkout_event_does_not_block_next_checkout(conf, monkeyp
                 bump(ev)
                 r = await c.call_tool("open_case", {"case": "CASE-1"})
                 assert r.structured_content["drive"]["fetched"] is True, (i, r.structured_content["drive"])
-            assert calls.count("copy") == 3 and st.events("CASE-1")[-1]["action"] == "checkout"
+            assert calls.count("copy") == 3 and st.events("CASE-1")[-1]["action"] == "checkin"
             # AI の実質的な変更 → skip
             await c.call_tool("log_event", {"case": "CASE-1", "action": "progress", "note": "worked"})
             bump(ev)
@@ -351,3 +358,26 @@ def test_plan_validation_via_mcp(conf):
                 assert r.is_error and msg in r.content[0].text, (tasks, r.content)
             assert st.current_plan("CASE-1")["version"] == 1 and st.progress("CASE-1")["open"] == 2  # 何も変わっていない
     run(main)
+
+
+def test_open_case_writes_access_log_not_events(conf, mocked_rclone):
+    """open_case を繰り返しても events.jsonl は変わらず（内容も mtime も）、index/access.log（ローカル）に 1 行ずつ増える。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    ev = ws.cases_dir / "CASE-1" / "events.jsonl"
+    before = (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns)
+    log = ws.index_dir / "access.log"
+    mcp = srv.create_server(conf, default_agent="test-agent")
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            for i in range(3):
+                r = await c.call_tool("open_case", {"case": "CASE-1", "agent": f"agent-{i}"})
+                assert not r.is_error and r.structured_content["drive"]["fetched"] is True
+                assert (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns) == before
+                lines = log.read_text(encoding="utf-8").splitlines()
+                assert len(lines) == i + 1 and lines[-1].split("\t")[1:] == ["CASE-1", f"agent-{i}"]
+    run(main)
+    assert [e["action"] for e in st.events("CASE-1")] == ["opened"]
+    assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 3
