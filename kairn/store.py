@@ -1,42 +1,233 @@
 """案件・計画の版・イベントの読み書き（docs/data-model.md）。
 
-ここに置く規則（MCP から呼ばれる。エージェントの文章には頼らない）:
-- plan.new_version(): 新版に carried_from で引き継がれなかった open タスクを superseded にする
-- task.set_status(done): evidence が空なら ValueError
+MCP が呼ぶ規則の実体はここ（エージェントの文章には頼らない）:
+- new_plan_version(): 新版に carried_from で引き継がれなかった open タスクを superseded にする
+- set_task_status(done): evidence が空なら ValueError
+- すべての変更は events.jsonl に追記する
 """
 from __future__ import annotations
 
+import json
+import os
+import re
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+JST = timezone(timedelta(hours=9))
+TASK_STATUSES = {"open", "doing", "blocked", "done", "dropped", "superseded"}
+CASE_STATUSES = {"open", "closed", "suspended"}
+EVENT_ACTIONS = {"opened", "plan", "started", "progress", "done", "dropped", "sendback", "comment", "decision",
+                 "checkin", "checkout", "status", "extract"}
+CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
+
+def now_iso() -> str:
+    return datetime.now(JST).isoformat(timespec="seconds")
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+class CaseNotFound(KeyError):
+    pass
 
 
 class CaseStore:
     def __init__(self, cases_dir: Path):
-        self.cases_dir = cases_dir
+        self.cases_dir = Path(cases_dir)
 
-    # --- case ---
+    # ---------- paths ----------
+    def case_dir(self, case_id: str) -> Path:
+        if not CASE_ID_RE.match(case_id) or ".." in case_id:
+            raise ValueError(f"invalid case id: {case_id!r}")
+        return self.cases_dir / case_id
+
+    def _case_file(self, case_id: str) -> Path:
+        return self.case_dir(case_id) / "case.json"
+
+    def _plan_dir(self, case_id: str) -> Path:
+        return self.case_dir(case_id) / "plan"
+
+    def _events_file(self, case_id: str) -> Path:
+        return self.case_dir(case_id) / "events.jsonl"
+
+    # ---------- cases ----------
+    def list_case_ids(self) -> list[str]:
+        if not self.cases_dir.exists():
+            return []
+        return sorted(p.name for p in self.cases_dir.iterdir() if p.is_dir() and (p / "case.json").exists())
+
+    def list_dirs_without_case(self) -> list[str]:
+        """case.json の無い案件ディレクトリ（既存 worklog 等）。移行の対象。"""
+        if not self.cases_dir.exists():
+            return []
+        return sorted(p.name for p in self.cases_dir.iterdir() if p.is_dir() and not (p / "case.json").exists() and not p.name.startswith("."))
+
     def load_case(self, case_id: str) -> dict:
-        raise NotImplementedError
+        f = self._case_file(case_id)
+        if not f.exists():
+            raise CaseNotFound(case_id)
+        return json.loads(f.read_text(encoding="utf-8"))
 
     def save_case(self, case: dict) -> None:
-        raise NotImplementedError
+        case["updated_at"] = now_iso()
+        _atomic_write(self._case_file(case["id"]), json.dumps(case, ensure_ascii=False, indent=1) + "\n")
 
-    # --- plan versions ---
-    def current_plan(self, case_id: str) -> dict:
-        raise NotImplementedError
+    def create_case(self, case_id: str, title: str, workspace: str, actor: str, agent: str = "", **extra) -> dict:
+        d = self.case_dir(case_id)
+        if self._case_file(case_id).exists():
+            raise FileExistsError(case_id)
+        d.mkdir(parents=True, exist_ok=True)
+        case = {"id": case_id, "title": title, "status": "open", "workspace": workspace,
+                "repos": extra.get("repos", []), "tickets": extra.get("tickets", []), "prs": extra.get("prs", []),
+                "related": extra.get("related", []), "elements": extra.get("elements", {}), "data": [],
+                "created_at": now_iso(), "updated_at": now_iso(), "current_plan": 0}
+        self.save_case(case)
+        wl = d / "worklog.md"
+        if not wl.exists():
+            _atomic_write(wl, f"# {title}\n\n- **Created**: {now_iso()[:10]}\n- **Status**: open\n\n## Objective\n\n## Current State\n\n## Decision Log\n\n## Notes\n\n## Data location\n")
+        self.append_event(case_id, {"actor": actor, "agent": agent, "action": "opened", "note": f"case created: {title}"})
+        return case
 
-    def new_plan_version(self, case_id: str, objective: str, tasks: list[dict], reason: str, actor: str) -> dict:
-        """新版を保存し、引き継がれなかった open タスクを superseded にして返す。"""
-        raise NotImplementedError
+    def set_case_status(self, case_id: str, status: str, actor: str, agent: str = "", note: str = "") -> dict:
+        if status not in CASE_STATUSES:
+            raise ValueError(f"invalid case status: {status}")
+        case = self.load_case(case_id)
+        case["status"] = status
+        self.save_case(case)
+        self.append_event(case_id, {"actor": actor, "agent": agent, "action": "status", "note": f"{status}: {note}".strip(": ")})
+        return case
 
-    # --- tasks ---
-    def set_task_status(self, case_id: str, task_id: str, status: str, evidence: list[dict], note: str, actor: str) -> dict:
+    # ---------- plans ----------
+    def _plan_file(self, case_id: str, version: int) -> Path:
+        return self._plan_dir(case_id) / f"v{version:04d}.json"
+
+    def current_plan(self, case_id: str) -> dict | None:
+        case = self.load_case(case_id)
+        v = case.get("current_plan", 0)
+        if not v:
+            return None
+        return json.loads(self._plan_file(case_id, v).read_text(encoding="utf-8"))
+
+    def list_plans(self, case_id: str) -> list[dict]:
+        d = self._plan_dir(case_id)
+        if not d.exists():
+            return []
+        return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(d.glob("v*.json"))]
+
+    def _next_task_id(self, case_id: str) -> int:
+        n = 0
+        for plan in self.list_plans(case_id):
+            for t in plan["tasks"]:
+                n = max(n, int(t["id"][1:]))
+        return n + 1
+
+    def new_plan_version(self, case_id: str, objective: str, tasks: list[dict], reason: str, actor: str, agent: str = "") -> dict:
+        """計画の新版。tasks の各要素: {title, owner?, carried_from?: "T012"}.
+        carried_from で引き継がれた既存タスクは ID と履歴を保ち、引き継がれなかった open/doing/blocked は superseded。"""
+        case = self.load_case(case_id)
+        prev = self.current_plan(case_id)
+        prev_tasks = {t["id"]: t for t in (prev["tasks"] if prev else [])}
+        version = (prev["version"] if prev else 0) + 1
+        next_id = self._next_task_id(case_id)
+        new_tasks: list[dict] = []
+        carried: set[str] = set()
+        for t in tasks:
+            cf = t.get("carried_from")
+            if cf:
+                if cf not in prev_tasks:
+                    raise ValueError(f"carried_from refers to unknown task {cf}")
+                base = dict(prev_tasks[cf])
+                base["title"] = t.get("title") or base["title"]
+                base["owner"] = t.get("owner") or base.get("owner", "ai")
+                base["carried_from"] = f"v{prev['version']:04d}"
+                carried.add(cf)
+                new_tasks.append(base)
+            else:
+                new_tasks.append({"id": f"T{next_id:03d}", "title": t["title"], "owner": t.get("owner", "ai"),
+                                  "status": "open", "created_at": now_iso(), "evidence": []})
+                next_id += 1
+        # 引き継がれなかった生きているタスクは superseded（前版のファイルに記録）
+        superseded = []
+        if prev:
+            for tid, t in prev_tasks.items():
+                if tid not in carried and t["status"] in ("open", "doing", "blocked"):
+                    t["status"] = "superseded"
+                    t["superseded_by"] = f"v{version:04d}"
+                    superseded.append(tid)
+            _atomic_write(self._plan_file(case_id, prev["version"]), json.dumps(prev, ensure_ascii=False, indent=1) + "\n")
+        plan = {"version": version, "created_at": now_iso(), "actor": actor, "agent": agent, "reason": reason,
+                "objective": objective, "tasks": new_tasks, "superseded": superseded}
+        _atomic_write(self._plan_file(case_id, version), json.dumps(plan, ensure_ascii=False, indent=1) + "\n")
+        case["current_plan"] = version
+        self.save_case(case)
+        self.append_event(case_id, {"actor": actor, "agent": agent, "action": "plan", "plan": version,
+                                    "note": reason, "superseded": superseded, "tasks": [t["id"] for t in new_tasks]})
+        return plan
+
+    # ---------- tasks ----------
+    def set_task_status(self, case_id: str, task_id: str, status: str, evidence: list[dict] | None, note: str,
+                        actor: str, agent: str = "") -> dict:
+        if status not in TASK_STATUSES or status == "superseded":
+            raise ValueError(f"invalid task status: {status}")
+        evidence = evidence or []
         if status == "done" and not evidence:
-            raise ValueError("done requires evidence (commit / pr / file / test)")
-        raise NotImplementedError
+            raise ValueError("done requires evidence (commit / pr / file / test / url)")
+        for ev in evidence:
+            if not isinstance(ev, dict) or "type" not in ev:
+                raise ValueError("evidence items must be objects with a 'type'")
+        plan = self.current_plan(case_id)
+        if not plan:
+            raise ValueError("no plan yet: call plan() first")
+        task = next((t for t in plan["tasks"] if t["id"] == task_id), None)
+        if not task:
+            raise ValueError(f"unknown task {task_id} in plan v{plan['version']}")
+        task["status"] = status
+        task.setdefault("evidence", []).extend(evidence)
+        task["updated_at"] = now_iso()
+        if status == "done":
+            task["done_at"] = now_iso()
+        _atomic_write(self._plan_file(case_id, plan["version"]), json.dumps(plan, ensure_ascii=False, indent=1) + "\n")
+        action = {"doing": "started", "done": "done", "dropped": "dropped"}.get(status, "progress")
+        self.append_event(case_id, {"actor": actor, "agent": agent, "action": action, "task": task_id,
+                                    "status": status, "note": note, "evidence": evidence})
+        return task
 
-    # --- events ---
-    def append_event(self, case_id: str, event: dict) -> None:
-        raise NotImplementedError
+    def open_tasks(self, case_id: str) -> list[dict]:
+        plan = self.current_plan(case_id)
+        return [t for t in (plan["tasks"] if plan else []) if t["status"] in ("open", "doing", "blocked")]
 
-    def recent_events(self, case_id: str, n: int = 20) -> list[dict]:
-        raise NotImplementedError
+    # ---------- events ----------
+    def append_event(self, case_id: str, event: dict) -> dict:
+        if event.get("action") not in EVENT_ACTIONS:
+            raise ValueError(f"invalid event action: {event.get('action')}")
+        ev = {"t": now_iso(), "case": case_id, **event}
+        f = self._events_file(case_id)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with f.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        return ev
+
+    def events(self, case_id: str, n: int | None = None) -> list[dict]:
+        f = self._events_file(case_id)
+        if not f.exists():
+            return []
+        rows = [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
+        return rows[-n:] if n else rows
+
+    def last_event(self, case_id: str) -> dict | None:
+        ev = self.events(case_id)
+        return ev[-1] if ev else None
+
+    # ---------- summaries ----------
+    def progress(self, case_id: str) -> dict:
+        plan = self.current_plan(case_id)
+        tasks = plan["tasks"] if plan else []
+        live = [t for t in tasks if t["status"] != "superseded"]
+        return {"total": len(live), "done": sum(1 for t in live if t["status"] == "done"),
+                "open": sum(1 for t in live if t["status"] in ("open", "doing", "blocked")),
+                "plan": plan["version"] if plan else 0}
