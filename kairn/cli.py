@@ -11,6 +11,8 @@
   kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮（30 分以上更新のないもの）
   kairn raw-move <ws> [<case>] [--dry-run]  # 生データ（rules.raw_data）を Drive へ移動し、所在を案件に記録
   kairn daily <ws> [--dry-run]              # bag2zst -> checkin -> raw-move -> drive-index -> index（systemd timer 用）
+  kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]
+                                         # 子エージェントで case.json の下書きを作る（書き込まない。適用は UI）
   kairn serve [--port 8765]              # MCP + UI
   kairn install-skill                    # skills/kairn を ~/.agents/skills に置き ~/.claude/skills からリンク
 """
@@ -206,6 +208,29 @@ def cmd_sync(a):
             sys.exit(1)
 
 
+def cmd_extract(a):
+    conf = cfg.load(); ws = _ws(conf, a.ws)
+    import json
+    from . import extract
+    from .store import CaseNotFound
+    try:
+        r = extract.extract_card(conf, ws, a.case, agent=a.agent)
+    except CaseNotFound:
+        raise SystemExit(f"kairn: unknown case {a.case!r} in workspace {ws.name!r}") from None
+    if a.json:
+        print(json.dumps(r, ensure_ascii=False, indent=1))
+    else:
+        print(f"agent={r['agent']} ok={r['ok']} elapsed={r['elapsed_sec']}s")
+        if r["ok"]:
+            print(json.dumps(r["card"], ensure_ascii=False, indent=1))
+        else:
+            print(f"error: {r['error']}", file=sys.stderr)
+            if r["raw_excerpt"]:
+                print(r["raw_excerpt"], file=sys.stderr)
+    if not r["ok"]:
+        sys.exit(1)
+
+
 def cmd_serve(a):
     conf = cfg.load()
     from .server import serve
@@ -238,6 +263,7 @@ def main() -> None:
     s = sub.add_parser("index", help="rebuild the local search index (changed files only; --full for everything)"); s.add_argument("ws", nargs="?"); s.add_argument("--full", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("drive-index", help="list all files on the drive into index/drive-index.txt"); s.add_argument("ws", nargs="?"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("daily", help="bag2zst -> checkin -> raw-move -> drive-index -> index"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
+    s = sub.add_parser("extract", help="draft case.json with an isolated child agent (read-only; apply in the UI)"); s.add_argument("case"); s.add_argument("--ws"); s.add_argument("--agent", choices=["claude", "codex", "opencode", "antigravity"]); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_extract)
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8765); s.set_defaults(f=cmd_serve)
     s = sub.add_parser("install-skill"); s.set_defaults(f=cmd_install_skill)
     a = ap.parse_args()

@@ -172,6 +172,16 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
         return {"ok": True, "rclone": msg, "last_checkin_at": st.load_case(case).get("last_checkin_at")}
 
     @mcp.tool()
+    def extract_card(case: str, workspace: str | None = None) -> dict[str, Any]:
+        """文脈隔離した子エージェント（設定 extract.agent）で case.json の下書きを作る。読み取り専用・書き込まない。失敗は ok=False と error で返す（is_error にしない）。"""
+        from . import extract
+        ws = _ws(workspace, case)
+        try:
+            return extract.extract_card(conf, ws, case)
+        except Exception as e:
+            raise _fail(e) from e
+
+    @mcp.tool()
     def drive_index(pattern: str, workspace: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         """Drive 上のファイル一覧（drive-index.txt）を正規表現で検索する（生データの所在）。"""
         from . import sync

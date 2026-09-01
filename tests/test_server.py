@@ -1,4 +1,4 @@
-"""MCP サーバー（mcp 2.x）: in-process の Client で 9 ツールを呼ぶ。rclone は monkeypatch。"""
+"""MCP サーバー（mcp 2.x）: in-process の Client で 10 ツールを呼ぶ。rclone は monkeypatch。"""
 from __future__ import annotations
 
 import anyio
@@ -9,7 +9,7 @@ from kairn import server as srv
 from kairn import sync
 from kairn.store import CaseStore
 
-TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "search", "find_cases", "checkin", "drive_index"}
+TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "search", "find_cases", "checkin", "drive_index", "extract_card"}
 
 
 @pytest.fixture
