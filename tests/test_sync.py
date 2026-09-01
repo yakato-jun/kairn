@@ -209,7 +209,7 @@ def test_raw_move_command_and_dry_run(conf, fake):
     for m in moves:
         assert m[m.index("--min-age") + 1] == "14d" and m[-1] == "--dry-run" and m[m.index("--bwlimit") + 1] == "4M"
         assert "--include" not in m and "--exclude" not in m                  # 併用は順序不定（rclone の警告）
-        assert "- **/target/**" in m and m.index("- **/target/**") < (m.index("- **") if "- **" in m else len(m))  # exclude が先
+        assert "- target/**" in m and m.index("- target/**") < (m.index("- **") if "- **" in m else len(m))  # exclude が先
     # lsf は move と同じフィルタ（lsf: ソースの後ろ全部 / move: -v の後ろ、--bwlimit の前）
     for l, m in zip(lsf, moves):
         assert l[l.index(str(case)) + 1:] == m[m.index("-v") + 1:m.index("--bwlimit")]
@@ -301,6 +301,21 @@ def test_daily_passes_dry_run(conf, fake):
     assert [c for c in fake.calls if c[1] == "sync"][0][-1] == "--dry-run"
 
 
+# ---------- rclone 除外パターン（項目 8）: 実 rclone でローカル間コピー（クラウド接続なし） ----------
+
+@pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
+def test_exclude_patterns_match_root_and_nested(conf, tmp_path, monkeypatch):
+    monkeypatch.setenv("RCLONE_CONFIG", str(tmp_path / "rclone-empty.conf"))
+    src = tmp_path / "src"; dst = tmp_path / "dst"
+    for rel in ("target/x.txt", "sub/target/x.txt", "build/y.txt", "a/b/node_modules/m.js", ".venv/lib/z.py", "__pycache__/c.pyc",
+                "keep.txt", "sub/keep.md", "targets/keep.txt", "obj.o"):
+        _touch(src / rel, 5)
+    r = subprocess.run(["rclone", "copy", str(src), str(dst), *sync._filters(conf)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    got = sorted(str(p.relative_to(dst)) for p in dst.rglob("*") if p.is_file())
+    assert got == ["keep.txt", "sub/keep.md", "targets/keep.txt"]
+
+
 def test_checkin_marks_last_checkin_at(conf, fake):
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
@@ -313,3 +328,37 @@ def test_checkin_marks_last_checkin_at(conf, fake):
     sync.checkin(conf, ws)                                                  # ワークスペース全体（daily）も全案件に記録
     assert st.load_case("CASE-2")["last_checkin_at"]
     assert st.local_changes_since_checkin("CASE-2") == []
+
+
+# ---------- Data location の記録先（項目 14）: worklog.md があればそこ、無ければ DATA.md ----------
+
+def test_data_location_goes_to_worklog_if_present_else_data_md(conf, fake):
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    # case.json あり・worklog.md なし → DATA.md（worklog.md は作らない）
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    (ws.cases_dir / "CASE-1" / "worklog.md").unlink()
+    _touch(ws.cases_dir / "CASE-1" / "run.bag", 10, 20 * DAY)
+    # case.json なし・worklog.md あり → worklog.md
+    _touch(ws.cases_dir / "0815_legacy" / "run.bag", 10, 20 * DAY)
+    (ws.cases_dir / "0815_legacy" / "worklog.md").write_text("# legacy\n\n## Notes\nx\n", encoding="utf-8")
+    r = sync.raw_move(conf, ws)
+    assert r["files"] == 2
+    assert not (ws.cases_dir / "CASE-1" / "worklog.md").exists() and "## Data location\n- " in (ws.cases_dir / "CASE-1" / "DATA.md").read_text()
+    assert st.load_case("CASE-1")["data"][0]["files"] == 1 and st.events("CASE-1")[-1]["actor"] == "kairn"
+    assert not (ws.cases_dir / "0815_legacy" / "DATA.md").exists()
+    assert "## Data location\n- " in (ws.cases_dir / "0815_legacy" / "worklog.md").read_text()
+    assert not (ws.cases_dir / "0815_legacy" / "case.json").exists()
+
+
+def test_daily_dry_run_does_not_write_drive_index_or_sqlite(conf, fake):
+    ws = conf.workspaces["acme"]
+    CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
+    r = sync.daily(conf, ws, dry=True)
+    assert r["ok"] is True
+    assert not (ws.index_dir / "drive-index.txt").exists() and not (ws.index_dir / "kairn.sqlite").exists()
+    assert "not written" in r["steps"]["drive_index"]["result"] and "skipped" in r["steps"]["index"]["result"]
+    assert (ws.index_dir / "daily.log").exists()
+    assert "last_checkin_at" not in CaseStore(ws.cases_dir).load_case("CASE-1")
+    r = sync.daily(conf, ws)
+    assert (ws.index_dir / "drive-index.txt").exists() and (ws.index_dir / "kairn.sqlite").exists() and r["steps"]["index"]["result"]["cases"] == 1

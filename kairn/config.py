@@ -2,7 +2,8 @@
 
   drive:      {remote: <rclone remote>, root: ws}          kairn setup --remote が書く
   extract:    {agent: claude|codex|opencode|antigravity}   kairn setup --agent
-  workspaces: {<name>: {repos: [<abs path>...], link_name: tmp}}   kairn attach / detach が書く
+  workspaces: {<name>: {repos: [<abs path> | {path: <abs path>} | {glob: <pattern>} ...], link_name: tmp}}
+              kairn attach / detach が書く（glob: は展開時にディレクトリだけ採る。未知のキー・空文字は拒否）
   rules:      同期・退避規則（既定値あり）
 
 規則:
@@ -12,6 +13,7 @@
 """
 from __future__ import annotations
 
+import glob as _glob
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -24,8 +26,9 @@ DATA_ROOT = Path(os.environ.get("KAIRN_DATA_ROOT", ROOT / "workspaces"))
 USER_CONFIG_PATH = Path(os.environ.get("KAIRN_CONFIG", os.path.expanduser("~/.config/kairn/config.yaml")))
 EXAMPLE_CONFIG_PATH = ROOT / "config" / "config.example.yaml"
 
+# exclude は rclone のフィルタ規則。先頭に / の無い `target/**` は任意の階層の target/ に一致する（`**/target/**` はルート直下に一致しない）
 DEFAULT_RULES = {
-    "exclude": ["**/target/**", "**/build/**", "**/__pycache__/**", "**/node_modules/**", "**/.venv/**", "*.o", "*.rlib", "*.pyc"],
+    "exclude": ["target/**", "build/**", "__pycache__/**", "node_modules/**", ".venv/**", "*.o", "*.rlib", "*.pyc"],
     "raw_data": {"extensions": ["bag", "zst", "pgm", "npz", "zip", "gz", "tar", "active", "pcd", "mp4"], "min_size": "50M", "min_age": "14d"},
     "bag_to_zst": True,
 }
@@ -35,9 +38,30 @@ DEFAULT_RULES = {
 class Workspace:
     name: str
     description: str = ""
-    repos: list[Path] = field(default_factory=list)
+    repos: list[Path] = field(default_factory=list)            # 展開済み（glob: はディレクトリに展開）
+    repo_specs: list = field(default_factory=list)             # 設定ファイルに書く形（文字列 / {path} / {glob}）
     link_name: str = "tmp"
     data_root: Path | None = None  # None なら DATA_ROOT（KAIRN_DATA_ROOT）
+
+    def add_repo(self, repo: Path) -> None:
+        if repo not in self.repos:
+            self.repos.append(repo)
+            self.repo_specs.append(str(repo))
+
+    def remove_repo(self, repo: Path) -> None:
+        """path 指定の登録を外す。glob: で拾われたものは外せない（設定の glob 行を消す必要がある）。"""
+        keep = []
+        for spec in self.repo_specs:
+            if isinstance(spec, dict) and "glob" in spec:
+                if any(r.resolve() == repo for r in _expand_repo_spec(spec, self.name)):
+                    raise SystemExit(f"kairn: {repo} is registered via glob {spec['glob']!r}; cannot detach a single directory")
+                keep.append(spec)
+            elif Path(os.path.expanduser(spec if isinstance(spec, str) else spec["path"])).resolve() == repo:
+                continue
+            else:
+                keep.append(spec)
+        self.repo_specs = keep
+        self.repos = [r for r in self.repos if r.resolve() != repo]
 
     @property
     def data_dir(self) -> Path:
@@ -82,7 +106,7 @@ class Config:
             "extract": {"agent": self.extract_agent},
             "rules": self.rules,
             "workspaces": {
-                n: {"description": w.description, "repos": [str(r) for r in w.repos], "link_name": w.link_name}
+                n: {"description": w.description, "repos": list(w.repo_specs), "link_name": w.link_name}
                 for n, w in self.workspaces.items()
             },
         }
@@ -95,6 +119,24 @@ class Config:
         os.replace(tmp, self.path)
 
 
+def _expand_repo_spec(spec, ws_name: str) -> list[Path]:
+    """repos の 1 要素を Path のリストに。文字列 / {path: ...} はそのまま 1 件、{glob: ...} は一致するディレクトリだけ。
+    未知のキー・複数キー・空文字は SystemExit（Path("") がカレントディレクトリに化けるのを防ぐ）。"""
+    where = f"workspaces.{ws_name}.repos"
+    if isinstance(spec, str):
+        spec = {"path": spec}
+    if not isinstance(spec, dict) or len(spec) != 1:
+        raise SystemExit(f"kairn: {where}: each entry must be a path string, {{path: ...}} or {{glob: ...}} (got {spec!r})")
+    (key, val), = spec.items()
+    if key not in ("path", "glob"):
+        raise SystemExit(f"kairn: {where}: unknown key {key!r} (expected path or glob)")
+    if not isinstance(val, str) or not val.strip():
+        raise SystemExit(f"kairn: {where}: {key} must be a non-empty string (got {val!r})")
+    if key == "path":
+        return [Path(os.path.expanduser(val))]
+    return [Path(p) for p in sorted(_glob.glob(os.path.expanduser(val))) if os.path.isdir(p)]
+
+
 def _parse(raw: dict, path: Path) -> Config:
     drive = raw.get("drive") or {}
     remote = drive.get("remote")
@@ -103,8 +145,13 @@ def _parse(raw: dict, path: Path) -> Config:
     wss: dict[str, Workspace] = {}
     for name, w in (raw.get("workspaces") or {}).items():
         w = w or {}
-        repos = [Path(os.path.expanduser(r if isinstance(r, str) else r.get("path", ""))) for r in (w.get("repos") or [])]
-        wss[name] = Workspace(name=name, description=w.get("description", ""), repos=[r for r in repos if str(r)], link_name=w.get("link_name", "tmp"))
+        specs = list(w.get("repos") or [])
+        repos: list[Path] = []
+        for spec in specs:
+            for r in _expand_repo_spec(spec, name):
+                if r not in repos:
+                    repos.append(r)
+        wss[name] = Workspace(name=name, description=w.get("description", ""), repos=repos, repo_specs=specs, link_name=w.get("link_name", "tmp"))
     rules = {**DEFAULT_RULES, **(raw.get("rules") or {})}
     return Config(remote=remote, drive_root=drive.get("root", "ws"), extract_agent=(raw.get("extract") or {}).get("agent", "claude"),
                   rules=rules, workspaces=wss, path=path)
@@ -126,11 +173,24 @@ def create(remote: str, agent: str = "claude", path: Path | None = None, drive_r
     return conf
 
 
-def assert_data_not_tracked() -> None:
-    """安全弁: workspaces/ が git に追跡されていたら起動を拒否する。"""
-    r = subprocess.run(["git", "-C", str(ROOT), "ls-files", "workspaces"], capture_output=True, text=True)
-    if r.returncode == 0 and r.stdout.strip():
-        raise SystemExit("kairn: refusing to run — workspaces/ is tracked by git (data must never be committed)")
+def _tracked_in_git(path: Path) -> bool:
+    """path（またはその配下）が、path を含む git リポジトリで追跡されているか。リポジトリ外・存在しないなら False。"""
+    probe = path if path.is_dir() else path.parent
+    if not probe.exists():
+        return False
+    top = subprocess.run(["git", "-C", str(probe), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if top.returncode != 0:
+        return False
+    r = subprocess.run(["git", "-C", top.stdout.strip(), "ls-files", "--", str(path)], capture_output=True, text=True)
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def assert_data_not_tracked(data_root: Path | None = None) -> None:
+    """安全弁: workspaces/（リポジトリ内）と KAIRN_DATA_ROOT が git に追跡されていたら起動を拒否する。"""
+    data_root = data_root or DATA_ROOT
+    for p in {ROOT / "workspaces", data_root}:
+        if _tracked_in_git(p):
+            raise SystemExit(f"kairn: refusing to run — {p} is tracked by git (data must never be committed)")
 
 
 def rclone_remotes() -> list[str]:

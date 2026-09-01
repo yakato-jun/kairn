@@ -84,11 +84,13 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     return (r.stderr or r.stdout).strip()[-400:]
 
 
-def drive_index(conf: Config, ws: Workspace) -> Path:
+def drive_index(conf: Config, ws: Workspace, dry: bool = False) -> Path:
+    """remote 上の全ファイル一覧を index/drive-index.txt に保存。dry では一覧を取得するだけで書き換えない。"""
     out = ws.index_dir / "drive-index.txt"
-    out.parent.mkdir(parents=True, exist_ok=True)
     r = _run(["rclone", "lsf", "-R", "--files-only", "--format", "pst", "--separator", "\t", "--fast-list", conf.drive_path(ws.name)])
-    out.write_text(r.stdout, encoding="utf-8")
+    if not dry:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(r.stdout, encoding="utf-8")
     return out
 
 
@@ -317,19 +319,23 @@ def _append_data_location(path: Path, line: str, title: str) -> None:
 
 
 def record_data_location(ws: Workspace, case_dir: Path, drive: str, moved: dict[str, int], list_rel: str) -> dict:
-    """移動結果を案件に記録: case.json.data[] ＋ worklog.md の Data location（case.json 無しなら DATA.md）＋ progress event。"""
+    """移動結果を案件に記録: worklog.md があればその `## Data location` 節、無ければ DATA.md（case.json の有無に関わらず）。
+    case.json があれば data[] と progress event にも記録する。"""
     n, b = len(moved), sum(moved.values())
     entry = {"drive": drive, "files": n, "bytes": b, "moved_at": now_iso(), "list": list_rel}
     line = (f"- {entry['moved_at'][:10]}: {n} file(s), {_human(b)} moved to `{drive}` (list: {list_rel}). "
             f"restore: `rclone copy {drive}<file> <local case dir>/`")
     store = CaseStore(ws.cases_dir)
+    title = case_dir.name
     if (case_dir / "case.json").exists():
         case = store.load_case(case_dir.name)
+        title = case.get("title", title)
         case.setdefault("data", []).append(entry)
         store.save_case(case)
-        _append_data_location(case_dir / "worklog.md", line, case.get("title", case_dir.name))
         store.append_event(case_dir.name, {"actor": "kairn", "agent": "sync", "action": "progress",
                                            "note": f"raw_move: {n} file(s), {_human(b)} -> {drive}", "data": entry})
+    if (case_dir / "worklog.md").exists():
+        _append_data_location(case_dir / "worklog.md", line, title)
     else:
         _append_data_location(case_dir / "DATA.md", line, f"{case_dir.name} — data location")
     return entry
@@ -388,7 +394,8 @@ def raw_move(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
 
 def daily(conf: Config, ws: Workspace, dry: bool = False) -> dict:
     """bag2zst -> checkin -> raw_move -> drive_index -> index rebuild。各段の結果と例外を index/daily.log に追記し、
-    失敗しても次段へ進む。返り値: {workspace, started, finished, dry, ok, steps: {name: {ok, result|error}}}"""
+    失敗しても次段へ進む。dry では rclone に --dry-run を渡し、drive-index.txt と索引（kairn.sqlite）を書き換えない。
+    返り値: {workspace, started, finished, dry, ok, steps: {name: {ok, result|error}}}"""
     from .index import Index
     ws.index_dir.mkdir(parents=True, exist_ok=True)
     log = ws.index_dir / "daily.log"
@@ -396,8 +403,8 @@ def daily(conf: Config, ws: Workspace, dry: bool = False) -> dict:
         ("bag2zst", lambda: bag2zst(conf, ws, dry=dry)),
         ("checkin", lambda: checkin(conf, ws, dry=dry)),
         ("raw_move", lambda: raw_move(conf, ws, dry=dry)),
-        ("drive_index", lambda: str(drive_index(conf, ws))),
-        ("index", lambda: Index(ws.index_dir, ws.cases_dir).rebuild()),
+        ("drive_index", lambda: str(drive_index(conf, ws, dry=dry)) + (" (dry-run: not written)" if dry else "")),
+        ("index", lambda: "skipped (dry-run: index not rebuilt)" if dry else Index(ws.index_dir, ws.cases_dir).rebuild()),
     ]
     out: dict = {"workspace": ws.name, "started": now_iso(), "dry": dry, "ok": True, "steps": {}}
 

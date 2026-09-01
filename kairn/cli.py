@@ -7,7 +7,7 @@
   kairn status
   kairn cases [<ws>] [--all]
   kairn new <case id> "<title>" [--ws <ws>]
-  kairn checkout <ws> [<case>] | checkin <ws> [<case>] | index <ws> | drive-index <ws>
+  kairn checkout <ws> [<case>] [--dry-run] | checkin <ws> [<case>] [--dry-run] | index <ws> [--full] | drive-index <ws>
   kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮（30 分以上更新のないもの）
   kairn raw-move <ws> [<case>] [--dry-run]  # 生データ（rules.raw_data）を Drive へ移動し、所在を案件に記録
   kairn daily <ws> [--dry-run]              # bag2zst -> checkin -> raw-move -> drive-index -> index（systemd timer 用）
@@ -99,8 +99,7 @@ def cmd_attach(a):
         other = conf.workspace_for_path(repo)
         if other and other.name != ws.name:
             raise SystemExit(f"kairn: {repo} is already attached to workspace {other.name!r} (detach first)")
-        if repo not in ws.repos:
-            ws.repos.append(repo)
+        ws.add_repo(repo)
         print(f"{repo}: {_link(repo, ws)}")
     conf.save()
     print(f"attached {len(repos)} repo(s) to {ws.name}. config: {conf.path}")
@@ -112,7 +111,7 @@ def cmd_detach(a):
     ws = conf.workspace_for_path(repo)
     if not ws or repo not in [r.resolve() for r in ws.repos]:
         raise SystemExit(f"kairn: {repo} is not attached")
-    ws.repos = [r for r in ws.repos if r.resolve() != repo]
+    ws.remove_repo(repo)
     link = repo / ws.link_name
     if link.is_symlink():
         link.unlink(); print(f"removed link {link}")
@@ -234,8 +233,10 @@ def main() -> None:
     s = sub.add_parser("status"); s.set_defaults(f=cmd_status)
     s = sub.add_parser("cases"); s.add_argument("ws", nargs="?"); s.add_argument("--all", action="store_true"); s.set_defaults(f=cmd_cases)
     s = sub.add_parser("new"); s.add_argument("id"); s.add_argument("title"); s.add_argument("--ws"); s.set_defaults(f=cmd_new)
-    for name in ("checkout", "checkin", "index", "drive-index", "bag2zst", "raw-move"):
-        s = sub.add_parser(name); s.add_argument("ws", nargs="?"); s.add_argument("case", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.add_argument("--full", action="store_true"); s.set_defaults(f=cmd_sync)
+    for name in ("checkout", "checkin", "bag2zst", "raw-move"):
+        s = sub.add_parser(name); s.add_argument("ws", nargs="?"); s.add_argument("case", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
+    s = sub.add_parser("index", help="rebuild the local search index (changed files only; --full for everything)"); s.add_argument("ws", nargs="?"); s.add_argument("--full", action="store_true"); s.set_defaults(f=cmd_sync)
+    s = sub.add_parser("drive-index", help="list all files on the drive into index/drive-index.txt"); s.add_argument("ws", nargs="?"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("daily", help="bag2zst -> checkin -> raw-move -> drive-index -> index"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8765); s.set_defaults(f=cmd_serve)
     s = sub.add_parser("install-skill"); s.set_defaults(f=cmd_install_skill)

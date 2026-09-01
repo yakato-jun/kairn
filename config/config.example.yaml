@@ -12,11 +12,11 @@ extract:
 # 同期・退避の共通規則（省略時は kairn/config.py の DEFAULT_RULES）
 rules:
   exclude:                       # 同期・移動しない（ビルド産物等）
-    - "**/target/**"
-    - "**/build/**"
-    - "**/__pycache__/**"
-    - "**/node_modules/**"
-    - "**/.venv/**"
+    - "target/**"               # 先頭に / が無いので任意の階層の target/ に一致（**/target/** はルート直下に一致しない）
+    - "build/**"
+    - "__pycache__/**"
+    - "node_modules/**"
+    - ".venv/**"
     - "*.o"
     - "*.rlib"
     - "*.pyc"
@@ -32,9 +32,10 @@ rules:
 workspaces:
   acme:
     description: "ACME 向けの開発（複数リポジトリで 1 ワークスペース）"
-    repos:                       # 所属リポジトリ（絶対パス）。各リポジトリの <link_name>/ を cases/ へのリンクにする
-      - /home/user/acme-robot
-      - /home/user/acme-tools
+    repos:                       # 所属リポジトリ。各リポジトリの <link_name>/ を cases/ へのリンクにする
+      - /home/user/acme-robot    # 文字列 = 絶対パス（`- path: /home/user/acme-robot` と同じ）
+      - path: /home/user/acme-tools
+      - glob: ~/Acme*            # 一致するディレクトリを全部（読み込み時に展開。ファイルは除く）
     link_name: tmp
   personal:
     description: "顧客横断の個人ログ。他ワークスペースからは明示指定でのみ参照"
