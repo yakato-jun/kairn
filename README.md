@@ -170,6 +170,12 @@ kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--
 ```
 MCP からは `extract_card(case)`（失敗も `ok=false` の結果として返す）。毎回 events に `{actor: kairn, agent: "extract:<name>", action: extract}` が残る。
 
+## 動作環境
+
+- Python 3.11〜3.13（venv は 3.13 で検証。3.14 は依存の pydantic が CPython 3.14.0 の
+  `typing._eval_type` 変更と衝突するため現時点では動かない。依存側の対応後に追従する）
+- 依存はすべて `uv.lock` で固定（作成時点の各最新版）。更新は `uv lock --upgrade && uv sync --group dev` の後にテスト全緑を確認する
+
 ## 状態
 
 段階 1（config / store / index / server(MCP, mcp 2.x) / ui）完了（2026-09-02）。段階 5（sync: bag2zst / raw-move / daily / systemd timer）完了（2026-09-02）。
