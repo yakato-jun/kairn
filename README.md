@@ -33,20 +33,71 @@ contrib/opencode/agents/kairn-extract.md  OpenCode 用の読み取り専用エ�
 workspaces/<ws>/       データ実体（.gitignore、Drive 同期）
   cases/<case>/        worklog.md、作業ファイル、plan/、events.jsonl
   index/               各環境で再生成する索引（kairn.sqlite）、drive-index.txt、daily.log、raw-moved-YYYYMMDD.txt
-skills/kairn/SKILL.md  各エージェント共通の運用手順（~/.agents/skills/kairn へ配置、~/.claude/skills はリンク）
+skills/kairn/SKILL.md  各エージェント共通の運用手順（`kairn install-skill` が ~/.agents/skills/kairn と ~/.claude/skills/kairn からリンクする）
 docs/                  データモデル・MCP ツール・UI の仕様
 ```
 
 ## 各エージェントへの適用
 
-| | 置き場 | MCP 登録 |
-|---|---|---|
-| Claude Code | `~/.claude/skills/kairn` → `~/.agents/skills/kairn` へのリンク | `claude mcp add --transport http kairn http://127.0.0.1:<port>/mcp` |
-| Codex CLI | `~/.agents/skills/kairn`（`$kairn` で明示起動） | `~/.codex/config.toml` `[mcp_servers.kairn] url=…` |
-| OpenCode | `~/.claude/skills` / `~/.agents/skills` を自動で読む | `opencode.json` `"mcp": {"kairn": {"type":"remote","url":…}}` |
+### 1. サーバーを常駐させる（`kairn serve`）
 
-リポジトリ側の CLAUDE.md / AGENTS.md には「このリポジトリは kairn ワークスペース `<ws>` に属する」
-の数行だけを書き、対応表は各環境の `~/.config/kairn/config.yaml`（`kairn attach` が書く）を正とする。
+MCP（`http://127.0.0.1:8765/mcp`）と UI（`http://127.0.0.1:8765/ui`）は同じプロセス。systemd user service で常駐させる:
+
+```
+cp contrib/systemd/kairn-serve.service ~/.config/systemd/user/
+# clone 先が %h/kairn でなければ ExecStart の %h/kairn を書き換える
+systemctl --user daemon-reload && systemctl --user enable --now kairn-serve.service
+systemctl --user status kairn-serve.service; journalctl --user -u kairn-serve
+```
+
+### 2. skill を置く（Claude Code / Codex / OpenCode 共通の SKILL.md）
+
+```
+kairn install-skill      # ~/.agents/skills/kairn と ~/.claude/skills/kairn を skills/kairn へのシンボリックリンクにする（既存があれば上書きせず報告）
+```
+
+### 3. MCP を登録する
+
+| エージェント | skill の読み込み元 | MCP 登録 |
+|---|---|---|
+| Claude Code | `~/.claude/skills/kairn` | `claude mcp add --transport http kairn http://127.0.0.1:8765/mcp -s user` |
+| Codex CLI | `~/.agents/skills/kairn`（`$kairn` で明示起動） | `~/.codex/config.toml` に `[mcp_servers.kairn]` / `url = "http://127.0.0.1:8765/mcp"` |
+| OpenCode | `~/.claude/skills` / `~/.agents/skills` を自動で読む | `~/.config/opencode/opencode.json` に `"mcp": {"kairn": {"type": "remote", "url": "http://127.0.0.1:8765/mcp", "enabled": true}}` |
+
+Codex の `~/.codex/config.toml`:
+```toml
+[mcp_servers.kairn]
+url = "http://127.0.0.1:8765/mcp"
+```
+
+OpenCode の `~/.config/opencode/opencode.json`（プロジェクト直下の `opencode.json` でも可。書式は https://opencode.ai/docs/mcp-servers/ ）:
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "kairn": {"type": "remote", "url": "http://127.0.0.1:8765/mcp", "enabled": true}
+  }
+}
+```
+
+### 4. OpenCode で extract を使う場合（`extract.agent: opencode`）
+
+読み取り専用のエージェント定義 `contrib/opencode/agents/kairn-extract.md` を `~/.config/opencode/agents/` に置く
+（書式は https://opencode.ai/docs/agents/ 。`tools:` は deprecated のため `permission:` で read / grep / glob / list 以外を deny）:
+```
+mkdir -p ~/.config/opencode/agents && cp contrib/opencode/agents/kairn-extract.md ~/.config/opencode/agents/
+```
+未配置だと opencode の extract は失敗し `ok=false` になる。
+
+### 5. リポジトリ側に書くこと（CLAUDE.md / AGENTS.md）
+
+紐付けの正は各環境の `~/.config/kairn/config.yaml`（`kairn attach` が書く）。リポジトリには所属ワークスペースと入口だけを書く:
+
+```
+## 作業ログ（kairn）
+このリポジトリは kairn ワークスペース `acme` に属する。案件（case）の作業は kairn skill の手順に従う
+（MCP `kairn` の open_case で開き、done は証拠付きで update_task、終わったら checkin）。案件ディレクトリは `tmp/<case>/`（`kairn attach` が張るリンク）。
+```
 
 ## 同期（sync）
 
