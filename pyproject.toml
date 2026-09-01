@@ -4,10 +4,16 @@ version = "0.0.1"
 description = "Case-based worklog operations: MCP server, local UI, Drive sync, shared agent skill"
 requires-python = ">=3.11"
 dependencies = [
-  "mcp>=1.20",
+  "mcp>=2",
   "fastapi>=0.115",
   "uvicorn>=0.30",
   "pyyaml>=6.0",
+  "python-multipart>=0.0.9",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
 ]
 
 [project.scripts]
