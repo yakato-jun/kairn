@@ -87,5 +87,5 @@ workspaces/<ws>/
 
 ## 証拠（evidence）の型
 `type` は commit / pr / file / test / url。`note` は actor=human のみ（AI の証拠にはならない）。型ごとの必須キー:
-commit → `id`（`repo` 任意）/ pr → `id`（`repo` 任意）/ file → `path` / test → `cmd`（`result` 任意）/ url → `url`。
+commit → `id`（`repo` 任意）/ pr → `id`（`repo` 任意）/ file → `path` / test → `cmd`（`result` 任意）/ url → `url` / note → `text`。
 不正な型・必須キー欠落は `update_task` / `log_event` とも拒否する（`kairn/store.py` `validate_evidence`）。

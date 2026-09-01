@@ -39,8 +39,9 @@ def test_validate_evidence_types_and_required_keys(store):
     assert validate_evidence(None, "ai") == []
     ok = [{"type": "commit", "id": "abc"}, {"type": "pr", "id": 1}, {"type": "file", "path": "x"}, {"type": "test", "cmd": "pytest"}, {"type": "url", "url": "u"}]
     assert validate_evidence(ok, "ai") == ok
-    assert validate_evidence([{"type": "note", "note": "seen it"}], "human")        # note は human のみ
-    for ev, actor in [([{"type": "note"}], "ai"), ([{"type": "note"}], "kairn"), ([{"type": "commit", "id": ""}], "ai"),
+    assert validate_evidence([{"type": "note", "text": "seen it"}], "human")        # note は human のみ、text 必須
+    for ev, actor in [([{"type": "note", "text": "x"}], "ai"), ([{"type": "note", "text": "x"}], "kairn"), ([{"type": "note"}], "human"),
+                      ([{"type": "note", "text": ""}], "human"), ([{"type": "note", "note": "old key"}], "human"), ([{"type": "commit", "id": ""}], "ai"),
                       ([{"type": "file", "id": "x"}], "ai"), ([{"type": "zip", "path": "x"}], "human"), ([{"id": "x"}], "ai"), ("commit abc", "ai")]:
         with pytest.raises(ValueError):
             validate_evidence(ev, actor)
@@ -48,10 +49,12 @@ def test_validate_evidence_types_and_required_keys(store):
     store.create_case("CASE-1", "t", "acme", actor="human")
     store.new_plan_version("CASE-1", "o", [{"title": "a"}], reason="r", actor="ai")
     with pytest.raises(ValueError, match="human only"):
-        store.set_task_status("CASE-1", "T001", "done", [{"type": "note"}], "", actor="ai")
+        store.set_task_status("CASE-1", "T001", "done", [{"type": "note", "text": "x"}], "", actor="ai")
+    with pytest.raises(ValueError, match="requires 'text'"):
+        store.append_event("CASE-1", {"actor": "human", "action": "comment", "note": "x", "evidence": [{"type": "note"}]})
     with pytest.raises(ValueError, match="requires 'path'"):
         store.append_event("CASE-1", {"actor": "ai", "action": "progress", "note": "x", "evidence": [{"type": "file"}]})
-    store.append_event("CASE-1", {"actor": "human", "action": "comment", "note": "x", "evidence": [{"type": "note", "note": "ok"}]})
+    store.append_event("CASE-1", {"actor": "human", "action": "comment", "note": "x", "evidence": [{"type": "note", "text": "ok"}]})
     store.set_task_status("CASE-1", "T001", "done", [{"type": "test", "cmd": "pytest -q", "result": "30 passed"}], "", actor="ai")
 
 

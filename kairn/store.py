@@ -23,7 +23,7 @@ EVENT_ACTIONS = {"opened", "plan", "started", "progress", "done", "dropped", "se
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 TASK_OWNERS = {"ai", "human"}
 EVIDENCE_TYPES = {"commit", "pr", "file", "test", "url"}
-EVIDENCE_REQUIRED_KEY = {"commit": "id", "pr": "id", "file": "path", "test": "cmd", "url": "url"}
+EVIDENCE_REQUIRED_KEY = {"commit": "id", "pr": "id", "file": "path", "test": "cmd", "url": "url", "note": "text"}  # note は human のみ
 # checkin 直後に書かれる case.json / events.jsonl の mtime は last_checkin_at（秒単位）よりわずかに後になるため、この幅は「変更なし」とみなす
 CHECKIN_SLACK_SEC = 2.0
 LOCAL_CHANGE_FILES = ("case.json", "events.jsonl", "worklog.md")
@@ -35,7 +35,7 @@ def now_iso() -> str:
 
 def validate_evidence(evidence: list | None, actor: str) -> list[dict]:
     """証拠の検証（docs/data-model.md「証拠の型」）。型は EVIDENCE_TYPES、`note` は actor=human のみ。
-    型ごとの必須キー（commit/pr→id、file→path、test→cmd、url→url）が無ければ ValueError。"""
+    型ごとの必須キー（commit/pr→id、file→path、test→cmd、url→url、note→text）が無ければ ValueError。"""
     if evidence is None:
         return []
     if not isinstance(evidence, list):
@@ -47,8 +47,7 @@ def validate_evidence(evidence: list | None, actor: str) -> list[dict]:
         if t == "note":
             if actor != "human":
                 raise ValueError("evidence type 'note' is allowed for actor=human only (ai must give commit / pr / file / test / url)")
-            continue
-        if t not in EVIDENCE_TYPES:
+        elif t not in EVIDENCE_TYPES:
             raise ValueError(f"unknown evidence type {t!r} (allowed: {', '.join(sorted(EVIDENCE_TYPES))}; 'note' for human only)")
         key = EVIDENCE_REQUIRED_KEY[t]
         if ev.get(key) in (None, ""):

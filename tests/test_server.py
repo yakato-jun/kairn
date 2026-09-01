@@ -236,7 +236,7 @@ def test_evidence_type_validation_via_mcp(conf):
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
             bad = [
-                ([{"type": "note", "note": "done, trust me"}], "human only"),
+                ([{"type": "note", "text": "done, trust me"}], "human only"),
                 ([{"type": "commit"}], "requires 'id'"),
                 ([{"type": "pr", "repo": "acme-robot"}], "requires 'id'"),
                 ([{"type": "file"}], "requires 'path'"),
