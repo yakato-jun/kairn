@@ -107,11 +107,11 @@ class Index:
         if match:
             sql = "SELECT case_id, file, heading, body, snippet(sections, 3, '[', ']', '…', 24), bm25(sections) FROM sections WHERE sections MATCH ?"
             args: list = [match]
-        else:  # 短語だけ: LIKE で走査
+        else:  # 短語だけ（trigram は 3 文字未満を索引しない）: 本文と案件 ID を LIKE で走査
             sql = "SELECT case_id, file, heading, body, substr(body, 1, 160), 0 FROM sections WHERE 1=1"
             args = []
             for w in short:
-                sql += " AND body LIKE ?"; args.append(f"%{w}%")
+                sql += " AND (body LIKE ? OR case_id LIKE ?)"; args += [f"%{w}%", f"%{w}%"]
         if cases:
             sql += " AND case_id IN (%s)" % ",".join("?" * len(cases)); args += cases
         sql += " ORDER BY 6 LIMIT ?"; args.append(limit * 4 if short else limit)
@@ -131,10 +131,18 @@ class Index:
     def find_cases(self, query: str, k: int = 5) -> list[dict]:
         """case.json（title/tickets/related/elements）と本文の両方から案件を採点。理由付き。
         search_sections と違い語は OR で結ぶ（問いの一部にでも当たる案件を拾い、bm25 で順位付け）。"""
-        match, _short = self._fts_query(query, op="OR")
+        match, short = self._fts_query(query, op="OR")
         scores: dict[str, float] = {}; reasons: dict[str, list[str]] = {}
         if not match:
-            return []
+            if not short:
+                return []
+            # 短語だけ（trigram は 3 文字未満を索引しない）: 案件 ID / title の LIKE で補う
+            sql = "SELECT case_id FROM cases WHERE " + " OR ".join("case_id LIKE ? OR title LIKE ?" for _ in short)
+            args = [x for w in short for x in (f"%{w}%", f"%{w}%")]
+            for (cid,) in self.db.execute(sql + " LIMIT 50", args):
+                scores[cid] = scores.get(cid, 0) + 1.0; reasons.setdefault(cid, []).append("案件 ID / title に部分一致")
+            ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:k]
+            return [{"case": cid, "score": round(s, 3), "reasons": reasons.get(cid, [])} for cid, s in ranked]
         for cid, title, score in self.db.execute("SELECT case_id, title, bm25(cases) FROM cases WHERE cases MATCH ? LIMIT 50", (match,)):
             scores[cid] = scores.get(cid, 0) + 3.0 * -score; reasons.setdefault(cid, []).append("案件カードに一致")
         for cid, heading, score in self.db.execute("SELECT case_id, heading, bm25(sections) FROM sections WHERE sections MATCH ? LIMIT 200", (match,)):
