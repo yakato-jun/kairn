@@ -14,7 +14,7 @@
   kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]
                                          # 子エージェントで case.json の下書きを作る（書き込まない。適用は UI）
   kairn serve [--port 8765]              # MCP + UI
-  kairn install-skill                    # skills/kairn を ~/.agents/skills に置き ~/.claude/skills からリンク
+  kairn install-skill [--home <dir>]     # <home>/.agents/skills/kairn と <home>/.claude/skills/kairn を skills/kairn へのリンクにする（既存は上書きしない）
 """
 from __future__ import annotations
 
@@ -237,15 +237,29 @@ def cmd_serve(a):
     serve(conf, host=a.host, port=a.port)
 
 
-def cmd_install_skill(a):
+def install_skill(home: Path) -> list[str]:
+    """skills/kairn を <home>/.agents/skills/kairn と <home>/.claude/skills/kairn からのシンボリックリンクにする。
+    既存（リンク・ディレクトリ・ファイル）は上書きせず報告する。戻り値は 1 行ずつの報告。"""
     src = cfg.ROOT / "skills" / "kairn"
-    agents = Path(os.path.expanduser("~/.agents/skills")); claude = Path(os.path.expanduser("~/.claude/skills"))
-    agents.mkdir(parents=True, exist_ok=True); claude.mkdir(parents=True, exist_ok=True)
-    for base in (agents, claude):
+    out = []
+    for base in (home / ".agents" / "skills", home / ".claude" / "skills"):
+        base.mkdir(parents=True, exist_ok=True)
         dst = base / "kairn"
-        if dst.is_symlink() or dst.exists():
-            print(f"exists: {dst} ({'symlink' if dst.is_symlink() else 'dir'})"); continue
-        dst.symlink_to(src, target_is_directory=True); print(f"linked {dst} -> {src}")
+        if dst.is_symlink():
+            target = Path(os.readlink(dst))
+            state = "already linked" if dst.resolve() == src.resolve() else f"symlink to {target}, not {src}; fix by hand"
+            out.append(f"exists: {dst} ({state})")
+        elif dst.exists():
+            out.append(f"exists: {dst} ({'dir' if dst.is_dir() else 'file'}; not overwritten)")
+        else:
+            dst.symlink_to(src, target_is_directory=True)
+            out.append(f"linked {dst} -> {src}")
+    return out
+
+
+def cmd_install_skill(a):
+    for line in install_skill(Path(os.path.expanduser(a.home)).resolve()):
+        print(line)
 
 
 def main() -> None:
@@ -265,7 +279,7 @@ def main() -> None:
     s = sub.add_parser("daily", help="bag2zst -> checkin -> raw-move -> drive-index -> index"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("extract", help="draft case.json with an isolated child agent (read-only; apply in the UI)"); s.add_argument("case"); s.add_argument("--ws"); s.add_argument("--agent", choices=["claude", "codex", "opencode", "antigravity"]); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_extract)
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8765); s.set_defaults(f=cmd_serve)
-    s = sub.add_parser("install-skill"); s.set_defaults(f=cmd_install_skill)
+    s = sub.add_parser("install-skill", help="symlink skills/kairn into ~/.agents/skills and ~/.claude/skills (existing entries are kept)"); s.add_argument("--home", default="~", help="HOME to install into (default: ~)"); s.set_defaults(f=cmd_install_skill)
     a = ap.parse_args()
     cfg.assert_data_not_tracked()
     a.f(a)
