@@ -6,5 +6,6 @@
 4. `ui`: 一覧・かんばん・時系列・差し戻し
 5. `sync`: rclone による checkout / checkin / 日次同期 / 生データ move / drive-index（既存 backup-tmp.sh の設計を取り込む）
 6. skill: skills/kairn/SKILL.md を ~/.agents/skills に配置、Claude 側リンク、/worklog の置き換え
-7. `extract`: claude -p による case.json 下書き
+7. `extract`: 文脈隔離した子エージェントで case.json の下書きを作る。エージェントはアダプタ方式で
+   設定（`extract.agent`）から選ぶ: claude / codex / opencode / antigravity（docs/extract-agents.md）
 8. 既存 worklog の移行（別件）
