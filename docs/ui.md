@@ -2,7 +2,7 @@
 
 **Host の許可リスト検査は未実装**（DNS リバインディング対策なし）。localhost / Tailscale 内からだけ到達できる前提で運用する（`kairn serve --host` を公開アドレスにしない）。
 
-人が操作するのはここだけ。データは MCP と同じファイル。実装: `kairn/ui.py`。
+人が操作するのはここだけ。データは MCP と同じファイル（`workspaces/<ws>/cases/<case>/`。エージェント側は `open_case` の `paths.case_dir` で同じ場所を読み書きする）。実装: `kairn/ui.py`。
 
 実装は **Starlette（FastAPI の基盤。MCP SDK の ASGI アプリと同じ Starlette に同居）＋ 素の HTML**。外部依存を増やさない。
 `server.build_app()` が `/`（→ `/ui`）、`/ui…`（UI）、`/mcp`（MCP）を 1 つのアプリに載せる。UI のルートは Mount ではなく

@@ -3,7 +3,7 @@
 段階 1（2026-09-02 完了）: 1〜4。段階 2（2026-09-02 完了）: 5。段階 3（2026-09-02 完了）: 7。段階 4（2026-09-02 完了）: 6。
 1〜7 は完了。8（既存 worklog の移行）は**別件**（このリポジトリの段階には含めない）。
 
-1. [完了] `config`: 環境ローカル設定（~/.config/kairn/config.yaml）の読み込み・検証（remote 固定、未登録パスは拒否）、`kairn attach`（<repo>/tmp → cases へのリンク）
+1. [完了] `config`: 環境ローカル設定（~/.config/kairn/config.yaml）の読み込み・検証（remote 固定、未登録パスは拒否）、`kairn attach`（リポジトリ → ワークスペースの対応を設定に記録。リポジトリ側にリンクは作らない。案件は `workspaces/<ws>/cases/` のみ）
 2. [完了] `store` / `index`: case.json / plan / events の読み書き、superseded 自動化、evidence 検証、SQLite FTS5（trigram）索引の差分再生成
 3. [完了] `server`: MCP（mcp 2.x、streamable HTTP /mcp。open_case / list_cases / plan / update_task / log_event / search / find_cases / checkin / drive_index）
 4. [完了] `ui`: 一覧・かんばん・時系列・版履歴・差し戻し・コメント・タスク追加・状態変更・鮮度・elements 絞り込み（/ui、MCP と同一プロセス）

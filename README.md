@@ -30,8 +30,8 @@ kairn/extract/         案件カードの下書き抽出: prompt.md（子エー�
 config/config.example.yaml  環境ローカル設定の書式例（架空名）。実体は ~/.config/kairn/config.yaml（kairn のコマンドが書く。コミットしない）
 contrib/systemd/       systemd user unit（kairn-serve.service: MCP+UI 常駐 / kairn-daily.service + .timer: 日次同期）
 contrib/opencode/agents/kairn-extract.md  OpenCode 用の読み取り専用エージェント定義（extract の opencode アダプタが `--agent kairn-extract` で使う）
-workspaces/<ws>/       データ実体（.gitignore、Drive 同期）
-  cases/<case>/        worklog.md、作業ファイル、plan/、events.jsonl
+workspaces/<ws>/       データ実体（.gitignore、Drive 同期）。案件の置き場はここだけ（リポジトリ側にはリンクも作らない）
+  cases/<case>/        worklog.md、作業ファイル、plan/、events.jsonl。エージェントは open_case が返す paths.case_dir（絶対パス）で読み書きする
   index/               各環境で再生成する索引（kairn.sqlite）、drive-index.txt、daily.log、raw-moved-YYYYMMDD.txt
 skills/kairn/SKILL.md  各エージェント共通の運用手順（`kairn install-skill` が ~/.agents/skills/kairn と ~/.claude/skills/kairn からリンクする）
 docs/                  データモデル・MCP ツール・UI の仕様
@@ -44,9 +44,9 @@ docs/                  データモデル・MCP ツール・UI の仕様
 ```
 kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity] [--extract-timeout <sec>]   # 使う remote（これ以外は使わない）と抽出エージェント（--agent / --extract-timeout 省略時は既存値を保つ）
 kairn ws list | kairn ws create <name> [--description "…"]   # ワークスペース一覧（Drive 上の有無つき）／作成
-kairn attach <ws> [<repo path>...]        # リポジトリを所属させ <repo>/<link_name>（既定 tmp）を cases/ へのリンクにする（省略時は cwd）
+kairn attach <ws> [<repo path>...]        # リポジトリの所属を設定に記録する（省略時は cwd。リポジトリ側には何も作らない）
 kairn detach [<repo path>]                # 所属を外す（glob: 由来なら exclude: を書く）
-kairn status                              # 設定・cwd の所属・各ワークスペースの案件数とリンク状態
+kairn status                              # 設定・cwd の所属・各ワークスペースの案件数と所属リポジトリ
 kairn cases [<ws>] [--all]                # 案件一覧（既定は open のみ）
 kairn new <case id> "<title>" [--ws <ws>] # 案件を作る（case.json）
 kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新（--dry-run では索引を書き換えない）

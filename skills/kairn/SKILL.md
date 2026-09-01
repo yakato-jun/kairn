@@ -15,6 +15,9 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
    次に `open_tasks`、`plan`、`recent_events`、`worklog_tail`、`related`。`drive` に `fetched: false` が
    あれば Drive からの取り寄せが skip / 失敗した理由が入っている（ローカル写しで続行している）。
 3. 計画が無い案件は `plan(case, objective, tasks, reason)` で v1 を作る（`tasks: [{title, owner?: ai|human}]`）。
+4. 案件ディレクトリ（worklog.md・作業ファイル）はリポジトリの外、kairn の `workspaces/<ws>/cases/<case>/` にある。
+   `open_case` の返り値 `paths.case_dir` / `paths.worklog`（絶対パス）で読み書きする。リポジトリ内の `tmp/` 等を探さない。
+   その領域を読み書きできない（許可の外）と言われたら、`kairn install-skill` が表示する許可設定手順を人に伝える。
 
 ## 作業中
 - 着手: `update_task(case, task, status="doing")`。
