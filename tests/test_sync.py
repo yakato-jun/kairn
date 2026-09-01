@@ -299,3 +299,17 @@ def test_daily_passes_dry_run(conf, fake):
     assert r["steps"]["bag2zst"]["result"]["dry"] and r["steps"]["raw_move"]["result"]["dry"]
     assert (ws.cases_dir / "CASE-123" / "run.bag").exists()
     assert [c for c in fake.calls if c[1] == "sync"][0][-1] == "--dry-run"
+
+
+def test_checkin_marks_last_checkin_at(conf, fake):
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human"); st.create_case("CASE-2", "t", "acme", actor="human")
+    _touch(ws.cases_dir / "0815_legacy" / "notes.md")
+    sync.checkin(conf, ws, "CASE-1", dry=True)
+    assert "last_checkin_at" not in st.load_case("CASE-1")                 # dry では記録しない
+    sync.checkin(conf, ws, "CASE-1")
+    assert st.load_case("CASE-1")["last_checkin_at"] and "last_checkin_at" not in st.load_case("CASE-2")
+    sync.checkin(conf, ws)                                                  # ワークスペース全体（daily）も全案件に記録
+    assert st.load_case("CASE-2")["last_checkin_at"]
+    assert st.local_changes_since_checkin("CASE-2") == []

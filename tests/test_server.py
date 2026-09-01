@@ -135,3 +135,148 @@ def test_search_survives_broken_symlink(conf, monkeypatch):
             assert not r.is_error, r.content
             assert r.structured_content["result"][0]["case"] == "CASE-1"
     run(main)
+
+
+# ---------- open_case の順序・checkout skip（項目 1） ----------
+
+def _fake_checkout_creating_case(conf, calls):
+    """Drive にしか無い案件を取り寄せる偽 checkout: 案件ディレクトリを作って成功を返す。"""
+    def checkout(c, ws, case=None, dry=False):
+        calls.append(("checkout", ws.name, case))
+        st = CaseStore(ws.cases_dir)
+        st.create_case(case, "from drive", ws.name, actor="human")
+        st.new_plan_version(case, "obj", [{"title": "t1"}], reason="on drive", actor="ai")
+        (ws.cases_dir / case / "worklog.md").write_text("# from drive\n## Notes\nfetched text\n", encoding="utf-8")
+        return "fake checkout created case"
+    return checkout
+
+
+def test_open_case_fetches_before_reading(conf, monkeypatch):
+    """Drive にしか無い案件: checkout → load の順なので CaseNotFound にならず、返り値は取り寄せ後のディスクを反映する。"""
+    calls = []
+    monkeypatch.setattr(sync, "checkout", _fake_checkout_creating_case(conf, calls))
+    mcp = srv.create_server(conf)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("open_case", {"case": "CASE-9"})
+            assert not r.is_error, r.content
+            oc = r.structured_content
+            assert oc["drive"]["fetched"] is True and oc["case"]["title"] == "from drive"
+            assert oc["plan"]["version"] == 1 and [t["id"] for t in oc["open_tasks"]] == ["T001"]
+            assert "fetched text" in oc["worklog_tail"] and oc["recent_events"][0]["action"] == "opened"
+            # 不正な ID は取り寄せる前に拒否
+            r = await c.call_tool("open_case", {"case": "../etc"})
+            assert r.is_error and "invalid case id" in r.content[0].text
+    run(main)
+    assert calls == [("checkout", "acme", "CASE-9")]
+    ev = CaseStore(conf.workspaces["acme"].cases_dir).events("CASE-9")
+    assert ev[-1]["action"] == "checkout"
+
+
+def test_open_case_unknown_case_reports_drive_result(conf, mocked_rclone):
+    mcp = srv.create_server(conf)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("open_case", {"case": "CASE-404"})
+            assert r.is_error and "CASE-404" in r.content[0].text and "fetched" in r.content[0].text
+    run(main)
+    assert ("checkout", "acme", "CASE-404") in mocked_rclone  # 取り寄せは試みた
+
+
+def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, monkeypatch):
+    """rclone は _run の層で偽装し、sync.checkout / sync.checkin 本体（last_checkin_at の記録を含む）を通す。"""
+    import os, subprocess, time
+    mocked_rclone = []
+    monkeypatch.setattr(sync, "_run", lambda cmd, dry=False: mocked_rclone.append(({"copy": "checkout", "sync": "checkin"}[cmd[1]], "acme", cmd[2].rsplit("/", 1)[-1] if cmd[1] == "sync" else cmd[2].rsplit("/", 1)[-1])) or subprocess.CompletedProcess(cmd, 0, "fake", ""))
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    wl = ws.cases_dir / "CASE-1" / "worklog.md"
+    mcp = srv.create_server(conf)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            # last_checkin_at 未記録 → checkout する
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            assert r.structured_content["drive"]["fetched"] is True
+            assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 1
+            # checkin → last_checkin_at が記録される。直後の open_case は（ローカル変更なし）checkout する
+            r = await c.call_tool("checkin", {"case": "CASE-1"})
+            assert not r.is_error and r.structured_content["last_checkin_at"]
+            assert st.load_case("CASE-1")["last_checkin_at"] == r.structured_content["last_checkin_at"]
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            assert r.structured_content["drive"]["fetched"] is True and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2
+            # checkin より新しいローカル変更（worklog.md の mtime を進める）→ checkout を skip
+            t = time.time() + 30
+            os.utime(wl, (t, t))
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            d = r.structured_content["drive"]
+            assert d["skipped"] == "local changes newer than last checkin" and d["fetched"] is False and "worklog.md" in d["files"]
+            assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2  # 呼ばれていない
+            assert st.events("CASE-1")[-1]["action"] == "checkout"            # open_case 自体の event は記録される
+            # もう一度 checkin すれば skip は解ける（偽装した未来の mtime は現在に戻す）
+            os.utime(wl, None)
+            await c.call_tool("checkin", {"case": "CASE-1"})
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            assert r.structured_content["drive"]["fetched"] is True and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 3
+    run(main)
+
+
+# ---------- 証拠の型検証（項目 2）・計画の検証（項目 5）: MCP 経由で is_error ----------
+
+def test_evidence_type_validation_via_mcp(conf):
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    st.new_plan_version("CASE-1", "o", [{"title": "a"}], reason="r", actor="ai")
+    mcp = srv.create_server(conf)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            bad = [
+                ([{"type": "note", "note": "done, trust me"}], "human only"),
+                ([{"type": "commit"}], "requires 'id'"),
+                ([{"type": "pr", "repo": "acme-robot"}], "requires 'id'"),
+                ([{"type": "file"}], "requires 'path'"),
+                ([{"type": "test", "result": "pass"}], "requires 'cmd'"),
+                ([{"type": "url"}], "requires 'url'"),
+                ([{"type": "screenshot", "path": "x.png"}], "unknown evidence type"),
+                ([{"id": "abc1234"}], "objects with a 'type'"),
+            ]
+            for ev, msg in bad:
+                r = await c.call_tool("update_task", {"case": "CASE-1", "task": "T001", "status": "done", "evidence": ev})
+                assert r.is_error and msg in r.content[0].text, (ev, r.content)
+                assert st.current_plan("CASE-1")["tasks"][0]["status"] == "open"
+                r = await c.call_tool("log_event", {"case": "CASE-1", "action": "progress", "note": "x", "evidence": ev})
+                assert r.is_error and msg in r.content[0].text, (ev, r.content)
+            assert not any(e["action"] == "progress" for e in st.events("CASE-1"))
+            ok = [{"type": "commit", "repo": "acme-robot", "id": "abc1234"}, {"type": "pr", "id": 42}, {"type": "file", "path": "a.md"},
+                  {"type": "test", "cmd": "pytest", "result": "pass"}, {"type": "url", "url": "https://example.com/x"}]
+            r = await c.call_tool("log_event", {"case": "CASE-1", "action": "progress", "note": "x", "evidence": ok})
+            assert not r.is_error
+            r = await c.call_tool("update_task", {"case": "CASE-1", "task": "T001", "status": "done", "evidence": ok})
+            assert not r.is_error and r.structured_content["status"] == "done"
+    run(main)
+
+
+def test_plan_validation_via_mcp(conf):
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    st.new_plan_version("CASE-1", "o", [{"title": "a"}, {"title": "b"}], reason="r", actor="ai")
+    mcp = srv.create_server(conf)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            for tasks, msg in [
+                ([{"carried_from": "T002"}, {"carried_from": "T002"}], "T002 carried twice"),
+                ([{"owner": "ai"}], "task needs title or carried_from"),
+                ([{"title": "x", "owner": "robot"}], "owner must be ai | human"),
+                ([{"carried_from": "T001", "owner": "bot"}], "owner must be ai | human"),
+            ]:
+                r = await c.call_tool("plan", {"case": "CASE-1", "objective": "o", "reason": "r", "tasks": tasks})
+                assert r.is_error and msg in r.content[0].text, (tasks, r.content)
+            assert st.current_plan("CASE-1")["version"] == 1 and st.progress("CASE-1")["open"] == 2  # 何も変わっていない
+    run(main)

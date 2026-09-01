@@ -1,7 +1,8 @@
 """Drive 同期（rclone）。ワークスペース単位。remote は設定済みのものだけ使う。
 
 - checkout(ws[, case]):  <remote>:<root>/<ws>/cases[/<case>] -> local（テキスト層のみ、削除は追従しない）
-- checkin(ws[, case]):   local -> remote（テキスト層 sync。削除は _deleted/<日付>/ へ退避）
+- checkin(ws[, case]):   local -> remote（テキスト層 sync。削除・Drive 側の新しい版は _deleted/<日付>/ へ退避）。成功時に
+                         各案件の case.json.last_checkin_at を更新（open_case の checkout skip 判定に使う）
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
 - bag2zst(ws[, case]):   *.bag / *.bag.active を zstd 圧縮（<name>.zst、mtime 引き継ぎ、元は削除）
 - raw_move(ws[, case]):  生データ（rules.raw_data）を rclone move で Drive へ移動し、所在を case.json / worklog に記録
@@ -76,6 +77,10 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     backup = conf.drive_path(ws.name, "_deleted", _dt.date.today().isoformat())
     r = _run(["rclone", "sync", str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
               "--stats-one-line", "-v", *_filters(conf), *_bw(conf)], dry)
+    if not dry:
+        store = CaseStore(ws.cases_dir)
+        for cid in ([case] if case else store.list_case_ids()):
+            store.mark_checkin(cid)
     return (r.stderr or r.stdout).strip()[-400:]
 
 

@@ -71,10 +71,15 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
         """案件を開く: case / 最新計画 / open タスク / 直近イベント / 人からの差し戻し・コメント / 関連案件 / worklog 末尾 を 1 回で返す。"""
         ws = _ws(workspace, case); st = _store(ws)
         try:
-            c = st.load_case(case)
+            st.case_dir(case)  # ID の検証（Drive 取り寄せの前）
+            # 順序: ワークスペース解決 → checkout（--update）→ 読み込み。返り値はすべて取り寄せ後のディスクから読む
+            fetched = _fetch_from_drive(conf, ws, st, case)
+            try:
+                c = st.load_case(case)
+            except CaseNotFound:
+                raise ToolError(f"unknown case {case!r} in workspace {ws.name!r} (drive: {fetched})") from None
             plan = st.current_plan(case)
             all_events = st.events(case)
-            fetched = _fetch_from_drive(conf, ws, case)
             feedback = [e for e in all_events if e.get("actor") == "human" and e.get("action") in ("sendback", "comment")][-5:]
             wl = ws.cases_dir / case / "worklog.md"
             tail = wl.read_text(encoding="utf-8", errors="replace")[-3000:] if wl.exists() else ""
@@ -160,11 +165,11 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
         ws = _ws(workspace, case); st = _store(ws)
         try:
             st.load_case(case)
-            msg = sync.checkin(conf, ws, case)
+            msg = sync.checkin(conf, ws, case)  # 成功時に case.json.last_checkin_at を更新する
         except Exception as e:
             raise _fail(e) from e
         st.append_event(case, {"actor": "ai", "agent": _agent(agent), "action": "checkin", "note": msg[-200:]})
-        return {"ok": True, "rclone": msg}
+        return {"ok": True, "rclone": msg, "last_checkin_at": st.load_case(case).get("last_checkin_at")}
 
     @mcp.tool()
     def drive_index(pattern: str, workspace: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
@@ -178,9 +183,13 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
     return mcp
 
 
-def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, case: str) -> dict[str, Any]:
-    """open_case の取り寄せ。失敗してもローカル写しで続行し、その旨を返す（docs/mcp-tools.md）。"""
+def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, st: CaseStore, case: str) -> dict[str, Any]:
+    """open_case の取り寄せ。case.json.last_checkin_at より新しいローカル変更があれば skip（未 checkin の変更を Drive で上書きしない）。
+    失敗してもローカル写しで続行し、その旨を返す（docs/mcp-tools.md）。"""
     from . import sync
+    changed = st.local_changes_since_checkin(case)
+    if changed:
+        return {"fetched": False, "skipped": "local changes newer than last checkin", "files": changed}
     try:
         return {"fetched": True, "rclone": sync.checkout(conf, ws, case)}
     except Exception as e:  # rclone 不在・remote 不達など
