@@ -152,7 +152,8 @@ OpenCode の `~/.config/opencode/opencode.json`:
 ```
 ## 作業ログ（kairn）
 このリポジトリは kairn ワークスペース `acme` に属する。案件（case）の作業は kairn skill の手順に従う
-（MCP `kairn` の open_case で開き、done は証拠付きで update_task、終わったら checkin）。案件ディレクトリは `tmp/<case>/`（`kairn attach` が張るリンク）。
+（MCP `kairn` の open_case で開き、done は証拠付きで update_task、終わったら checkin）。
+案件ディレクトリはこのリポジトリの外（kairn の workspaces 配下）にある。open_case が返す `paths.case_dir` の絶対パスで読み書きする。
 ```
 
 ## 同期（sync）
