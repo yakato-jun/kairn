@@ -874,6 +874,64 @@ def test_merge_manifest_never_drops_entries(conf, fake, monkeypatch):
     assert not (ws.index_dir / "manifest.cache.json").exists()
 
 
+def test_update_manifest_repairs_missing_entries_when_drive_rev_matches(conf, fake, monkeypatch):
+    """自己修復: manifest にエントリの無いローカル案件（rev あり）は、Drive の case.json の rev がローカルと一致する場合に限り
+    ローカルの rev / last_checkin_at / checked_in_from で補う。不一致・読めない・rev 未付与の案件は補わない。
+    checkin の結果に [manifest repaired: N] が付く。上限秒を使い切ったら残りは次回。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    for cid in ("CASE-1", "CASE-2", "CASE-3", "CASE-4", "CASE-5"):
+        st.create_case(cid, cid, "acme", actor="human")
+    sync.checkin(conf, ws)                                                            # 全件 checkin 済み（manifest に 5 件）
+    c1, c2, c3 = (st.load_case(c) for c in ("CASE-1", "CASE-2", "CASE-3"))
+    fake.remote_cases = {"CASE-1": dict(c1), "CASE-2": {**c2, "rev": "another-host-rev"}, "CASE-4": dict(st.load_case("CASE-4"))}   # CASE-3 は Drive に無い
+    c5 = st.load_case("CASE-5"); c5.pop("rev"); st.save_case(c5)                       # rev 未付与
+    fake.manifest = {"cases": {"CASE-0": {"rev": "keep"}}, "updated_at": "x"}         # 欠落した manifest（CASE-1〜5 が無い）
+    fake.calls.clear()
+    msg = sync.checkin(conf, ws, "CASE-4")
+    assert msg.endswith("[manifest: 1] [manifest repaired: 1]")
+    cats = [c[2] for c in fake.calls if c[1] == "cat"]
+    assert cats == ["my-drive:ws/acme/manifest.json", "my-drive:ws/acme/cases/CASE-1/case.json", "my-drive:ws/acme/cases/CASE-2/case.json",
+                    "my-drive:ws/acme/cases/CASE-3/case.json"]                        # CASE-4 は自分の分、CASE-5 は rev 無し: 確認しない
+    assert set(fake.manifest["cases"]) == {"CASE-0", "CASE-1", "CASE-4"}
+    assert fake.manifest["cases"]["CASE-1"] == {"rev": c1["rev"], "checked_in_at": c1["last_checkin_at"], "from": c1["checked_in_from"]}
+    assert fake.manifest["cases"]["CASE-4"]["rev"] == st.load_case("CASE-4")["rev"] != c1["rev"]
+    cache = json.loads((ws.index_dir / "manifest.cache.json").read_text(encoding="utf-8"))
+    assert set(cache["cases"]) == {"CASE-0", "CASE-1", "CASE-4"}
+    # 2 回目: CASE-2（不一致）と CASE-3（Drive に無い）だけ再確認し、補わない
+    fake.calls.clear()
+    assert sync.checkin(conf, ws, "CASE-4").endswith("[manifest: 1]")
+    assert [c[2].rsplit("/", 2)[-2] for c in fake.calls if c[1] == "cat" and c[2].endswith("case.json")] == ["CASE-2", "CASE-3"]
+    # 上限秒 0: 確認せず、残りは次回
+    monkeypatch.setattr(sync, "MANIFEST_REPAIR_BUDGET_SEC", 0.0)
+    fake.calls.clear(); fake.remote_cases["CASE-2"] = dict(c2)
+    sync.checkin(conf, ws, "CASE-4")
+    assert [c[1] for c in fake.calls] == ["copyto", "sync", "cat", "rcat"] and "CASE-2" not in fake.manifest["cases"]
+    monkeypatch.setattr(sync, "MANIFEST_REPAIR_BUDGET_SEC", 5.0)
+    # 1 件目の cat がタイムアウトしたら打ち切る（残りは次回）
+    timed_out: list[tuple[str, float]] = []
+
+    def slow_cat(cmd, **kw):
+        if cmd[1] == "cat" and cmd[2].endswith("/CASE-2/case.json"):
+            timed_out.append((cmd[2], kw["timeout"]))
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+        return fake(cmd, **kw)
+    monkeypatch.setattr(subprocess, "run", slow_cat)
+    fake.calls.clear()
+    assert sync.checkin(conf, ws, "CASE-4").endswith("[manifest: 1]") and "CASE-2" not in fake.manifest["cases"]
+    assert [c[2] for c in fake.calls if c[1] == "cat" and c[2].endswith("case.json")] == [] and len(timed_out) == 1
+    assert timed_out[0][0].endswith("/CASE-2/case.json") and 0 < timed_out[0][1] <= 5.0     # cat の timeout は残り秒（≤ 上限）
+    monkeypatch.setattr(subprocess, "run", fake)
+    assert sync.checkin(conf, ws, "CASE-4").endswith("[manifest repaired: 1]") and fake.manifest["cases"]["CASE-2"]["rev"] == c2["rev"]
+    # repair_manifest 単体: 引数の manifest を直接書き換え、補った案件 id を返す。cat には rclone_flags が付く
+    m = {"cases": {}}
+    conf.rules["rclone_flags"] = ["--checkers", "4"]
+    fake.remote_cases["CASE-4"] = dict(st.load_case("CASE-4"))     # 偽 rclone の sync は Drive 側 case.json を更新しないので合わせる
+    fake.calls.clear()
+    assert sync.repair_manifest(conf, ws, m) == ["CASE-1", "CASE-2", "CASE-4"] and set(m["cases"]) == {"CASE-1", "CASE-2", "CASE-4"}
+    assert all(c[-2:] == ["--checkers", "4"] for c in fake.calls)
+
+
 def test_manifest_rebuild_holds_lock(conf, fake):
     """manifest_rebuild（dry でない）は列挙〜書き戻しをロックの中で行う。dry はロックを取らない。"""
     ws = conf.workspaces["acme"]

@@ -18,7 +18,8 @@
                          list_cases / UI 一覧の印（drive_state）に使う。同一ホスト内の同時更新（serve のジョブと CLI の checkin、
                          serve 内の別スレッド）は $XDG_STATE_HOME/kairn/locks/<ws>.manifest.lock への flock で直列化する
                          （manifest_lock。読むのはロック取得後）。別ホスト間の競合は「後勝ち」（案件ごとの独立エントリなので影響は
-                         当該案件のみ）
+                         当該案件のみ）。update_manifest は読み込んだエントリを減らさず（refuse_entry_loss）、ローカルに rev があるのに
+                         エントリの無い案件は Drive の case.json の rev が一致する場合に限り補う（repair_manifest。5 秒で打ち切り）
 - checkin_job(ws, case, agent): MCP の checkin ジョブ本体（checkin → checkin event）。kairn/jobs.py のスレッドで走る
 - merge_events(local_path, remote_lines): 行の文字列一致で重複除去した和集合を `t` で安定ソートし、内容が変わる時だけ書き戻す
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
@@ -193,6 +194,7 @@ MANIFEST_CACHE_NAME = "manifest.cache.json"
 MANIFEST_TIMEOUT_SEC = 10   # open_case が rclone cat を待つ上限秒（越えたら manifest unavailable としてローカルを返す）
 MANIFEST_LOCK_TIMEOUT_SEC = 60   # manifest の cat → rcat 区間のホスト内ロックを待つ上限秒（越えたら ManifestLockTimeout）
 MANIFEST_LOCK_POLL_SEC = 0.1
+MANIFEST_REPAIR_BUDGET_SEC = 5.0   # update_manifest の自己修復（欠けたエントリの Drive 側 rev 確認）に使う上限秒。残りは次回に回す
 
 
 class ManifestLockTimeout(RcloneError):
@@ -313,20 +315,64 @@ def refuse_entry_loss(read: dict | None, merged: dict) -> None:
         raise ManifestWriteRefused(f"refusing to write manifest: {len(lost)} existing entr{'y' if len(lost) == 1 else 'ies'} would be dropped ({', '.join(lost[:5])}{', …' if len(lost) > 5 else ''})")
 
 
-def update_manifest(conf: Config, ws: Workspace, entries: dict[str, dict]) -> dict:
+def repair_manifest(conf: Config, ws: Workspace, manifest: dict, budget_sec: float | None = None) -> list[str]:
+    """自己修復（update_manifest の中、ロック内で呼ぶ）: ローカルの case.json に rev があるのに manifest にエントリの無い案件を、
+    Drive の cases/<case>/case.json を rclone cat で 1 件ずつ読み、その rev がローカルと一致する場合に限りローカルの
+    rev / last_checkin_at / checked_in_from（store.manifest_entry）で補う。一致しない（Drive に別の版がある）・読めない案件は触らない。
+    確認は budget_sec（既定 MANIFEST_REPAIR_BUDGET_SEC）で打ち切り、残りは次回の checkin に回す。manifest は直接書き換える。
+    返り値: 補った案件 id（案件 id 順）。"""
+    if budget_sec is None:
+        budget_sec = MANIFEST_REPAIR_BUDGET_SEC
+    st = CaseStore(ws.cases_dir)
+    cases = manifest.setdefault("cases", {})
+    repaired: list[str] = []
+    t0 = time.monotonic()
+    for cid in st.list_case_ids():
+        if cid in cases:
+            continue
+        entry = st.manifest_entry(cid)
+        if entry is None:   # rev 未付与（未 checkin）: 補うものが無い
+            continue
+        remaining = budget_sec - (time.monotonic() - t0)
+        if remaining <= 0:
+            break
+        try:
+            r = subprocess.run(["rclone", "cat", conf.drive_path(ws.name, "cases", cid, "case.json"), *_flags(conf)],
+                               capture_output=True, text=True, timeout=remaining)
+        except subprocess.TimeoutExpired:
+            break
+        except OSError:
+            break
+        if r.returncode != 0:
+            continue
+        try:
+            remote = json.loads(r.stdout)
+        except ValueError:
+            continue
+        if isinstance(remote, dict) and remote.get("rev") == entry["rev"]:
+            cases[cid] = entry
+            repaired.append(cid)
+    return repaired
+
+
+def update_manifest(conf: Config, ws: Workspace, entries: dict[str, dict]) -> tuple[dict, list[str]]:
     """checkin 後: ホスト内ロック（manifest_lock）を取ってから Drive の manifest を読み（取得できなければ新規作成）、渡された案件の
     エントリを書き換えて rcat で書き戻す。読むのは必ずロック取得後（ロック前に読んだ値で書き戻すと、待っている間に他が書いた
     エントリを消す）。同一ホストの同時 checkin はこのロックで直列化され、別ホスト間は「後勝ち」（他案件のエントリには触れないので
     影響は当該案件のみ）。ロック待ちの上限は MANIFEST_LOCK_TIMEOUT_SEC（超えたら ManifestLockTimeout）。
+    重ねた後、ローカルに rev があるのにエントリの無い案件を repair_manifest で補う（Drive の case.json の rev が一致する案件だけ、
+    MANIFEST_REPAIR_BUDGET_SEC 以内。欠けた manifest が checkin のたびに少しずつ戻る）。
     書き戻す前に refuse_entry_loss で「読み込んだエントリが 1 つも減っていない」ことを確かめる（減っていれば書かずに
-    ManifestWriteRefused。既存エントリを消してよいのは manifest_rebuild だけ）。キャッシュも更新する。"""
+    ManifestWriteRefused。既存エントリを消してよいのは manifest_rebuild だけ）。キャッシュも更新する。
+    返り値: (書き戻した manifest, 自己修復で補った案件 id)。"""
     with manifest_lock(ws):
         read = fetch_manifest(conf, ws)
         m = merge_manifest(read, entries)
+        repaired = repair_manifest(conf, ws, m)
         refuse_entry_loss(read, m)
         write_manifest(conf, ws, m)
         save_manifest_cache(ws, m)
-    return m
+    return m, repaired
 
 
 DRIVE_STATES = ("synced", "drive_newer", "local_changes", "unknown")
@@ -551,10 +597,12 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     if stamped:
         entries = {cid: e for cid in stamped if (e := store.manifest_entry(cid)) is not None}
         try:
-            update_manifest(conf, ws, entries)
+            _, repaired = update_manifest(conf, ws, entries)
         except RcloneError as e:
             raise RcloneError(f"transferred, but manifest update failed ({e}); the next checkin updates it. rclone: {msg}") from e
         msg = f"{msg} [manifest: {len(entries)}]"
+        if repaired:
+            msg = f"{msg} [manifest repaired: {len(repaired)}]"
     return msg
 
 
