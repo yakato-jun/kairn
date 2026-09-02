@@ -55,6 +55,7 @@ def cmd_setup(a):
                          f"create it first:  rclone config create {a.remote} drive scope=drive")
     conf = cfg.create(a.remote, a.agent, extract_timeout=a.extract_timeout)
     print(f"config written: {conf.path}\n  remote={conf.remote} root={conf.drive_root} extract.agent={conf.extract_agent} extract.timeout={conf.extract_timeout}s")
+    _warn_shared_client_id(conf.remote)
     from . import sync
     names = sync.list_ws_on_drive(conf)
     print(f"workspaces on drive: {names or '(none)'}")
@@ -114,10 +115,18 @@ def cmd_detach(a):
     conf.save(); print(f"detached {repo} from {ws.name}")
 
 
+def _warn_shared_client_id(remote: str) -> None:
+    """remote が Google Drive で自前の client_id が無ければ stderr に 1 行（config.shared_client_id_warning）。それ以外は何も出さない。"""
+    w = cfg.shared_client_id_warning(remote)
+    if w:
+        print(w, file=sys.stderr)
+
+
 def cmd_status(a):
     conf = cfg.load()
     from .store import CaseStore
     print(f"config: {conf.path}\nremote: {conf.remote}  root: {conf.drive_root}  extract.agent: {conf.extract_agent}  extract.timeout: {conf.extract_timeout}s")
+    _warn_shared_client_id(conf.remote)
     here = conf.workspace_for_path(Path.cwd())
     print(f"cwd: {Path.cwd()} -> workspace: {here.name if here else '(not attached)'}")
     for ws in conf.workspaces.values():

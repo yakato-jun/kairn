@@ -393,3 +393,35 @@ def assert_data_not_tracked(data_root: Path | None = None) -> None:
 def rclone_remotes() -> list[str]:
     r = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True)
     return [x.rstrip(":") for x in r.stdout.split()] if r.returncode == 0 else []
+
+
+SHARED_CLIENT_ID_WARNING = ("warning: rclone remote {remote!r} is a Google Drive remote without its own client_id "
+                            "(共有 client_id のため Drive API が絞られます。README「専用 OAuth クライアント」の手順で設定してください)")
+_SECRET_KEYS = ("token", "client_secret")
+
+
+def shared_client_id_warning(remote: str) -> str | None:
+    """`rclone config show <remote>` を読み、type = drive で client_id が空／無いなら警告文（kairn setup / status が表示）。
+    それ以外（client_id あり、drive 以外、rclone 不在・失敗・remote 不明）は None。秘密の値は保持も出力もしない:
+    見るのは `type` と `client_id` の 2 キーだけで、`token` / `client_secret` の行は読まずに捨てる。"""
+    try:
+        r = subprocess.run(["rclone", "config", "show", remote], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    kind: str | None = None
+    has_client_id = False
+    for line in r.stdout.splitlines():
+        if "=" not in line or line.lstrip().startswith(("#", "[")):
+            continue
+        key, value = (x.strip() for x in line.split("=", 1))
+        if key in _SECRET_KEYS:
+            continue
+        if key == "type":
+            kind = value
+        elif key == "client_id":
+            has_client_id = bool(value)
+    if kind == "drive" and not has_client_id:
+        return SHARED_CLIENT_ID_WARNING.format(remote=remote)
+    return None
