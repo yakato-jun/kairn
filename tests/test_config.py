@@ -400,3 +400,78 @@ def test_cli_setup_and_status_warn_about_shared_client_id(tmp_path, monkeypatch,
     cli.main()
     out, err = capsys.readouterr()
     assert "remote: my-drive" in out and err == ""
+
+
+# ---------- ConfigHolder（常駐の設定: リクエストごとに config.yaml の更新を確認して読み直す） ----------
+
+def _holder(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("drive: {remote: my-drive}\nworkspaces: {acme: {repos: []}}\n", encoding="utf-8")
+    loads = []
+    warnings = []
+
+    def loader(path):
+        loads.append(path)
+        return cfg.load(path)
+    return p, cfg.ConfigHolder(cfg.load(p), loader=loader, warn=warnings.append), loads, warnings
+
+
+def _touch_newer(p):
+    """mtime を確実に進める（同じ ns に書き戻されても変更と分かるように +1 秒）。"""
+    import os
+    st = p.stat()
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+
+def test_config_holder_reloads_only_when_file_changes(tmp_path):
+    p, h, loads, warnings = _holder(tmp_path)
+    first = h.current()
+    assert h.current() is first and h.current() is first and loads == [] and h.reloads == 0    # 変更なし → 読み直さない
+    assert h.path == p
+    p.write_text("drive: {remote: my-drive}\nworkspaces: {acme: {repos: []}, beta: {repos: []}}\n", encoding="utf-8")
+    _touch_newer(p)
+    second = h.current()
+    assert second is not first and list(second.workspaces) == ["acme", "beta"] and loads == [p] and h.reloads == 1
+    assert h.current() is second and loads == [p] and warnings == []                          # 読み直したあとは再び安定
+    # Config.save()（UI / CLI の rules 編集）でも同じ: 保存後の最初の current() で新しい Config
+    cfg.set_rule(second, "raw_data.min_size", "10M")
+    _touch_newer(p)
+    third = h.current()
+    assert third is not second and third.rules["raw_data"]["min_size"] == "10M" and h.reloads == 2
+
+
+def test_config_holder_keeps_previous_config_when_file_is_broken(tmp_path):
+    p, h, loads, warnings = _holder(tmp_path)
+    good = h.current()
+    p.write_text("drive: {remote: [unclosed\n", encoding="utf-8")                            # 壊れた YAML
+    _touch_newer(p)
+    assert h.current() is good and loads == [p] and len(warnings) == 1
+    assert str(p) in warnings[0] and "could not be reloaded" in warnings[0] and "keeping" in warnings[0]
+    assert h.current() is good and loads == [p] and len(warnings) == 1                        # 同じ壊れた版で繰り返し警告しない
+    p.write_text("drive: {}\nworkspaces: {}\n", encoding="utf-8")                              # remote 無し（load は SystemExit）
+    _touch_newer(p)
+    assert h.current() is good and loads == [p, p] and len(warnings) == 2 and "SystemExit" in warnings[1]
+    p.write_text("drive: {remote: my-drive}\nworkspaces: {beta: {repos: []}}\n", encoding="utf-8")   # 直ればその版に切り替わる
+    _touch_newer(p)
+    assert list(h.current().workspaces) == ["beta"] and h.reloads == 1 and len(warnings) == 2
+
+
+def test_config_holder_keeps_previous_config_when_file_disappears(tmp_path):
+    p, h, loads, warnings = _holder(tmp_path)
+    good = h.current()
+    p.unlink()
+    assert h.current() is good and loads == [] and len(warnings) == 1 and "disappeared" in warnings[0] and str(p) in warnings[0]
+    assert h.current() is good and len(warnings) == 1                                          # 無いままなら繰り返し警告しない
+    p.write_text("drive: {remote: my-drive}\nworkspaces: {beta: {repos: []}}\n", encoding="utf-8")   # 戻れば読み直す
+    assert list(h.current().workspaces) == ["beta"] and loads == [p] and len(warnings) == 1
+
+
+def test_config_holder_default_warning_goes_to_stderr(tmp_path, capsys):
+    p = tmp_path / "config.yaml"
+    p.write_text("drive: {remote: my-drive}\nworkspaces: {}\n", encoding="utf-8")
+    h = cfg.ConfigHolder(cfg.load(p))
+    p.write_text("drive: {remote: [unclosed\n", encoding="utf-8")
+    _touch_newer(p)
+    assert h.current().remote == "my-drive"
+    err = capsys.readouterr().err
+    assert err.startswith("kairn: config ") and err.count("\n") == 1

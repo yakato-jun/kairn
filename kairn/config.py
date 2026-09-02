@@ -12,6 +12,11 @@
               rules.rclone_flags（文字列のリスト。既定は空）は rclone を呼ぶすべての箇所で共通引数の後ろに付ける追加引数
               （自前の OAuth client_id を前提に --transfers / --drive-pacer-* 等で Drive API の並列度を上げる。sync._flags）
 
+常駐（kairn serve）は起動時の Config を ConfigHolder に包み、MCP のツールと UI のハンドラはリクエストの入口で holder.current() を
+取る。current() は config.yaml の mtime / size を os.stat で見て、変わっていれば読み直して差し替える（CLI や UI で ws create /
+attach / rules … した結果が再起動なしで次のリクエストから効く）。読み直しに失敗したら（壊れた YAML・remote 無し・ファイル消失）
+直前の設定を維持して警告を 1 行出す。1 リクエストの間は同じ Config を使い、ジョブは投入時点の Config を使う。
+
 規則:
 - drive.remote が無ければ起動しない。設定済みの remote 以外は決して使わない。
 - workspaces.<name>.repos に登録されたパス以外に対して kairn は何もしない。
@@ -23,6 +28,9 @@ import copy
 import glob as _glob
 import os
 import subprocess
+import sys
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -332,6 +340,60 @@ def load(path: Path | None = None) -> Config:
     if not path.exists():
         raise SystemExit(f"kairn: no config at {path}. run: kairn setup --remote <rclone remote name>")
     return _parse(yaml.safe_load(path.read_text(encoding="utf-8")) or {}, path)
+
+
+def _warn(msg: str) -> None:
+    print(f"kairn: {msg}", file=sys.stderr, flush=True)
+
+
+class ConfigHolder:
+    """常駐プロセスの設定の置き場（kairn serve。MCP と UI で 1 つを共有）。
+    current() を呼ぶたびに config.yaml を os.stat し、(mtime_ns, size) が前回と違えば loader（既定 load）で読み直して差し替える。
+    読み直しに失敗したら直前の Config を維持し、warn に 1 行出す（同じ内容のファイルに対して繰り返し警告しない: 失敗した版の
+    stat を記録し、次に変わったときにまた試す）。ファイルが消えた（stat 失敗）ときも同様。
+    current() が返す Config はその呼び出し以降は書き換えないので、呼び出し側は 1 リクエストの間それを使い続けてよい
+    （UI の設定ページは受け取った Config を set_rule 等で書いて保存する。次のリクエストで新しい Config に置き換わる）。"""
+
+    def __init__(self, conf: Config, loader: Callable[[Path], Config] = load, warn: Callable[[str], None] = _warn):
+        self._conf = conf
+        self._path = conf.path
+        self._loader = loader
+        self._warn = warn
+        self._lock = threading.Lock()
+        self._stamp = self._stat()
+        self.reloads = 0   # 読み直しに成功した回数（テスト・診断用）
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _stat(self) -> tuple[int, int] | None:
+        try:
+            st = os.stat(self._path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def current(self) -> Config:
+        """今の設定。config.yaml が変わっていれば読み直してから返す（変わっていなければ stat 1 回だけ）。"""
+        with self._lock:
+            stamp = self._stat()
+            if stamp == self._stamp:
+                return self._conf
+            if stamp is None:
+                self._warn(f"config {self._path} disappeared; keeping the previously loaded settings")
+                self._stamp = None
+                return self._conf
+            try:
+                conf = self._loader(self._path)
+            except (Exception, SystemExit) as e:   # load は不正な設定を SystemExit で拒否する。常駐は落とさない
+                reason = " ".join(str(e).split())   # yaml のエラーは複数行なので 1 行に潰す
+                self._warn(f"config {self._path} changed but could not be reloaded ({type(e).__name__}: {reason}); keeping the previously loaded settings")
+                self._stamp = stamp
+                return self._conf
+            self._conf, self._stamp = conf, stamp
+            self.reloads += 1
+            return conf
 
 
 def create(remote: str, agent: str | None = None, path: Path | None = None, drive_root: str = "ws",
