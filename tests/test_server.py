@@ -1,4 +1,4 @@
-"""MCP サーバー（mcp 2.x）: in-process の Client で 11 ツールを呼ぶ。rclone は monkeypatch、Drive の版マーカー（cases/<case>/.rev/）はメモリ内の偽物（fake_drive）。
+"""MCP サーバー（mcp 2.x）: in-process の Client で 12 ツールを呼ぶ。rclone は monkeypatch、Drive の版マーカー（cases/<case>/.rev/）はメモリ内の偽物（fake_drive）。
 checkin と open_case の取り寄せはジョブ（スレッド）なので、結果を見る前に job.wait() で完了を待つ（_checkin / _open）。
 open_case は Drive のマーカーの rev がローカルと違うときだけ取り寄せる: 取り寄せを起こしたいテストは fake_drive.set_rev(case, "…") で rev をずらす。"""
 from __future__ import annotations
@@ -15,7 +15,7 @@ from kairn import sync
 from kairn.jobs import JobTable
 from kairn.store import CaseStore
 
-TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status"}
+TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "set_case_status", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status"}
 
 
 @pytest.fixture
@@ -267,7 +267,7 @@ def test_invalid_case_id_is_rejected_before_touching_filesystem(conf, monkeypatc
         async with Client(mcp, raise_exceptions=True) as c:
             for tool, args in [("open_case", {}), ("plan", {"objective": "o", "reason": "r", "tasks": []}),
                                ("update_task", {"task": "T001", "status": "doing"}), ("log_event", {"action": "progress", "note": "n"}),
-                               ("checkin", {}), ("extract_card", {})]:
+                               ("checkin", {}), ("extract_card", {}), ("set_case_status", {"status": "closed", "instruction": "close it"})]:
                 r = await c.call_tool(tool, {"case": "../x", **args})
                 assert r.is_error and "invalid case id" in r.content[0].text, (tool, r.content)
     run(main)
@@ -806,3 +806,66 @@ def test_shutdown_watchdog_forces_exit_after_delay():
     assert exits2 == [0] and "running job(s): none" in lines2[0]
     import inspect, os
     assert inspect.signature(srv.start_shutdown_watchdog).parameters["exit_fn"].default is os._exit
+
+
+# ---------- set_case_status（案件を閉じる・保留する・再開するのは人の判断。AI は人の発言を instruction に添えて代行する） ----------
+
+def test_set_case_status_transitions_via_mcp(conf):
+    """closed / suspended / open の遷移が event {action: status, from, to, note=instruction, actor: ai, agent} を書き、open_case の recent_events に出る。
+    同じステータスは changed=false でイベント無し。instruction が空・空白は ToolError。open タスクの件数は open_tasks。未知の案件／ワークスペース・不正な status は ToolError。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    st.new_plan_version("CASE-1", "o", [{"title": "a"}, {"title": "b"}], reason="r", actor="ai")
+    st.set_task_status("CASE-1", "T001", "done", [{"type": "commit", "id": "abc"}], "", actor="ai")
+    mcp = srv.create_server(conf, default_agent="test-agent")
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            tool = next(t for t in (await c.list_tools()).tools if t.name == "set_case_status")
+            assert "人の判断" in tool.description and "AI の判断で呼ばない" in tool.description and "instruction" in tool.description
+            assert set(tool.input_schema["required"]) == {"case", "status", "instruction"}
+            n = len(st.events("CASE-1"))
+            # instruction が空・空白 → 拒否（何も書かない）
+            for bad in ("", "   ", "\n"):
+                r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "closed", "instruction": bad})
+                assert r.is_error and "instruction is required" in r.content[0].text and "human decision" in r.content[0].text, bad
+            assert st.load_case("CASE-1")["status"] == "open" and len(st.events("CASE-1")) == n
+            # open → closed（open タスク T002 が残っていても拒否しない。open_tasks で知らせる）
+            r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "closed", "instruction": "この案件は閉じて"})
+            assert not r.is_error, r.content
+            out = r.structured_content
+            assert out["case"] == "CASE-1" and out["status"] == "closed" and out["previous_status"] == "open" and out["changed"] is True and out["open_tasks"] == 1
+            ev = out["event"]
+            assert ev["action"] == "status" and ev["from"] == "open" and ev["to"] == "closed" and ev["note"] == "この案件は閉じて"
+            assert ev["actor"] == "ai" and ev["agent"] == "test-agent" and ev["case"] == "CASE-1"
+            assert st.load_case("CASE-1")["status"] == "closed" and st.events("CASE-1")[-1] == ev
+            # 同じステータス → changed=false、イベント無し
+            r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "closed", "instruction": "閉じて"})
+            out = r.structured_content
+            assert not r.is_error and out["changed"] is False and out["event"] is None and out["status"] == "closed" and out["previous_status"] == "closed"
+            assert len(st.events("CASE-1")) == n + 1
+            # closed → suspended → open（agent 指定）
+            r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "suspended", "instruction": "しばらく保留で", "agent": "codex"})
+            assert r.structured_content["previous_status"] == "closed" and r.structured_content["event"]["agent"] == "codex"
+            r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "open", "instruction": "再開して", "workspace": "acme"})
+            assert r.structured_content["status"] == "open" and r.structured_content["previous_status"] == "suspended" and r.structured_content["changed"] is True
+            assert [(e["from"], e["to"]) for e in st.events("CASE-1") if e["action"] == "status"] == [("open", "closed"), ("closed", "suspended"), ("suspended", "open")]
+            # open_case の直近イベントに actor / note 付きで出る
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            last = r.structured_content["recent_events"][-1]
+            assert last["action"] == "status" and last["actor"] == "ai" and last["note"] == "再開して" and last["to"] == "open"
+            # 不正な status・未知の案件・未知のワークスペース → ToolError（何も書かない）
+            m = len(st.events("CASE-1"))
+            r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "archived", "instruction": "x"})
+            assert r.is_error and "invalid case status" in r.content[0].text
+            r = await c.call_tool("set_case_status", {"case": "CASE-404", "status": "closed", "instruction": "x"})
+            assert r.is_error and "CASE-404" in r.content[0].text
+            r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "closed", "instruction": "x", "workspace": "nowhere"})
+            assert r.is_error and "nowhere" in r.content[0].text
+            assert len(st.events("CASE-1")) == m and st.load_case("CASE-1")["status"] == "open"
+            # open タスクが無ければ open_tasks は 0
+            st.set_task_status("CASE-1", "T002", "dropped", [], "", actor="ai")
+            r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "closed", "instruction": "閉じて"})
+            assert r.structured_content["open_tasks"] == 0 and r.structured_content["changed"] is True
+    run(main)

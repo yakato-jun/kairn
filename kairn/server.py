@@ -192,6 +192,20 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
             raise _fail(e) from e
 
     @mcp.tool()
+    def set_case_status(case: str, status: str, instruction: str, workspace: str | None = None, agent: str = "") -> dict[str, Any]:
+        """案件を閉じる（closed）・保留する（suspended）・再開する（open）。これは人の判断で、AI の判断で呼ばない: 人が明示した時だけ、その発言をそのまま instruction に入れて呼ぶ（空は拒否）。返り値 {case, status, previous_status, changed, event, open_tasks}。同じステータスなら changed=false（イベントは書かない）。open タスクが残っていても拒否せず open_tasks の件数で知らせる（閉じるかは人の判断）。"""
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ToolError("instruction is required: pass the person's own words that asked for this status change "
+                            "(closing, suspending or reopening a case is a human decision; do not call this on the AI's own judgement)")
+        ws = _ws(workspace, case); st = _store(ws)
+        try:
+            r = st.set_case_status(case, status, actor="ai", agent=_agent(agent), note=instruction.strip())
+            return {"case": case, "status": r["case"]["status"], "previous_status": r["previous_status"], "changed": r["changed"],
+                    "event": r["event"], "open_tasks": len(st.open_tasks(case))}
+        except Exception as e:
+            raise _fail(e) from e
+
+    @mcp.tool()
     def search(query: str, cases: list[str] | None = None, workspace: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
         """worklog 等の `## ` 節単位の全文検索（ワークスペース内のみ）。結果の file/heading で本文を特定できる。"""
         try:

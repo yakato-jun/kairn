@@ -5,7 +5,7 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 
 # kairn 運用手順（Claude Code / Codex / OpenCode 共通）
 
-判断の規則は MCP サーバー `kairn`（11 ツール）が強制する。ここでは「いつ何を呼ぶか」だけを定める。
+判断の規則は MCP サーバー `kairn`（12 ツール）が強制する。ここでは「いつ何を呼ぶか」だけを定める。
 ツールの引数・返り値の詳細は kairn リポジトリの `docs/mcp-tools.md`。
 
 ## 案件を開く
@@ -48,6 +48,15 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
   **引き継がなかった open / doing / blocked タスクは自動で `superseded` になる**（閉じる操作は無い）。
   done も引き継がないと新版の進捗に数えない。
 - 過去の経緯を探す: `search(query)`（worklog 等の `## ` 節単位。語は AND）。Drive 上の生データの所在: `drive_index(pattern)`。
+
+## 案件のステータス（閉じる・保留する・再開する）
+- 案件を閉じる（closed）・保留する（suspended）・再開する（open）のは**人の判断**。AI の判断で変えない
+  （タスクが全部 done でも、長く動きが無くても、AI からは閉じない。提案もしない）。
+- 人が明示した時だけ `set_case_status(case, status, instruction=<人の発言そのまま>)` を呼ぶ。`instruction` は
+  「この案件は閉じて」のような人の発言をそのまま入れる（空は拒否される。AI の要約や理由に置き換えない）。
+- 返り値の `open_tasks` が 0 でないまま `closed` にした時は、残っている open タスクの件数を人に伝える（拒否はされない。閉じるかは人）。
+  `changed: false` は既にそのステータスだった（何も書かれていない）。
+- 人が自分で操作する経路は UI の「案件の状態を変更」と CLI `kairn close | suspend | reopen <ws> <case> [--note]`。
 
 ## 下書き（extract）
 - `extract_card(case)` は案件カード（title / summary / elements / related / causal）の**下書きを返すだけ**。
