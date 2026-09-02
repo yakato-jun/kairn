@@ -295,6 +295,9 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkout → checkin →
     `kairn setup` / `attach` / `install-service` は既存の `rules` を引き継ぐ。**常駐中の `kairn serve` は起動時に読んだ `rules` を使い続ける**
     （CLI で変えた後は `systemctl --user restart kairn-serve.service`。UI から変えた場合はそのプロセスに即時反映される）。
     変更後は `kairn checkin <ws> <case> --dry-run` で転送対象を確認する（`-v` の出力に転送するファイル名が出る）。
+- **作業領域は同期しない**: 案件フォルダ内に git worktree（`.git` がファイル）や `.kairn-nosync`（空ファイル）を直下に置いたディレクトリは、
+  配下ごと checkout / checkin / raw-move / 索引の対象外（docs/data-model.md「作業領域の除外」）。通常の clone は `.git/` だけが既定の
+  `rules.exclude` `.git/**` で除かれる（古い設定ファイルには `kairn rules add-exclude '.git/**'` で足す）。
 - 日次実行（systemd user timer、既定は毎日 12:30 ± 10 分、停止中だった分は次回起動時に実行）は `kairn install-service` がワークスペースごとに
   `kairn-daily@<ws>.timer` を生成・登録する（「各エージェントへの適用」1）。確認:
   ```

@@ -92,6 +92,24 @@ workspaces/<ws>/
   case.json の無いディレクトリでは `DATA.md` に同じ行を書く。events には `{"actor": "kairn", "agent": "sync", "action": "progress", "data": {…}}` を追記する。
 - 復元: `rclone copy <drive><file> <案件ディレクトリ>/`
 
+## 作業領域の除外（同期・退避・索引の共通規則）
+案件フォルダの中に git worktree（`git worktree add <案件ディレクトリ>/wt …`）や作業用ディレクトリを置いて作業してよい。
+次のいずれかの**ファイル**が直下にあるディレクトリは「作業領域」で、配下ごと同期（checkout / checkin）・退避（raw-move）・
+bag2zst・全文索引の対象外になる（`kairn/sync.py` `WORKAREA_MARKERS` / `is_workarea`）:
+- `.git` ファイル（git worktree では `.git` は `gitdir: …` を書いたファイル）
+- `.kairn-nosync`（空ファイル。git 以外の作業領域の目印。手で置く）
+
+同期は転送のたびにローカル側の転送ルート（案件ディレクトリ、ワークスペース全体なら `cases/`）を走査し（`workarea_dirs`。作業領域の配下・
+シンボリックリンク・`rules.exclude` のディレクトリは辿らない）、見つけた各ディレクトリを rclone の `--filter '- /<dir>/**'` として
+他の規則より先に付ける（rclone の `--exclude-if-present` は、同名のディレクトリ（通常の clone の `.git/`）がツリー内にあると転送全体が
+失敗するため使わない）。checkout でもローカルの作業領域には書かない。索引（`kairn/index.py`）は同じ判定で配下を走査しない。
+
+通常の clone（`.git` がディレクトリ）は作業領域にならない。`rules.exclude` の既定 `.git/**` で `.git/` だけが除かれ、ソース本体は
+同期・索引される。リポジトリの写しを案件フォルダに置くときは worktree を使うか、その clone の直下に `.kairn-nosync` を置く。
+成果物（worklog.md、調査メモ、ログの抜粋等）は作業領域の外＝案件直下に書く。
+
+既存の設定ファイル（`~/.config/kairn/config.yaml`）に `.git/**` が無い場合、kairn は自動で足さない: `kairn rules add-exclude '.git/**'`。
+
 ## plan/vNNNN.json（計画の版）
 ```json
 {

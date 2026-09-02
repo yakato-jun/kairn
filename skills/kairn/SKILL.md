@@ -33,6 +33,10 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 4. 案件ディレクトリ（worklog.md・作業ファイル）はリポジトリの外、kairn の `workspaces/<ws>/cases/<case>/` にある。
    `open_case` の返り値 `paths.case_dir` / `paths.worklog`（絶対パス）で読み書きする。リポジトリ内の `tmp/` 等を探さない。
    その領域を読み書きできない（許可の外）と言われたら、`kairn install-skill` が表示する許可設定手順を人に伝える。
+5. 案件フォルダ内に git worktree（`git worktree add <case_dir>/<name> …`）を作って作業してよい。直下に `.git` ファイル
+   （worktree）か `.kairn-nosync`（空ファイル）があるディレクトリは配下ごと同期・索引・退避の対象外。通常の clone は
+   `.git/` だけが除かれソース本体は同期されるので、clone ではなく worktree を使うか `.kairn-nosync` を置く。
+   成果物（worklog.md、調査メモ、ログの抜粋）は作業領域の中ではなく案件直下に書く。
 
 ## 作業中
 - 着手: `update_task(case, task, status="doing")`。
