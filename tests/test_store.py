@@ -79,13 +79,15 @@ def test_mark_checkin_and_local_changes(store):
     store.create_case("CASE-1", "t", "acme", actor="human")
     assert store.local_changes_since_checkin("CASE-1") is None          # 未記録 → 判定不能
     assert store.local_changes_since_checkin("CASE-404") is None        # 案件なし
-    assert store.manifest_entry("CASE-1") is None                       # rev 未付与
+    assert store.rev_markers("CASE-1") == []                            # rev 未付与: .rev/ も無い
     ts = store.mark_checkin("CASE-1")
     c = store.load_case("CASE-1")
     assert c["last_checkin_at"] == ts and len(c["rev"]) == 36 and c["checked_in_from"]   # 版マーカー（uuid4）とホスト名
-    assert store.manifest_entry("CASE-1") == {"rev": c["rev"], "checked_in_at": ts, "from": c["checked_in_from"]}
+    assert store.rev_markers("CASE-1") == [c["rev"]]                    # 案件フォルダの .rev/<rev>（空ファイル 1 個）
+    assert (store.case_dir("CASE-1") / ".rev" / c["rev"]).stat().st_size == 0
     assert store.local_changes_since_checkin("CASE-1") == []            # 直後は変更なし（case.json 自身の書き込みは誤検出しない）
     assert store.mark_checkin("CASE-1") and store.load_case("CASE-1")["rev"] != c["rev"]   # 毎回振り直す
+    assert store.rev_markers("CASE-1") == [store.load_case("CASE-1")["rev"]]              # 古いマーカーは残らない
     d = store.case_dir("CASE-1")
     store.new_plan_version("CASE-1", "o", [{"title": "a"}], reason="r", actor="ai")
     t = time.time() + 60
@@ -106,8 +108,25 @@ def test_mark_checkin_and_local_changes(store):
     assert store.local_changes_since_checkin("CASE-1") == ["events.jsonl"]
 
 
+def test_write_rev_marker_rebuilds_dir(store):
+    """write_rev_marker: .rev/ を空にして case.json の rev を名前にした空ファイルを 1 個置く。古いマーカー・入れ子・無関係なファイルは消える。
+    rev が無ければ .rev/ ごと消す。case.json が無ければ何もしない。"""
+    store.create_case("CASE-1", "t", "acme", actor="human")
+    d = store.case_dir("CASE-1") / ".rev"
+    assert store.write_rev_marker("CASE-1") is None and not d.exists()          # rev 未付与
+    d.mkdir(); (d / "stale-1").touch(); (d / "stale-2").touch(); (d / "nested").mkdir(); (d / "nested" / "x").touch()
+    assert store.write_rev_marker("CASE-1") is None and not d.exists()          # rev 未付与: 中身ごと消す
+    store.set_rev("CASE-1", "11111111-2222-3333-4444-555555555555")
+    assert store.rev_markers("CASE-1") == ["11111111-2222-3333-4444-555555555555"]
+    (d / "stale-3").touch()
+    m = store.write_rev_marker("CASE-1")
+    assert m == d / "11111111-2222-3333-4444-555555555555" and store.rev_markers("CASE-1") == [m.name] and m.stat().st_size == 0
+    assert store.write_rev_marker("CASE-404") is None and store.rev_markers("CASE-404") == []
+    assert store.local_changes_since_checkin("CASE-1") is None                  # .rev/ はローカル変更の判定に入らない
+
+
 def test_set_rev_keeps_mtime_and_updated_at(store):
-    """manifest rebuild 用: rev だけを書き換え、updated_at と mtime は変えない（open_case の skip 判定に影響させない）。"""
+    """rev だけを書き換え、updated_at と mtime は変えない（open_case の skip 判定に影響させない）。.rev/ は作り直す。"""
     import os, time
     store.create_case("CASE-1", "t", "acme", actor="human")
     store.mark_checkin("CASE-1")
@@ -118,6 +137,7 @@ def test_set_rev_keeps_mtime_and_updated_at(store):
     store.set_rev("CASE-1", "11111111-2222-3333-4444-555555555555")
     after = store.load_case("CASE-1")
     assert after["rev"] == "11111111-2222-3333-4444-555555555555" and after["updated_at"] == before["updated_at"]
+    assert store.rev_markers("CASE-1") == ["11111111-2222-3333-4444-555555555555"]
     assert abs(f.stat().st_mtime - old) < 1e-3 and {k: v for k, v in after.items() if k != "rev"} == {k: v for k, v in before.items() if k != "rev"}
 
 

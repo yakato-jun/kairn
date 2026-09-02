@@ -9,14 +9,16 @@ MCP が呼ぶ規則の実体はここ（エージェントの文章には頼ら�
   閲覧だけで events.jsonl に差分を作らないため（複数環境の events をマージする前提）
 - last_checkin_at / last_checkin_events: 案件単位の最終 checkin 時刻とその時点の events.jsonl 行数（case.json）。
   open_case はこれより新しいローカル変更（kairn 自身の checkin event は除く）があれば checkout を skip する
-- rev / checked_in_from: checkin のたびに振り直す版マーカー（uuid4）と checkin したホスト名（case.json）。Drive のワークスペース直下の
-  manifest.json（kairn/sync.py）に同じ rev が載り、open_case はローカルの rev と比べて同じなら取り寄せを省略する
+- rev / checked_in_from: checkin のたびに振り直す版マーカー（uuid4）と checkin したホスト名（case.json）。同じ rev を名前にした
+  空ファイルを案件フォルダの .rev/ に 1 個だけ置く（write_rev_marker。rev を付け替えるたびに作り直す）。Drive 側の案件フォルダにも
+  同じ .rev/<rev> が同期され、open_case / list_cases は rclone lsf でその名前だけを見てローカルの rev と比べる（kairn/sync.py）
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import socket
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -34,6 +36,7 @@ EVIDENCE_REQUIRED_KEY = {"commit": "id", "pr": "id", "file": "path", "test": "cm
 # checkin 直後に書かれる case.json / events.jsonl の mtime は last_checkin_at（秒単位）よりわずかに後になるため、この幅は「変更なし」とみなす
 CHECKIN_SLACK_SEC = 2.0
 LOCAL_CHANGE_FILES = ("case.json", "events.jsonl", "worklog.md")
+REV_DIR = ".rev"   # 案件フォルダ内の版マーカー置き場: <case>/.rev/<rev>（空ファイル 1 個。checkin で Drive へ同期される）
 # kairn 自身が同期の記録として書く event。これだけが last_checkin_at 以後に増えた events.jsonl は「ローカル変更」とみなさない
 # （checkin ツールは mark_checkin で行数を記録した後に checkin event を追記するため、その 1 行を変更と数えない）
 SYNC_EVENT_ACTIONS = ("checkin",)
@@ -183,27 +186,62 @@ class CaseStore:
         case["checked_in_from"] = hostname()
         case["last_checkin_events"] = len(self.events(case_id))
         self.save_case(case)
+        self.write_rev_marker(case_id)
         return case["last_checkin_at"]
 
     def set_rev(self, case_id: str, rev: str) -> None:
-        """manifest rebuild 用: case.json の rev だけを書き換える（updated_at は触らず、mtime も元に戻す。
-        open_case の skip 判定（mtime）に影響させない）。"""
+        """case.json の rev だけを書き換える（updated_at は触らず、mtime も元に戻す。open_case の skip 判定（mtime）に影響させない）。
+        .rev/ のマーカーも作り直す。"""
         f = self._case_file(case_id)
         case = self.load_case(case_id)
         mtime = f.stat().st_mtime
         case["rev"] = rev
         _atomic_write(f, json.dumps(case, ensure_ascii=False, indent=1) + "\n")
         os.utime(f, (mtime, mtime))
+        self.write_rev_marker(case_id)
 
     def manifest_entry(self, case_id: str) -> dict | None:
-        """manifest.json に載せる当該案件のエントリ {rev, checked_in_at, from}（case.json の rev / last_checkin_at / checked_in_from）。
-        case.json が無い、または rev 未付与なら None。"""
+        """当該案件の {rev, checked_in_at, from}（case.json の rev / last_checkin_at / checked_in_from）。case.json が無い、または rev 未付与なら None。"""
         if not self._case_file(case_id).exists():
             return None
         case = self.load_case(case_id)
         if not case.get("rev"):
             return None
         return {"rev": case["rev"], "checked_in_at": case.get("last_checkin_at"), "from": case.get("checked_in_from", "")}
+
+    def rev_dir(self, case_id: str) -> Path:
+        return self.case_dir(case_id) / REV_DIR
+
+    def rev_markers(self, case_id: str) -> list[str]:
+        """.rev/ にあるマーカー名（無ければ []）。正常なら case.json の rev と同じ名前が 1 つ。"""
+        d = self.rev_dir(case_id)
+        if not d.is_dir():
+            return []
+        return sorted(p.name for p in d.iterdir() if p.is_file() and not p.is_symlink())
+
+    def write_rev_marker(self, case_id: str) -> Path | None:
+        """案件フォルダの .rev/ を case.json の rev から作り直す: 中を空にして <rev> という空ファイルを 1 個だけ置く。
+        rev が無ければ .rev/ を空にして消す。case.json が無ければ何もしない（None）。返り値: 置いたマーカーのパス（無ければ None）。
+        rev を付け替える経路（mark_checkin / set_rev）、checkin の転送直前、checkout（copy --update）の後に呼ぶ
+        （古いマーカーが残らない。Drive 側の古いマーカーは checkin の rclone sync が消す）。"""
+        if not self._case_file(case_id).exists():
+            return None
+        rev = self.load_case(case_id).get("rev")
+        d = self.rev_dir(case_id)
+        if d.is_dir():
+            for p in d.iterdir():
+                if p.is_dir() and not p.is_symlink():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+        if not rev:
+            if d.is_dir():
+                d.rmdir()
+            return None
+        d.mkdir(parents=True, exist_ok=True)
+        marker = d / str(rev)
+        marker.touch()
+        return marker
 
     def local_changes_since_checkin(self, case_id: str) -> list[str] | None:
         """last_checkin_at より新しいローカル変更（case.json / events.jsonl / worklog.md / plan/*.json の mtime）。
