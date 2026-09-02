@@ -65,8 +65,17 @@ workspaces/<ws>/
 - 置き場所: `<remote>:<root>/<ws>/manifest.json`（`cases/` の外）。ローカルには写しを置かず、直近の取得結果を `index/manifest.cache.json`
   （`fetched_at` 付き）に置く。取得は `open_case` / `kairn checkout <ws>` / `checkin` の更新時 / UI 一覧の「更新確認」で行う。
 - 更新は checkin の転送後に `rclone cat` で現在値を取得 → 当該案件のエントリを書き換え → `rclone rcat` で書き戻す（取得できなければ新規作成）。
-  **同時 checkin の競合は「後勝ち」**: 案件ごとの独立エントリなので影響は当該案件のみ（別案件の同時 checkin では、後の書き戻しが先の
+  **同一ホスト内は排他＋マージ**: cat → rcat の区間はワークスペースごとのロックファイル（`$XDG_STATE_HOME/kairn/locks/<ws>.manifest.lock`、
+  既定 `~/.local/state/kairn/locks/`）への `fcntl.flock(LOCK_EX)` で直列化する（`kairn serve` のジョブと CLI の `kairn checkin`、serve 内の
+  別スレッドが同じロックで並ぶ）。現在値を読むのは必ずロック取得後で、読んだ manifest に自分の案件のエントリだけを重ねて書き戻す。
+  読み込んだエントリを減らす書き込みはしない（書く直前に検査し、減っていれば書かずにエラー。既存エントリを消せるのは `manifest rebuild` だけ）。
+  ロック待ちは 60 秒で打ち切り、checkin は「転送は済んだが manifest 更新失敗」として返す（次の checkin が更新する）。
+  **ホスト間の競合は「後勝ち」**: 案件ごとの独立エントリなので影響は当該案件のみ（別案件の同時 checkin では、後の書き戻しが先の
   エントリを取り込んでいる。同じ案件を同時に checkin した場合だけ先の rev が消え、その環境は次の `open_case` で取り寄せることになる）。
+- **自己修復**: 更新のたび（ロック内）、当該ワークスペースのローカル `case.json` に `rev` があるのに manifest にエントリの無い案件を、
+  Drive の `cases/<case>/case.json` を `rclone cat` で 1 件ずつ読んで `rev` がローカルと一致する場合に限りローカルの
+  `rev` / `last_checkin_at` / `checked_in_from` で補う（一致しない・読めない案件は触らない）。確認は 5 秒程度で打ち切り、残りは次回の
+  checkin に回す。checkin の結果に `[manifest repaired: N]` が付く。全件を作り直すのは `kairn manifest rebuild <ws>`。
 - `open_case` は `rclone cat` を 1 回（10 秒でタイムアウト）だけ行い、案件の `rev` がローカルの `case.json.rev` と同じなら取り寄せを省略する。
   エントリが無い案件は「未知」として取り寄せる（安全側）。manifest が取れない（オフライン・未作成）ときは取り寄せをせずローカル写しを返す。
 - 既存の Drive データ（`rev` の無い case.json）は `kairn manifest rebuild <ws>` で一度だけ `rev` を付与して manifest を作る（README「同期」）。

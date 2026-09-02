@@ -246,7 +246,7 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 - **版マーカーと manifest.json**（差分なしの取り寄せでも 30 秒かかるため、更新の有無を安価に確認する）: すべての checkin 経路
   （MCP `checkin`・`kairn checkin`・`daily`）は転送の前に案件の `case.json` へ `rev`（uuid4）/ `last_checkin_at` / `checked_in_from`（ホスト名）を書き、
   転送後にワークスペースの `<remote>:<root>/<ws>/manifest.json`（`{"cases": {"<case>": {"rev", "checked_in_at", "from"}}, "updated_at"}`）を
-  `rclone cat` → 当該案件を更新 → `rclone rcat` で書き戻す（同時 checkin は後勝ち。案件ごとの独立エントリなので影響は当該案件のみ。docs/data-model.md）。
+  `rclone cat` → 当該案件を更新 → `rclone rcat` で書き戻す（同一ホスト内はロックファイルで直列化しマージ、ホスト間は後勝ち。案件ごとの独立エントリなので影響は当該案件のみ。docs/data-model.md）。
   `open_case` は `rclone cat` を 1 回（10 秒でタイムアウト）だけ行い、案件の `rev` がローカルと同じなら取り寄せを省略する（`drive.up_to_date: true`）。
   違えば取り寄せジョブを起動して最大 20 秒待ち、間に合えば取り寄せ後の内容を返す（`drive.fetched: true`）。manifest が取れなければ取り寄せずローカル写し
   （`drive.up_to_date: null`）。直近に取得した manifest は `index/manifest.cache.json` に置き、`list_cases` の `drive.state` と UI 一覧の Drive 列
