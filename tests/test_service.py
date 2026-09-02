@@ -263,3 +263,22 @@ def test_config_serve_section_roundtrip(tmp_path: Path):
     (tmp_path / "bad.yaml").write_text("drive: {remote: my-drive}\nserve: {port: 0}\n")
     with pytest.raises(SystemExit, match="serve.port"):
         cfg.load(tmp_path / "bad.yaml")
+
+
+def test_overwrite_writes_unit_body_not_diff(env, monkeypatch, capsys):
+    """既存 unit と差分があるとき、--yes で書かれるのは新しい本文であって unified diff ではない。"""
+    from kairn import service, config as cfg
+    conf = cfg.load()
+    dest = env["unit_dir"] if isinstance(env, dict) and "unit_dir" in env else service.unit_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    opts = service.ServiceOptions(workspaces=[], enable_now=False, linger=False)
+    units = service.render_units(opts, ["/usr/bin/kairn"])
+    name = "kairn-serve.service"
+    (dest / name).write_text(units[name].replace("RestartSec=5", "RestartSec=9"), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(service, "run_cmd", lambda cmd, **k: calls.append(cmd) or 0)
+    monkeypatch.setattr(service, "have_systemctl", lambda: False)
+    rc = service.install(conf, opts, yes=True, dest=dest, cmd=["/usr/bin/kairn"], out=lambda *a: None)
+    text = (dest / name).read_text(encoding="utf-8")
+    assert "+++ " not in text and "@@ " not in text and "--- " not in text
+    assert text == units[name]

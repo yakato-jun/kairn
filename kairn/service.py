@@ -285,7 +285,7 @@ def install(conf: cfg.Config, opts: ServiceOptions, *, yes: bool, dest: Path | N
             if not _ask_bool(f"{len(changed)} 個の既存 unit を上書きしますか", False, yes):
                 out("kairn: 中止しました（何も書いていません）")
                 return 1
-    write_units({**new, **changed}, dest)
+    write_units({name: units[name] for name in [*new, *changed]}, dest)  # changed は diff なので本文は units から取る
     for name in new:
         out(f"wrote: {dest / name}")
     for name in changed:
