@@ -37,12 +37,34 @@ class FakeRun:
         self.fail_move_nth = fail_move_nth  # n 回目の move だけ失敗させる（1 始まり）
         self.moves = 0
         self.fail = fail or set()
+        self.manifest: dict | None = None            # Drive の manifest.json（cat / rcat）。None なら未作成（cat は 3 で失敗）
+        self.remote_cases: dict[str, dict] = {}      # Drive 上の cases/<case>/case.json（lsf --include /*/case.json / cat / rcat）
+        self.remote_case_mtime = "2026-08-15 09:30:00"
+        self.rcats: list[tuple[str, str]] = []       # (path, 本文)
 
     def __call__(self, cmd, **kw):
         self.calls.append(list(cmd))
         prog, sub = cmd[0], cmd[1]
         if prog == "rclone" and sub in self.fail:
             return subprocess.CompletedProcess(cmd, 1, "", f"fake rclone {sub} failed")
+        if prog == "rclone" and sub == "cat":
+            target = cmd[2]
+            if target.endswith("/manifest.json") and self.manifest is not None:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(self.manifest), "")
+            if target.endswith("/case.json") and target.rsplit("/", 2)[-2] in self.remote_cases:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(self.remote_cases[target.rsplit("/", 2)[-2]]), "")
+            return subprocess.CompletedProcess(cmd, 3, "", "fake rclone cat: object not found")
+        if prog == "rclone" and sub == "rcat":
+            target, text = cmd[2], kw.get("input", "")
+            self.rcats.append((target, text))
+            if target.endswith("/manifest.json"):
+                self.manifest = json.loads(text)
+            elif target.endswith("/case.json"):
+                self.remote_cases[target.rsplit("/", 2)[-2]] = json.loads(text)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if prog == "rclone" and sub == "lsf" and "/*/case.json" in cmd:   # manifest_rebuild の列挙（path \t mtime）
+            rows = [f"{cid}/case.json\t{self.remote_case_mtime}" for cid in sorted(self.remote_cases)]
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(rows) + ("\n" if rows else ""), "")
         if prog == "rclone" and sub == "copyto":
             case = cmd[2].rsplit("/", 2)[-2]
             if case not in self.remote_events:
@@ -206,7 +228,7 @@ def test_checkout_uses_update_and_bwlimit(conf, fake):
     cmd = fake.calls[-1]
     assert cmd[cmd.index("--bwlimit") + 1] == "08:00,4M 20:00,off" and cmd[-1] == "--dry-run"
     sync.checkin(conf, ws, "CASE-123") if (ws.cases_dir / "CASE-123").mkdir(parents=True, exist_ok=True) is None else None
-    cmd = fake.calls[-1]
+    cmd = [c for c in fake.calls if c[1] in ("sync", "copy")][-1]
     assert cmd[:2] == ["rclone", "sync"] and "--bwlimit" in cmd and "--backup-dir" in cmd
 
 
@@ -215,11 +237,11 @@ def test_checkin_workspace_copies_but_case_syncs(conf, fake):
     ws = conf.workspaces["acme"]
     CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
     sync.checkin(conf, ws)
-    cmd = fake.calls[-1]
+    cmd = [c for c in fake.calls if c[1] in ("sync", "copy")][-1]
     assert cmd[:4] == ["rclone", "copy", str(ws.cases_dir), "my-drive:ws/acme/cases"]
     assert cmd[cmd.index("--backup-dir") + 1].startswith("my-drive:ws/acme/_deleted/")
     sync.checkin(conf, ws, "CASE-1")
-    cmd = fake.calls[-1]
+    cmd = [c for c in fake.calls if c[1] in ("sync", "copy")][-1]
     assert cmd[:4] == ["rclone", "sync", str(ws.cases_dir / "CASE-1"), "my-drive:ws/acme/cases/CASE-1"] and "--backup-dir" in cmd
     sync.daily(conf, ws)
     assert [c[1] for c in fake.calls if c[1] in ("sync", "copy")][-1] == "copy"
@@ -540,16 +562,16 @@ def test_checkin_case_merges_then_syncs(conf, monkeypatch):
     f = FakeRun(sync.raw_rules(conf), remote_events={"CASE-123": remote})
     monkeypatch.setattr(subprocess, "run", f)
     msg = sync.checkin(conf, ws, "CASE-123")
-    assert [c[1] for c in f.calls] == ["copyto", "sync"]
+    assert [c[1] for c in f.calls] == ["copyto", "sync", "cat", "rcat"]   # マージ → 転送 → manifest（cat → rcat）
     assert f.calls[1][:4] == ["rclone", "sync", str(ws.cases_dir / "CASE-123"), "my-drive:ws/acme/cases/CASE-123"]
     assert not any(x.endswith("events.jsonl") for x in _excludes(f.calls[1]))  # マージ済みの events.jsonl をそのまま Drive へ
     assert [e["note"] for e in _events_of(ws, "CASE-123")] == ["remote only", "remote only 2", "case created: t"]
-    assert st.load_case("CASE-123")["last_checkin_events"] == 3 and msg.endswith("[events merged: 1]")
+    assert st.load_case("CASE-123")["last_checkin_events"] == 3 and "[events merged: 1]" in msg and msg.endswith("[manifest: 1]")
     # 取得失敗 → マージなしで sync（従来どおり）
     f2 = FakeRun(sync.raw_rules(conf), fail={"copyto"})
     monkeypatch.setattr(subprocess, "run", f2)
     sync.checkin(conf, ws, "CASE-123")
-    assert [c[1] for c in f2.calls] == ["copyto", "sync"] and len(_events_of(ws, "CASE-123")) == 3
+    assert [c[1] for c in f2.calls] == ["copyto", "sync", "cat", "rcat"] and len(_events_of(ws, "CASE-123")) == 3
 
 
 def test_checkout_and_checkin_workspace_merge_per_case(conf, monkeypatch):
@@ -578,6 +600,107 @@ def test_checkout_and_checkin_workspace_merge_per_case(conf, monkeypatch):
     assert [e["note"] for e in _events_of(ws, "CASE-9")] == ["r9"]
     f.calls.clear()
     sync.checkin(conf, ws)
-    assert [c[1] for c in f.calls] == ["copyto", "copyto", "copyto", "copy"]
-    assert not any(x.endswith("events.jsonl") for x in _excludes(f.calls[-1]))
+    assert [c[1] for c in f.calls] == ["copyto", "copyto", "copyto", "copy", "cat", "rcat"]
+    assert not any(x.endswith("events.jsonl") for x in _excludes(f.calls[3]))
     assert st.load_case("CASE-1")["last_checkin_events"] == 2
+    assert set(f.manifest["cases"]) == {"CASE-1", "CASE-2"} and f.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"]   # 案件なしのディレクトリは載せない
+
+
+# ---------- 版マーカー（rev）と manifest.json ----------
+
+def test_checkin_stamps_rev_and_updates_manifest(conf, fake):
+    """checkin(case): 転送前に case.json へ rev（uuid4）/ last_checkin_at / checked_in_from を書き、転送後に manifest を
+    cat → 当該案件を更新 → rcat の順で書き戻す（他案件のエントリは保つ）。キャッシュ index/manifest.cache.json も更新。"""
+    from kairn import store as store_mod
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    fake.manifest = {"cases": {"CASE-0": {"rev": "keep", "checked_in_at": "2026-08-01T00:00:00+09:00", "from": "other-host"}}, "updated_at": "x"}
+    msg = sync.checkin(conf, ws, "CASE-1")
+    c = st.load_case("CASE-1")
+    assert len(c["rev"]) == 36 and c["last_checkin_at"] and c["checked_in_from"] == store_mod.hostname()
+    assert [x[1] for x in fake.calls] == ["copyto", "sync", "cat", "rcat"]
+    assert fake.calls[2][2] == "my-drive:ws/acme/manifest.json" and fake.calls[3][2] == "my-drive:ws/acme/manifest.json"
+    path, text = fake.rcats[-1]
+    written = json.loads(text)
+    assert written["cases"]["CASE-1"] == {"rev": c["rev"], "checked_in_at": c["last_checkin_at"], "from": c["checked_in_from"]}
+    assert written["cases"]["CASE-0"]["rev"] == "keep" and written["updated_at"] != "x" and msg.endswith("[manifest: 1]")
+    cache = json.loads((ws.index_dir / "manifest.cache.json").read_text(encoding="utf-8"))
+    assert cache["cases"] == written["cases"] and cache["fetched_at"]
+    # 2 回目は rev が変わる
+    rev1 = c["rev"]
+    sync.checkin(conf, ws, "CASE-1")
+    assert st.load_case("CASE-1")["rev"] != rev1 and fake.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"]
+    # manifest が無ければ新規作成（cat 失敗 → rcat）
+    fake.manifest = None
+    sync.checkin(conf, ws, "CASE-1")
+    assert set(fake.manifest["cases"]) == {"CASE-1"}
+    # dry では何も書かない
+    fake.calls.clear(); rev = st.load_case("CASE-1")["rev"]
+    sync.checkin(conf, ws, "CASE-1", dry=True)
+    assert [x[1] for x in fake.calls] == ["sync"] and st.load_case("CASE-1")["rev"] == rev
+
+
+def test_checkin_transfer_failure_restores_case_json(conf, monkeypatch):
+    """転送（rclone sync）が失敗したら版マーカーは書く前の内容・mtime に戻り、manifest は触らない。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    f = FakeRun(sync.raw_rules(conf), fail={"sync"})
+    monkeypatch.setattr(subprocess, "run", f)
+    cj = ws.cases_dir / "CASE-1" / "case.json"
+    before = (cj.read_text(encoding="utf-8"), cj.stat().st_mtime)
+    with pytest.raises(sync.RcloneError, match="sync failed"):
+        sync.checkin(conf, ws, "CASE-1")
+    assert (cj.read_text(encoding="utf-8"), cj.stat().st_mtime) == before and "rev" not in st.load_case("CASE-1")
+    assert [x[1] for x in f.calls] == ["copyto", "sync"] and f.rcats == []
+    # manifest の書き戻しだけが失敗: 転送は済んでいるので版マーカーは残し、理由を RcloneError で返す
+    f2 = FakeRun(sync.raw_rules(conf), fail={"rcat"})
+    monkeypatch.setattr(subprocess, "run", f2)
+    with pytest.raises(sync.RcloneError, match="transferred, but manifest update failed"):
+        sync.checkin(conf, ws, "CASE-1")
+    assert st.load_case("CASE-1")["rev"] and st.load_case("CASE-1")["last_checkin_at"]
+
+
+def test_checkin_workspace_stamps_only_changed_cases(conf, fake):
+    """ワークスペース全体（daily）: 未 checkin の案件と last_checkin_at より新しい変更のある案件だけ rev を振り直す
+    （変更の無い案件の rev を毎日変えない）。案件が 1 つも対象でなければ manifest も触らない。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "a", "acme", actor="human"); st.create_case("CASE-2", "b", "acme", actor="human")
+    sync.checkin(conf, ws)
+    r1, r2 = st.load_case("CASE-1")["rev"], st.load_case("CASE-2")["rev"]
+    assert r1 and r2 and set(fake.manifest["cases"]) == {"CASE-1", "CASE-2"}
+    fake.calls.clear()
+    assert sync.checkin(conf, ws).count("[manifest") == 0
+    assert [x[1] for x in fake.calls] == ["copyto", "copyto", "copy"]                     # 変更なし: cat / rcat 無し
+    assert (st.load_case("CASE-1")["rev"], st.load_case("CASE-2")["rev"]) == (r1, r2)
+    t = time.time() + 5
+    os.utime(ws.cases_dir / "CASE-1" / "worklog.md", (t, t))
+    fake.calls.clear()
+    sync.checkin(conf, ws)
+    assert [x[1] for x in fake.calls] == ["copyto", "copyto", "copy", "cat", "rcat"]
+    assert st.load_case("CASE-1")["rev"] != r1 and st.load_case("CASE-2")["rev"] == r2
+    assert fake.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"] and fake.manifest["cases"]["CASE-2"]["rev"] == r2
+    os.utime(ws.cases_dir / "CASE-1" / "worklog.md", None)
+
+
+def test_manifest_fetch_failures_are_none(conf, monkeypatch):
+    """rclone 不在・タイムアウト・非ゼロ・JSON でない → None。timeout を渡している。"""
+    ws = conf.workspaces["acme"]
+    seen = {}
+
+    def run(cmd, **kw):
+        seen["kw"] = kw
+        return subprocess.CompletedProcess(cmd, 0, "not json", "")
+    monkeypatch.setattr(subprocess, "run", run)
+    assert sync.fetch_manifest(conf, ws) is None and seen["kw"]["timeout"] == sync.MANIFEST_TIMEOUT_SEC == 10
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, '{"cases": []}', ""))
+    assert sync.fetch_manifest(conf, ws) is None
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 10)))
+    assert sync.fetch_manifest(conf, ws) is None
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError("rclone")))
+    assert sync.fetch_manifest(conf, ws) is None and sync.refresh_manifest(conf, ws) is None
+    assert not (ws.index_dir / "manifest.cache.json").exists() and sync.load_manifest_cache(ws) is None
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, '{"cases": {"CASE-1": {"rev": "a"}}}', ""))
+    assert sync.refresh_manifest(conf, ws)["cases"]["CASE-1"]["rev"] == "a" and sync.load_manifest_cache(ws)["fetched_at"]

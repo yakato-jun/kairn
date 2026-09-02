@@ -65,8 +65,9 @@ def test_run_without_progress_still_uses_subprocess_run(monkeypatch, fake_popen)
     assert calls == [["rclone", "lsf", "x"]] and fake_popen.calls == []
 
 
-def test_checkin_and_checkout_pass_progress_and_stats(conf, fake_popen, monkeypatch):
-    """checkin / checkout に progress を渡すと転送本体は Popen で走り、--stats 5s --stats-one-line が付く。events の copyto は従来どおり run。"""
+def test_checkin_and_checkout_pass_progress_and_stats(conf, fake_popen, monkeypatch, drive_manifest):
+    """checkin / checkout に progress を渡すと転送本体は Popen で走り、--stats 5s --stats-one-line が付く。events の copyto は従来どおり run。
+    manifest（cat / rcat）はメモリ内の偽物。"""
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 3, "", "object not found"))
     ws = conf.workspaces["acme"]
     CaseStore(ws.cases_dir).create_case("CASE-123", "t", "acme", actor="human")
@@ -74,7 +75,7 @@ def test_checkin_and_checkout_pass_progress_and_stats(conf, fake_popen, monkeypa
     msg = sync.checkin(conf, ws, "CASE-123", progress=got.append)
     cmd = fake_popen.calls[-1]
     assert cmd[:2] == ["rclone", "sync"] and cmd[cmd.index("--stats") + 1] == "5s" and "--stats-one-line" in cmd
-    assert got == FakePopen.lines and "ETA 0s" in msg
+    assert got == FakePopen.lines and "ETA 0s" in msg and drive_manifest.rev("CASE-123") == CaseStore(ws.cases_dir).load_case("CASE-123")["rev"]
     got.clear()
     sync.checkout(conf, ws, "CASE-123", progress=got.append)
     cmd = fake_popen.calls[-1]
@@ -174,7 +175,7 @@ def test_finished_jobs_are_pruned_by_count_and_age(monkeypatch):
 
 # ---------- checkin ジョブ本体（sync.checkin_job）: mark_checkin とイベント記録はジョブ側 ----------
 
-def test_checkin_job_marks_checkin_and_appends_event(conf, fake_popen, monkeypatch):
+def test_checkin_job_marks_checkin_and_appends_event(conf, fake_popen, monkeypatch, drive_manifest):
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 3, "", "object not found"))
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
@@ -185,6 +186,7 @@ def test_checkin_job_marks_checkin_and_appends_event(conf, fake_popen, monkeypat
     assert job.status == "done", job.error
     c = st.load_case("CASE-123")
     assert c["last_checkin_at"] and job.result["last_checkin_at"] == c["last_checkin_at"] and job.result["ok"] is True
+    assert c["rev"] and drive_manifest.rev("CASE-123") == c["rev"] and c["checked_in_from"]
     ev = st.events("CASE-123")[-1]
     assert ev["action"] == "checkin" and ev["agent"] == "test-agent" and "ETA 0s" in ev["note"]
     assert c["last_checkin_events"] == len(st.events("CASE-123")) - 1    # 行数は checkin event を足す前
@@ -192,11 +194,12 @@ def test_checkin_job_marks_checkin_and_appends_event(conf, fake_popen, monkeypat
     assert job.progress.startswith("Transferred:") and "100%" in job.progress
     # 失敗（rclone 非ゼロ）: failed、last_checkin_at は更新されず、event も増えない
     fake_popen.rc = 1
-    n = len(st.events("CASE-123")); before = c["last_checkin_at"]
+    n = len(st.events("CASE-123")); before = (c["last_checkin_at"], c["rev"])
     job, _ = table.submit("checkin", ws.name, "CASE-123", lambda p: sync.checkin_job(conf, ws, "CASE-123", "test-agent", p))
     _wait(job)
     assert job.status == "failed" and job.error.startswith("RcloneError:") and "ETA 0s" in job.error
-    assert len(st.events("CASE-123")) == n and st.load_case("CASE-123")["last_checkin_at"] == before
+    assert len(st.events("CASE-123")) == n and (st.load_case("CASE-123")["last_checkin_at"], st.load_case("CASE-123")["rev"]) == before
+    assert drive_manifest.rev("CASE-123") == before[1]   # 転送失敗: rev は戻り、manifest も変わらない
     # 未知の案件: failed（例外がそのまま error に）
     job, _ = table.submit("checkin", ws.name, "CASE-404", lambda p: sync.checkin_job(conf, ws, "CASE-404", "a", p))
     _wait(job)

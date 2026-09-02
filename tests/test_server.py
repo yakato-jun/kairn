@@ -333,7 +333,7 @@ def test_open_case_reports_failed_fetch_when_job_fails_immediately(conf, monkeyp
     run(main)
 
 
-def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, monkeypatch, jobs):
+def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, monkeypatch, jobs, drive_manifest):
     """rclone は _run の層で偽装し、sync.checkout / sync.checkin 本体（last_checkin_at の記録を含む）を通す。"""
     import os, subprocess, time
     mocked_rclone = []
@@ -378,7 +378,7 @@ def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, mo
     run(main)
 
 
-def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, monkeypatch, jobs):
+def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, monkeypatch, jobs, drive_manifest):
     """checkin 後に open_case を繰り返しても（events.jsonl の mtime が CHECKIN_SLACK_SEC を超えて進んでも）checkout は skip されない。
     人／AI の実質的な変更（log_event / update_task / UI 操作）があれば skip する。checkin ジョブ自身の checkin event は変更に数えない。"""
     import os, subprocess, time

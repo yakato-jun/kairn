@@ -79,9 +79,13 @@ def test_mark_checkin_and_local_changes(store):
     store.create_case("CASE-1", "t", "acme", actor="human")
     assert store.local_changes_since_checkin("CASE-1") is None          # 未記録 → 判定不能
     assert store.local_changes_since_checkin("CASE-404") is None        # 案件なし
+    assert store.manifest_entry("CASE-1") is None                       # rev 未付与
     ts = store.mark_checkin("CASE-1")
-    assert store.load_case("CASE-1")["last_checkin_at"] == ts
+    c = store.load_case("CASE-1")
+    assert c["last_checkin_at"] == ts and len(c["rev"]) == 36 and c["checked_in_from"]   # 版マーカー（uuid4）とホスト名
+    assert store.manifest_entry("CASE-1") == {"rev": c["rev"], "checked_in_at": ts, "from": c["checked_in_from"]}
     assert store.local_changes_since_checkin("CASE-1") == []            # 直後は変更なし（case.json 自身の書き込みは誤検出しない）
+    assert store.mark_checkin("CASE-1") and store.load_case("CASE-1")["rev"] != c["rev"]   # 毎回振り直す
     d = store.case_dir("CASE-1")
     store.new_plan_version("CASE-1", "o", [{"title": "a"}], reason="r", actor="ai")
     t = time.time() + 60

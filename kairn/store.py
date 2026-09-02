@@ -9,12 +9,16 @@ MCP が呼ぶ規則の実体はここ（エージェントの文章には頼ら�
   閲覧だけで events.jsonl に差分を作らないため（複数環境の events をマージする前提）
 - last_checkin_at / last_checkin_events: 案件単位の最終 checkin 時刻とその時点の events.jsonl 行数（case.json）。
   open_case はこれより新しいローカル変更（kairn 自身の checkin event は除く）があれば checkout を skip する
+- rev / checked_in_from: checkin のたびに振り直す版マーカー（uuid4）と checkin したホスト名（case.json）。Drive のワークスペース直下の
+  manifest.json（kairn/sync.py）に同じ rev が載り、open_case はローカルの rev と比べて同じなら取り寄せを省略する
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import socket
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -37,6 +41,19 @@ SYNC_EVENT_ACTIONS = ("checkin",)
 
 def now_iso() -> str:
     return datetime.now(JST).isoformat(timespec="seconds")
+
+
+def hostname() -> str:
+    """checked_in_from に書くホスト名（取れなければ "unknown"）。"""
+    try:
+        return socket.gethostname() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def new_rev() -> str:
+    """版マーカー（uuid4）。checkin のたびに振り直す。"""
+    return str(uuid.uuid4())
 
 
 def parse_iso(ts: str) -> datetime | None:
@@ -155,15 +172,28 @@ class CaseStore:
         return case
 
     def mark_checkin(self, case_id: str) -> str | None:
-        """checkin 成功時に case.json.last_checkin_at（時刻）と last_checkin_events（その時点の events.jsonl の行数）を更新する。
-        case.json が無ければ何もしない（None）。"""
+        """checkin の版マーカー: case.json に rev（uuid4、毎回振り直す）・last_checkin_at（時刻）・checked_in_from（ホスト名）・
+        last_checkin_events（その時点の events.jsonl の行数）を書く。sync.checkin は転送の**前**にこれを呼ぶ（Drive に置く case.json に
+        同じ rev が入るように）。case.json が無ければ何もしない（None）。返り値: last_checkin_at。"""
         if not self._case_file(case_id).exists():
             return None
         case = self.load_case(case_id)
+        case["rev"] = new_rev()
         case["last_checkin_at"] = now_iso()
+        case["checked_in_from"] = hostname()
         case["last_checkin_events"] = len(self.events(case_id))
         self.save_case(case)
         return case["last_checkin_at"]
+
+    def manifest_entry(self, case_id: str) -> dict | None:
+        """manifest.json に載せる当該案件のエントリ {rev, checked_in_at, from}（case.json の rev / last_checkin_at / checked_in_from）。
+        case.json が無い、または rev 未付与なら None。"""
+        if not self._case_file(case_id).exists():
+            return None
+        case = self.load_case(case_id)
+        if not case.get("rev"):
+            return None
+        return {"rev": case["rev"], "checked_in_at": case.get("last_checkin_at"), "from": case.get("checked_in_from", "")}
 
     def local_changes_since_checkin(self, case_id: str) -> list[str] | None:
         """last_checkin_at より新しいローカル変更（case.json / events.jsonl / worklog.md / plan/*.json の mtime）。

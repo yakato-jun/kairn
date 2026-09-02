@@ -3,11 +3,18 @@
 - checkout(ws[, case]):  <remote>:<root>/<ws>/cases[/<case>] -> local（テキスト層のみ、削除は追従しない）。
                          events.jsonl は「新しい方で上書き」せず、Drive 版を取り寄せてローカル版と行の和集合にマージする
                          （merge_case_events → 他ファイルを rclone copy --update）
-- checkin(ws[, case]):   local -> remote（テキスト層）。先に events.jsonl を同じくマージしてから転送する。
+- checkin(ws[, case]):   local -> remote（テキスト層）。先に events.jsonl を同じくマージし、各案件の case.json に版マーカー
+                         （rev = uuid4 / last_checkin_at / checked_in_from。store.mark_checkin）を書いてから転送する。
                          案件単位は rclone sync（削除・Drive 側の新しい版は _deleted/<日付>/ へ退避）、
                          ワークスペース全体（daily）は rclone copy（ローカルに無い案件ディレクトリを Drive から消さない。
-                         上書きされる Drive 側の版は同じく _deleted/ へ）。成功時に各案件の case.json.last_checkin_at を更新
-                         （open_case の checkout skip 判定に使う）
+                         上書きされる Drive 側の版は同じく _deleted/ へ）。転送後にワークスペースの manifest.json を更新する
+                         （update_manifest: rclone cat → 当該案件のエントリを書き換え → rclone rcat）。転送に失敗したら
+                         版マーカーは書く前の内容に戻す
+- manifest.json:         <remote>:<root>/<ws>/manifest.json = {"cases": {"<case>": {"rev", "checked_in_at", "from"}}, "updated_at"}。
+                         open_case（kairn/server.py）は rclone cat 1 回（MANIFEST_TIMEOUT_SEC）で当該案件の rev を見て、ローカルの
+                         case.json.rev と同じなら取り寄せを省略する。直近に取得した内容は index/manifest.cache.json に置き、
+                         list_cases / UI 一覧の印に使う。同時 checkin の競合は「後勝ち」（案件ごとの独立エントリなので
+                         影響は当該案件のみ）
 - checkin_job(ws, case, agent): MCP の checkin ジョブ本体（checkin → checkin event）。kairn/jobs.py のスレッドで走る
 - merge_events(local_path, remote_lines): 行の文字列一致で重複除去した和集合を `t` で安定ソートし、内容が変わる時だけ書き戻す
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
@@ -142,6 +149,87 @@ def merge_case_events(conf: Config, ws: Workspace, case: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# manifest.json（ワークスペース直下。案件ごとの版マーカー rev）
+# ---------------------------------------------------------------------------
+
+MANIFEST_NAME = "manifest.json"
+MANIFEST_CACHE_NAME = "manifest.cache.json"
+MANIFEST_TIMEOUT_SEC = 10   # open_case が rclone cat を待つ上限秒（越えたら manifest unavailable としてローカルを返す）
+
+
+def manifest_drive_path(conf: Config, ws: Workspace) -> str:
+    return conf.drive_path(ws.name, MANIFEST_NAME)
+
+
+def parse_manifest(text: str) -> dict | None:
+    """manifest.json の本文 → dict。JSON でない／`cases` が dict でないなら None（壊れた manifest は「無い」と同じ扱い）。"""
+    try:
+        m = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(m, dict) or not isinstance(m.get("cases"), dict):
+        return None
+    return m
+
+
+def fetch_manifest(conf: Config, ws: Workspace, timeout: float = MANIFEST_TIMEOUT_SEC) -> dict | None:
+    """Drive の manifest.json を rclone cat で 1 回読む。rclone 不在・タイムアウト・非ゼロ終了（未作成・オフライン）・
+    JSON でない → None（呼び出し側は「manifest unavailable」として扱う）。"""
+    try:
+        r = subprocess.run(["rclone", "cat", manifest_drive_path(conf, ws)], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return parse_manifest(r.stdout)
+
+
+def write_manifest(conf: Config, ws: Workspace, manifest: dict) -> None:
+    """manifest.json を rclone rcat（stdin → Drive）で書き戻す。失敗は RcloneError。"""
+    text = json.dumps(manifest, ensure_ascii=False, indent=1) + "\n"
+    try:
+        r = subprocess.run(["rclone", "rcat", manifest_drive_path(conf, ws)], input=text, capture_output=True, text=True)
+    except OSError as e:  # rclone コマンド不在
+        raise RcloneError(f"rclone rcat failed: {e}") from e
+    if r.returncode != 0:
+        raise RcloneError(f"rclone rcat {manifest_drive_path(conf, ws)} failed: {(r.stderr or r.stdout).strip()[-400:]}")
+
+
+def save_manifest_cache(ws: Workspace, manifest: dict) -> Path:
+    """直近に取得した manifest を index/manifest.cache.json に置く（fetched_at 付き。ローカルのみ、同期しない）。"""
+    p = ws.index_dir / MANIFEST_CACHE_NAME
+    _atomic_write(p, json.dumps({**manifest, "fetched_at": now_iso()}, ensure_ascii=False, indent=1) + "\n")
+    return p
+
+
+def load_manifest_cache(ws: Workspace) -> dict | None:
+    """index/manifest.cache.json（無ければ None）。"""
+    p = ws.index_dir / MANIFEST_CACHE_NAME
+    if not p.exists():
+        return None
+    return parse_manifest(p.read_text(encoding="utf-8"))
+
+
+def refresh_manifest(conf: Config, ws: Workspace, timeout: float = MANIFEST_TIMEOUT_SEC, cache: bool = True) -> dict | None:
+    """manifest を取得し、取れたらキャッシュを更新して返す（取れなければ None。キャッシュは触らない）。"""
+    m = fetch_manifest(conf, ws, timeout)
+    if m is not None and cache:
+        save_manifest_cache(ws, m)
+    return m
+
+
+def update_manifest(conf: Config, ws: Workspace, entries: dict[str, dict]) -> dict:
+    """checkin 後: Drive の manifest を読み（取得できなければ新規作成）、渡された案件のエントリを書き換えて rcat で書き戻す。
+    同時 checkin は「後勝ち」（他案件のエントリには触れないので影響は当該案件のみ）。キャッシュも更新する。"""
+    m = fetch_manifest(conf, ws) or {"cases": {}}
+    m["cases"].update(entries)
+    m["updated_at"] = now_iso()
+    write_manifest(conf, ws, m)
+    save_manifest_cache(ws, m)
+    return m
+
+
 def _local_case_dirs(ws: Workspace) -> list[str]:
     if not ws.cases_dir.exists():
         return []
@@ -177,9 +265,14 @@ def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
 
 def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False, progress: ProgressFn | None = None) -> str:
     """ローカル → Drive。先に各案件の events.jsonl を Drive 版とマージしてから転送する（Drive にしか無い行を消さない）。
+    転送の前に case.json へ版マーカー（rev / last_checkin_at / checked_in_from / last_checkin_events。store.mark_checkin）を書く
+    （Drive に置く case.json に同じ rev が入る）。案件指定は必ず書く。ワークスペース全体（daily）は last_checkin_at より新しい
+    ローカル変更がある案件と未 checkin の案件だけに書く（内容が変わっていない案件の rev を毎日変えて他環境に取り寄せさせない）。
     case 指定は `rclone sync`（案件内の削除を追従）、ワークスペース全体は `rclone copy`
     （ローカルに無い案件ディレクトリは消してよい＝Drive から削除しない。README 原則 2）。どちらも上書きされる Drive 側の版は
-    `_deleted/<日付>/` に退避する（--backup-dir）。dry ではマージしない。progress は転送本体の出力を行単位に受け取る（checkout と同じ）。"""
+    `_deleted/<日付>/` に退避する（--backup-dir）。転送が失敗したら版マーカーは書く前の内容（mtime も）に戻す。
+    転送後に manifest.json の当該案件のエントリを更新する（update_manifest。失敗は RcloneError: 転送は済んでいる）。
+    dry ではマージも版マーカーも書かない。progress は転送本体の出力を行単位に受け取る（checkout と同じ）。"""
     src = ws.cases_dir / case if case else ws.cases_dir
     if not src.exists():
         raise RcloneError(f"nothing to check in: {src} does not exist")
@@ -187,14 +280,38 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     backup = conf.drive_path(ws.name, "_deleted", _dt.date.today().isoformat())
     verb = "sync" if case else "copy"
     merged = [] if dry else [c for c in ([case] if case else _local_case_dirs(ws)) if merge_case_events(conf, ws, c)]
-    r = _run(["rclone", verb, str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
-              *STATS_ARGS, "-v", *_filters(conf), *_bw(conf)], dry, progress)
+    store = CaseStore(ws.cases_dir)
+    stamped: dict[str, tuple[str, float]] = {}   # 版マーカーを書いた案件 → 書く前の case.json（内容, mtime）。転送失敗時に戻す
     if not dry:
-        store = CaseStore(ws.cases_dir)
         for cid in ([case] if case else store.list_case_ids()):
-            store.mark_checkin(cid)
+            f = ws.cases_dir / cid / "case.json"
+            if not f.exists():
+                continue
+            if not case and store.local_changes_since_checkin(cid) == []:   # 変更なし（判定不能 None は書く）
+                continue
+            before = (f.read_text(encoding="utf-8"), f.stat().st_mtime)
+            if store.mark_checkin(cid) is not None:
+                stamped[cid] = before
+    try:
+        r = _run(["rclone", verb, str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
+                  *STATS_ARGS, "-v", *_filters(conf), *_bw(conf)], dry, progress)
+    except BaseException:
+        for cid, (text, mtime) in stamped.items():
+            f = ws.cases_dir / cid / "case.json"
+            _atomic_write(f, text)
+            os.utime(f, (mtime, mtime))
+        raise
     msg = (r.stderr or r.stdout).strip()[-400:]
-    return f"{msg} [events merged: {len(merged)}]" if merged else msg
+    if merged:
+        msg = f"{msg} [events merged: {len(merged)}]"
+    if stamped:
+        entries = {cid: e for cid in stamped if (e := store.manifest_entry(cid)) is not None}
+        try:
+            update_manifest(conf, ws, entries)
+        except RcloneError as e:
+            raise RcloneError(f"transferred, but manifest update failed ({e}); the next checkin updates it. rclone: {msg}") from e
+        msg = f"{msg} [manifest: {len(entries)}]"
+    return msg
 
 
 def checkin_job(conf: Config, ws: Workspace, case: str, agent: str, progress: ProgressFn | None = None) -> dict:
