@@ -16,3 +16,4 @@
 | 12 | 生データの所在は `worklog.md` があればその `## Data location` 節、無ければ `DATA.md` に書く（case.json の有無に関わらず）。`daily --dry-run` は drive-index.txt と索引を書き換えない | 記録先を「AI が書く経緯の文書」に寄せつつ、案件化前のディレクトリでも所在を失わない。dry-run は観察のみで副作用を残さない |
 | 13 | 案件ごとに `last_checkin_at` を持ち、`open_case` はそれより新しいローカル変更があれば checkout を skip する。`open_case` は取り寄せ → 読み込みの順 | 未 checkin の変更を Drive の版で上書きしない。Drive にしか無い案件も開ける。返り値とディスクの食い違いを無くす |
 | 14 | `events.jsonl` は checkout / checkin の前に Drive 版と行の和集合にマージする（重複は文字列一致、`t` で安定ソート）。`open_case` は events に書かず、閲覧記録はローカルの `index/access.log` へ | 追記専用ログを「新しい方で上書き」すると複数環境の行が失われる。閲覧のたびに追記するとローカルが常に新しくなり他環境の event を取り込めない（2026-09-02） |
+| 15 | 常駐は systemd user service。unit は kairn 自身（`kairn install-service`）がコード内テンプレートから生成し、実行中の自分のパスを ExecStart に埋める。雛形ファイルは置かない | clone 先・導入方法（uv tool / venv）ごとに変わるパスを人に書き換えさせない。`kairn ensure` は service が止まっていた時の保険で、常駐の代替ではない（2026-09-02） |
