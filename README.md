@@ -89,8 +89,8 @@ kairn detach [<repo path>]                # 所属を外す（glob: 由来なら
 kairn status                              # 設定・cwd の所属・各ワークスペースの案件数と所属リポジトリ（remote が共有 client_id の Drive なら警告）
 kairn cases [<ws>] [--all]                # 案件一覧（既定は open のみ）
 kairn new <case id> "<title>" [--ws <ws>] # 案件を作る（case.json）
-kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新（--dry-run では索引を書き換えない）。同期実行（タイムアウト無し）。案件省略時は manifest の rev がローカルと違う案件だけ
-kairn checkin <ws> [<case>] [--dry-run]   # ローカル → Drive（案件単位は rclone sync、ワークスペース全体は rclone copy。rev / last_checkin_at を書き manifest.json を更新）。同期実行（タイムアウト無し）
+kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新（--dry-run では索引を書き換えない）。同期実行（タイムアウト無し）。案件省略時は Drive の版マーカー（cases/*/.rev/）を 1 回読み、rev がローカルと違う案件だけ
+kairn checkin <ws> [<case>] [--dry-run]   # ローカル → Drive（案件単位は rclone sync、ワークスペース全体は rclone copy。rev / last_checkin_at を書き、案件フォルダの .rev/<rev> を置く）。同期実行（タイムアウト無し）
 kairn index <ws> [--full]                 # 索引（SQLite FTS5）の差分再生成（--full で全部）
 kairn drive-index <ws>                    # Drive 上の全ファイル一覧を index/drive-index.txt に
 kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮
@@ -135,8 +135,8 @@ systemctl --user status kairn-serve.service; journalctl --user -u kairn-serve
   停止時に走っていたジョブ（checkin / 取り寄せ）はログ（`journalctl --user -u kairn-serve`）に 1 行残り、次回の checkin / checkout で整合する。
   シグナル受信から 7 秒（5 + 2）経ってもプロセスが残っていれば（同期ツールハンドラの実行中など）、ウォッチドッグが running ジョブをログに出して
   `os._exit(0)` で落とす（`kairn/server.py` `start_shutdown_watchdog`）。
-- **版マーカー（manifest.json）の導入時は一度 `kairn manifest rebuild <ws>` を実行する**（後述「同期」）。実行するまで `open_case` は Drive を
-  「manifest unavailable」として取り寄せず、`kairn checkout <ws>` は manifest 未作成のエラーになる。
+- **版マーカー（`cases/<case>/.rev/<rev>`）の導入時は一度 `kairn drive-markers <ws>` を実行する**（後述「同期」）。実行するまで Drive の既存案件は
+  マーカー無しなので、`open_case` は毎回取り寄せ、`kairn checkout <ws>` はそれらを対象にしない（checkin した案件から順にマーカーが付く）。
 
 `kairn ensure`: 設定のポートで `/mcp` が応答しなければ `kairn serve` を切り離して起動（`start_new_session`。出力は `~/.local/state/kairn/serve.log`）し、
 応答が出るまで最大 15 秒待つ（`--timeout`）。動いていれば何もしない。終了コード 0 = 応答あり。skill は案件を開く前にこれを 1 回実行する（service が止まっていた時の保険）。
@@ -233,7 +233,7 @@ OpenCode の `~/.config/opencode/opencode.json`:
 kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active → <name>.zst（zstd -T0 -6、検証後に置換、mtime 引き継ぎ。30 分以内に更新されたものと rules.exclude（target/** 等）配下は対象外）
 kairn raw-move <ws> [<case>] [--dry-run]  # rclone move → <remote>:<root>/<ws>/cases/<case>/…。移動後に case.json.data[]、worklog.md の
                                           #   「## Data location」（case.json が無ければ DATA.md）、index/raw-moved-YYYYMMDD.txt、progress event に記録
-kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move → drive-index → index を順に実行。段が失敗しても次へ進み、index/daily.log に記録
+kairn daily <ws> [--dry-run]              # bag2zst → checkout → checkin → raw-move → drive-index → index を順に実行。段が失敗しても次へ進み、index/daily.log に記録
 ```
 
 - 所在の記録先: `worklog.md` があればその `## Data location` 節、無ければ `DATA.md`（case.json の有無に関わらず）。case.json があれば `data[]` と progress event にも記録。
@@ -243,36 +243,36 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
   Drive にその案件が無い・rclone が無い等で取得できなければマージを飛ばして従来どおり転送する。
 - `checkout <ws> <case>` は events 以外を `rclone copy --update`（ローカルの方が新しいファイルは上書きしない）。`open_case` の取り寄せも同じ。
   `open_case` は `case.json.last_checkin_at`（checkin が更新）より新しいローカル変更があれば checkout を skip する。
-- **版マーカーと manifest.json**（差分なしの取り寄せでも 30 秒かかるため、更新の有無を安価に確認する）: すべての checkin 経路
+- **版マーカー（`cases/<case>/.rev/<rev>`）**（差分なしの取り寄せでも 30 秒かかるため、更新の有無を安価に確認する）: すべての checkin 経路
   （MCP `checkin`・`kairn checkin`・`daily`）は転送の前に案件の `case.json` へ `rev`（uuid4）/ `last_checkin_at` / `checked_in_from`（ホスト名）を書き、
-  転送後にワークスペースの `<remote>:<root>/<ws>/manifest.json`（`{"cases": {"<case>": {"rev", "checked_in_at", "from"}}, "updated_at"}`）を
-  `rclone cat` → 当該案件を更新 → `rclone rcat` で書き戻す（同一ホスト内はロックファイルで直列化しマージ、ホスト間は後勝ち。案件ごとの独立エントリなので影響は当該案件のみ。docs/data-model.md）。
-  `open_case` は `rclone cat` を 1 回（10 秒でタイムアウト）だけ行い、案件の `rev` がローカルと同じなら取り寄せを省略する（`drive.up_to_date: true`）。
-  違えば取り寄せジョブを起動して最大 20 秒待ち、間に合えば取り寄せ後の内容を返す（`drive.fetched: true`）。manifest が取れなければ取り寄せずローカル写し
-  （`drive.up_to_date: null`）。直近に取得した manifest は `index/manifest.cache.json` に置き、`list_cases` の `drive.state` と UI 一覧の Drive 列
-  （同期済み / Drive の方が新しい / ローカル未 checkin / 不明）に使う（取得は `open_case`・`checkin`・`kairn checkout <ws>`・UI の「更新確認」）。
-  `kairn checkout <ws>`（案件指定なし）は manifest と比べて `rev` が違う案件（ローカルに無い案件を含む）だけを取り寄せる。
+  案件フォルダの `.rev/` を「`<rev>` という空ファイル 1 個」に作り直してから転送する（案件単位の `rclone sync` が Drive 側の古いマーカーを消す。
+  ワークスペース全体の `rclone copy` の後は、rev を振り直した案件の `.rev/` だけを `rclone sync` で揃える）。集計ファイルは置かない（docs/data-model.md）。
+  `open_case` は `rclone lsf <case>/.rev/` を 1 回（10 秒でタイムアウト）だけ行い、名前がローカルの `rev` と同じなら取り寄せを省略する（`drive.up_to_date: true`）。
+  違えば取り寄せジョブを起動して最大 20 秒待ち、間に合えば取り寄せ後の内容を返す（`drive.fetched: true`）。マーカーが無い・2 個以上ある（不定）案件は取り寄せる。
+  Drive が読めなければ取り寄せずローカル写し（`drive.up_to_date: null`）。直近に読んだ版は `index/drive_revs.cache.json` に置き、`list_cases` の `drive.state` と
+  UI 一覧の Drive 列（同期済み / Drive の方が新しい / ローカル未 checkin / 不明）に使う。
+  `kairn checkout <ws>`（案件指定なし）・UI の「更新確認」・`daily` は `rclone lsf -R --include '/cases/*/.rev/*'` 1 回で全案件の版を読み、
+  `rev` が違う案件（ローカルに無い案件を含む）だけを取り寄せる。
   `kairn checkin <ws>`（`daily`）は `last_checkin_at` より新しいローカル変更がある案件と未 checkin の案件だけ `rev` を振り直す（内容の変わらない案件の
   `rev` を毎日変えない。作業ファイルだけが増えた案件は次に case.json / worklog / events / plan が変わるまで振り直されない）。
-- **新方式導入時は一度 `kairn manifest rebuild <ws>` を実行する**（既存 Drive データの移行。`--dry-run` で変更内容の確認のみ）: Drive 上の
-  `cases/*/case.json` を `rclone lsf` で列挙して `rclone cat` で読み、`rev` が無ければ付与して `rclone rcat` で書き戻し（`last_checkin_at` は既存値を維持、
-  無ければ Drive 側ファイルの更新時刻）、それらから `manifest.json` を作り直す。ローカルに同じ案件があり `rev` が無い／違う場合はローカルの `case.json` にも
-  同じ `rev` を書く（未 checkin のローカル変更がある案件と `last_checkin_at` の無い案件はそのままにして報告に列挙）。他の環境ではその後 `kairn checkout <ws>`
-  か `open_case` で `rev` 付きの `case.json` を取り寄せる。
+- **新方式導入時は一度 `kairn drive-markers <ws>` を実行する**（既存 Drive データの移行。`--dry-run` で内容の確認のみ）: Drive の `cases/*/case.json` を
+  `rclone copy --include` 1 回で一時ディレクトリへ取り寄せ、`rev` がローカルの `case.json` と一致する案件だけ `cases/<case>/.rev/<rev>` を作って
+  `rclone sync`（当該案件の `.rev/` に限定）1 回で Drive へ置く。不一致・Drive 側に `rev` が無い・ローカルに無い案件は一覧で報告して触らない
+  （それらは各環境の次の checkin でマーカーが付く）。`--remove-manifest` を付けた時だけ旧方式の `manifest.json` を消す。
 - `open_case` は `events.jsonl` に書かない。閲覧記録はワークスペースの `index/access.log`（ローカルのみ、同期しない）に 1 行追記する。
 - `checkin <ws> <case>`（MCP の `checkin(case)` も）は `rclone sync`: 案件内の削除を追従し、Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする（events.jsonl はマージ済み）。**他環境で作業した後は先に `checkout` する**。
 - `checkin <ws>`（案件指定なし。`daily` が毎日呼ぶ）は `rclone copy`: ローカルに無い案件ディレクトリを Drive から消さない（原則 2「ローカルの案件ディレクトリは消してよい」）。上書きされる Drive 側の版は同じく `_deleted/` へ。
 - **MCP の `checkin(case)` と `open_case` の取り寄せはジョブ**（`kairn/jobs.py`。サーバー内のスレッド）で、ツールは待たずに `job_id` を返し、`job_status(job_id)` で done / failed を見る
   （docs/mcp-tools.md「ジョブ」。大きな案件で MCP クライアントの呼び出しタイムアウトに当たらないため）。同じ案件のジョブは種類を問わず 1 つずつ実行する
-  （checkin 中に取り寄せが来れば `queued` で待つ。別案件は並走）。`open_case` は manifest の `rev` が違うときだけ取り寄せジョブを起動し、最大 20 秒待つ。
+  （checkin 中に取り寄せが来れば `queued` で待つ。別案件は並走）。`open_case` は Drive のマーカーの `rev` が違うときだけ取り寄せジョブを起動し、最大 20 秒待つ。
   ジョブ表はサーバーのメモリ内で、`kairn serve` の再起動で消える。
   **CLI の `kairn checkin` / `kairn checkout` は従来どおり同期**（終わるまで待つ。タイムアウト無し）。**大きな初回投入（数百 MB・数百ファイル）は MCP ではなく CLI で行う**:
   `kairn checkin <ws> <case>`。
 - `open_case` の checkout skip 判定は人／AI の実質的な変更だけを見る: `events.jsonl` が checkin 時点（`case.json.last_checkin_events` 行）以後に kairn 自身の `checkin` event で伸びただけなら変更と数えない。
 - `daily --dry-run` は rclone に `--dry-run` を渡し、`drive-index.txt` と索引（`kairn.sqlite`）を書き換えない。
 - 帯域制限は `rules.bwlimit`（例 `"08:00,4M 20:00,off"`。rclone の `--bwlimit` にそのまま渡す）。
-- **rclone の追加引数 `rules.rclone_flags`**（既定は空）: rclone を呼ぶすべての箇所（checkout / checkin / raw-move / drive-index / manifest の
-  読み書き / events の取り寄せ / ws の lsd・mkdir・lsf）で共通引数の後ろに付ける（同じオプションは後ろが勝つ）。
+- **rclone の追加引数 `rules.rclone_flags`**（既定は空）: rclone を呼ぶすべての箇所（checkout / checkin / raw-move / drive-index / 版マーカーの
+  lsf・sync / drive-markers / events の取り寄せ / ws の lsd・mkdir・lsf）で共通引数の後ろに付ける（同じオプションは後ろが勝つ）。
   `kairn rules set rclone_flags "--transfers 8 --checkers 16 --drive-pacer-min-sleep 10ms --drive-pacer-burst 200"` が推奨例
   （`--` で始まるオプションとその値だけ受け付ける。`kairn rules set rclone_flags ""` で空に戻す。`kairn rules show` / UI の設定ページで確認・編集）。
   Google Drive はファイルごとに API 呼び出しが要り、rclone 共有の client_id では API レートが絞られるため、小ファイル多数の案件で転送が
@@ -280,7 +280,7 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
   前提**で、共有 client_id のまま並列度だけ上げると rate limit のリトライで却って遅くなる。
 - **テキスト層の上限と除外**（大量のログ・CSV を持つ案件向け）。`checkout` / `checkin`（MCP の `open_case` / `checkin` も）が転送するのは
   `rules.exclude` に当たらず、`rules.raw_data.extensions` の拡張子でなく、**`rules.raw_data.min_size`（既定 `50M`）以下**のファイルだけ
-  （rclone の `--exclude` / `--max-size`。`kairn/sync.py` `_filters`）。それを超えるものは生データ層で、`raw-move` が `min_age`（既定 `14d`）後に Drive へ移動する。
+  （rclone の `--filter '- <pattern>'` / `--max-size`。`kairn/sync.py` `_filters`。版マーカー `.rev/` は先頭の `+ .rev/**` で常に含める）。それを超えるものは生データ層で、`raw-move` が `min_age`（既定 `14d`）後に Drive へ移動する。
   1 ファイルは小さくても件数が多い（数百ファイル・数百 MB のログや CSV）と転送に数分かかるので、案件に合わせて調整する:
   - 上限を下げる: `rules.raw_data.min_size: 10M` 等（超えたファイルはテキスト層から外れ、`min_age` 後に `raw-move` の対象になる）
   - 同期しないパターンを足す: `rules.exclude` に `logs/**`、`*.csv`、`*.log` 等（`**` で終わるパターンはどの階層のそのディレクトリにも、

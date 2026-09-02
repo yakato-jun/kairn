@@ -10,12 +10,12 @@ workspaces/<ws>/
     worklog.md           AI が書く経緯・調査・決定（従来の worklog。Tasks 節は持たない）
     plan/v0001.json …    計画の版（下記）。最新版が「今やること」
     events.jsonl         追記専用のイベント（下記）。checkout / checkin で Drive 版と行の和集合にマージされる
+    .rev/<rev>           版マーカー（空ファイル 1 個。名前 = case.json の rev。下記）。Drive の同じ場所にも同期される
     …                    作業ファイル（MMdd_hhmm_ prefix 等、従来どおり）
   index/kairn.sqlite     索引（case / plan / task / event / section の検索用）。再生成可
   index/drive-index.txt  Drive 上の全ファイル一覧（path, size, mtime）。`kairn drive-index` / `kairn daily` が生成
   index/access.log       open_case の閲覧記録（1 行 `<時刻>\t<案件>\t<agent>`）。ローカルのみ、Drive に同期しない
-  index/manifest.cache.json  直近に取得した Drive の manifest.json（`fetched_at` 付き）。list_cases / UI 一覧の印に使う。ローカルのみ
-<remote>:<root>/<ws>/manifest.json   Drive 側だけにあるワークスペースの版一覧（下記）。ローカルには置かない（キャッシュのみ）
+  index/drive_revs.cache.json  直近に読んだ Drive の版（`{"revs": {case: rev | null}, "fetched_at"}`）。list_cases / UI 一覧の印に使う。ローカルのみ
 ```
 
 ## case.json
@@ -37,15 +37,15 @@ workspaces/<ws>/
   "created_at": "...", "updated_at": "...", "current_plan": 3,
   "last_checkin_at": "2026-09-01T18:00:00+09:00",  // この案件を最後に checkin した時刻（checkin ツール / kairn checkin / daily が更新）
   "last_checkin_events": 42,                         // その時点の events.jsonl の行数（同上。マージ後の行数。open_case の checkout skip 判定に使う）
-  "rev": "6f1c2b4e-…",                               // 版マーカー（uuid4）。checkin のたびに振り直す。Drive の manifest.json に同じ値が載る
+  "rev": "6f1c2b4e-…",                               // 版マーカー（uuid4）。checkin のたびに振り直す。同じ名前の空ファイルが .rev/ に置かれる
   "checked_in_from": "my-laptop"                     // その checkin をしたホスト名（socket.gethostname()）
 }
 ```
-- `rev` / `checked_in_from`: すべての checkin 経路（MCP `checkin`、`kairn checkin`、`daily`）が**転送の前に**書く（Drive に置く case.json に
-  同じ `rev` が入る）。転送後にワークスペースの `manifest.json` の当該案件のエントリを更新する。転送が失敗したら書く前の内容に戻す。
+- `rev` / `checked_in_from`: すべての checkin 経路（MCP `checkin`、`kairn checkin`、`daily`）が**転送の前に**書き、`.rev/` を作り直してから転送する
+  （Drive に置く case.json と `.rev/<rev>` に同じ `rev` が入る）。転送が失敗したら書く前の内容に戻す（`.rev/` も）。
   `kairn checkin <ws>`（案件指定なし。`daily`）は `last_checkin_at` より新しいローカル変更がある案件と未 checkin の案件だけに書く
   （内容の変わらない案件の `rev` を毎日変えて他環境に取り寄せさせない。作業ファイルだけが増えた案件は対象にならない）。
-  `open_case` はローカルの `rev` と manifest の `rev` が同じなら取り寄せを省略する（docs/mcp-tools.md）。
+  `open_case` はローカルの `rev` と Drive の `.rev/` の名前が同じなら取り寄せを省略する（docs/mcp-tools.md）。
 - `last_checkin_at`: `open_case` は、これより新しいローカル変更（`case.json` / `events.jsonl` / `worklog.md` / `plan/*.json` の mtime）が
   あれば Drive からの checkout を skip し `drive={"skipped": "local changes newer than last checkin"}` を返す（未 checkin の変更を Drive で上書きしない）。
   `events.jsonl` は、checkin 時点（`last_checkin_events` 行）以後に増えた行が kairn 自身の `checkin` event だけなら変更と数えない
@@ -53,34 +53,29 @@ workspaces/<ws>/
   checkin 後に繰り返し開いても skip にならない。未記録なら checkout する（`--update` なのでローカルの方が新しいファイルは上書きされない）。
   checkout で Drive 版の行がマージされ `events.jsonl` が変わった場合は、次の checkin までローカル変更として扱われる（skip）。
 
-## manifest.json（Drive のワークスペース直下。案件ごとの版）
-```json
-{
-  "cases": {
-    "CASE-123_widget-boot-failure": {"rev": "6f1c2b4e-…", "checked_in_at": "2026-09-01T18:00:00+09:00", "from": "my-laptop"}
-  },
-  "updated_at": "2026-09-01T18:00:05+09:00"
-}
+## 版マーカー（`cases/<case>/.rev/<rev>`）
 ```
-- 置き場所: `<remote>:<root>/<ws>/manifest.json`（`cases/` の外）。ローカルには写しを置かず、直近の取得結果を `index/manifest.cache.json`
-  （`fetched_at` 付き）に置く。取得は `open_case` / `kairn checkout <ws>` / `checkin` の更新時 / UI 一覧の「更新確認」で行う。
-- 更新は checkin の転送後に `rclone cat` で現在値を取得 → 当該案件のエントリを書き換え → `rclone rcat` で書き戻す（取得できなければ新規作成）。
-  **同一ホスト内は排他＋マージ**: cat → rcat の区間はワークスペースごとのロックファイル（`$XDG_STATE_HOME/kairn/locks/<ws>.manifest.lock`、
-  既定 `~/.local/state/kairn/locks/`）への `fcntl.flock(LOCK_EX)` で直列化する（`kairn serve` のジョブと CLI の `kairn checkin`、serve 内の
-  別スレッドが同じロックで並ぶ）。現在値を読むのは必ずロック取得後で、読んだ manifest に自分の案件のエントリだけを重ねて書き戻す。
-  読み込んだエントリを減らす書き込みはしない（書く直前に検査し、減っていれば書かずにエラー。既存エントリを消せるのは `manifest rebuild` だけ）。
-  ロック待ちは 60 秒で打ち切り、checkin は「転送は済んだが manifest 更新失敗」として返す（次の checkin が更新する）。
-  **ホスト間の競合は「後勝ち」**: 案件ごとの独立エントリなので影響は当該案件のみ（別案件の同時 checkin では、後の書き戻しが先の
-  エントリを取り込んでいる。同じ案件を同時に checkin した場合だけ先の rev が消え、その環境は次の `open_case` で取り寄せることになる）。
-- **自己修復**: 更新のたび（ロック内）、当該ワークスペースのローカル `case.json` に `rev` があるのに manifest にエントリの無い案件を、
-  Drive の `cases/<case>/case.json` を `rclone cat` で 1 件ずつ読んで `rev` がローカルと一致する場合に限りローカルの
-  `rev` / `last_checkin_at` / `checked_in_from` で補う（一致しない・読めない案件は触らない）。確認は 5 秒程度で打ち切り、残りは次回の
-  checkin に回す。checkin の結果に `[manifest repaired: N]` が付く。全件を作り直すのは `kairn manifest rebuild <ws>`。
-- `open_case` は `rclone cat` を 1 回（10 秒でタイムアウト）だけ行い、案件の `rev` がローカルの `case.json.rev` と同じなら取り寄せを省略する。
-  エントリが無い案件は「未知」として取り寄せる（安全側）。manifest が取れない（オフライン・未作成）ときは取り寄せをせずローカル写しを返す。
-- 既存の Drive データ（`rev` の無い case.json）は `kairn manifest rebuild <ws>` で一度だけ `rev` を付与して manifest を作る（README「同期」）。
-- 印（`list_cases` の `drive.state` / UI 一覧）: `synced`（rev 一致）/ `drive_newer`（rev が違う）/ `local_changes`（未 checkin のローカル変更。
-  `drive_differs` で Drive 側も違うか）/ `unknown`（キャッシュ無し・エントリ無し・未 checkin）。判定はキャッシュ時点のもの。
+<remote>:<root>/<ws>/cases/CASE-123_widget-boot-failure/.rev/6f1c2b4e-…     空ファイル。名前が版（case.json の rev）
+```
+- **版は案件フォルダ内のマーカーファイルで持ち、ワークスペース単位の集計ファイルは置かない。** 一覧が答えるのは版だけで、内容（checkin 時刻・
+  ホスト名・タイトル等）は `case.json` にある（`last_checkin_at` / `checked_in_from`）。
+- 規則: `.rev/` にはマーカーが **1 個だけ** ある。名前 = `case.json.rev`。中身は空。`rev` を付け替えるたび（checkin、`drive-markers`）に
+  `.rev/` を空にして作り直す。checkin は転送直前にも `case.json` の `rev` から作り直してから転送し（案件単位の `rclone sync` が Drive 側の古い
+  マーカーを消す。ワークスペース全体の `rclone copy` の後は振り直した案件の `.rev/` だけを `rclone sync` で揃える）、checkout（`rclone copy --update`）
+  の後も `case.json` の `rev` から作り直す（取り寄せた古いマーカーがローカルに残らない）。同期のフィルタは先頭で `.rev/**` を必ず含め、
+  `rules.exclude` / `rules.raw_data` の除外や `raw-move` の対象にならない。
+- 読み方: 1 案件は `rclone lsf <ws>/cases/<case>/.rev/`（`open_case`。10 秒でタイムアウト）、全案件は
+  `rclone lsf -R --files-only --include '/cases/*/.rev/*' <ws>`（1 プロセス。`kairn checkout <ws>` / UI の「更新確認」/ `daily`）。
+  名前だけを見る（ファイルは読まない）。マーカーが **2 個以上** ある案件は「不定」＝ `rev` 不一致と同じ扱い（取り寄せ対象）。マーカーが無い案件も
+  取り寄せ対象（安全側）。`.rev/` が無い（directory not found）のは「マーカー無し」、それ以外の失敗・タイムアウトは「Drive が読めない」
+  （`open_case` は取り寄せずローカル写しを返す）。
+- 直近に読んだ版は `index/drive_revs.cache.json`（`{"revs": {case: rev | null}, "fetched_at"}`。`null` は不定、無い案件はマーカー無し）に置く。
+  全案件を読んだ時に `fetched_at` を更新し、`open_case` の 1 案件の照会と checkin の完了は当該案件だけを更新する（`fetched_at` は変えない）。
+- 印（`list_cases` の `drive.state` / UI 一覧）: `synced`（rev 一致）/ `drive_newer`（rev が違う、または不定）/ `local_changes`（未 checkin のローカル変更。
+  `drive_differs` で Drive 側も違うか）/ `unknown`（キャッシュ無し・マーカー無し・未 checkin）。判定はキャッシュ時点のもの。
+  `checked_in_at` / `from` はローカル `case.json` の `last_checkin_at` / `checked_in_from`。
+- 既存の Drive データ（マーカーの無い案件）は `kairn drive-markers <ws>` で一度だけ、Drive の `case.json` の `rev` がローカルと一致する案件に
+  マーカーを置く（README「同期」）。それ以外の案件は各環境の次の checkin でマーカーが付く。
 
 ### summary / elements / related / causal（抽出の下書きの適用先）
 - `kairn/extract`（MCP `extract_card` / `kairn extract` / UI「下書きを取得」）は下書きを返すだけで case.json には書かない。

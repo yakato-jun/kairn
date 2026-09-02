@@ -20,13 +20,13 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
    `job_status` で確認し、失敗が続くなら人の判断を仰ぐ）。エラー（is_error）ではなく通常の結果なので、案件が無いと決めつけない。
    `available: true` なら **`human_feedback`（人からの差し戻し sendback・コメント comment）を最初に読む**。
    次に `open_tasks`、`plan`、`recent_events`、`worklog_tail`、`related`。
-   - `drive` は Drive との照合結果。`open_case` は Drive の manifest で案件の版（`rev`）を比べ、同じなら取り寄せない。
+   - `drive` は Drive との照合結果。`open_case` は Drive の案件フォルダの版マーカー（`.rev/<rev>`）と案件の版（`rev`）を比べ、同じなら取り寄せない。
      - `drive.up_to_date: true` … ローカルが最新（`fetched: true` なら今取り寄せた）。そのまま作業する。
      - `drive.up_to_date: false` で `drive.job_id` がある … Drive に新しい版があり取り寄せが 20 秒以内に終わらなかった（返り値は
        **取り寄せ前のローカル内容**）。他の環境で作業した後など最新が要るときは `job_status(job_id)` が `done` になってからもう一度
        `open_case` する（`status: failed` なら `error` を人に伝えてローカル写しで続行）。ローカルだけで作業を続けるなら待たなくてよい。
-     - `drive.up_to_date: null` … Drive の状態が分からない（オフライン、または manifest 未作成。`note`）。ローカル写しで続行し、
-       他の環境で作業した可能性があるなら人に伝える（`kairn manifest rebuild <ws>` の案内は人の判断）。
+     - `drive.up_to_date: null` … Drive の状態が分からない（オフライン等。`note`）。ローカル写しで続行し、
+       他の環境で作業した可能性があるなら人に伝える。
      - `drive.skipped` … 未 checkin のローカル変更があるため取り寄せなかった（ローカル写しで続行。checkin すれば解ける）。
    - 「unknown case …」のエラーは取り寄せを終えても案件が無い（Drive にも無い）とき。`find_cases` / `list_cases` で人に選んでもらう。
 3. 計画が無い案件は `plan(case, objective, tasks, reason)` で v1 を作る（`tasks: [{title, owner?: ai|human}]`）。
