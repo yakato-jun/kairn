@@ -16,7 +16,10 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
   当たる（サーバー側は最後まで走るがクライアントは失敗扱い）。そのため `checkin` と `open_case` の取り寄せはデーモンスレッドのジョブにし、
   ツールは即座に `job_id` を返す。状態は `job_status(job_id)` で見る（queued → running → done | failed。`progress` は rclone の
   `--stats 5s --stats-one-line` の最新行、`elapsed_sec` は開始からの秒数）。**同じ案件に対する同種のジョブが queued / running なら新しく作らず
-  既存の `job_id` を返す**（`note` に "already running"）。完了したジョブは 200 件または 24 時間で捨てる。
+  既存の `job_id` を返す**（`note` に "already running"）。**同じ案件（workspace, case）のジョブは種類を問わず 1 つずつ実行する**
+  （(workspace, case) ごとの FIFO キュー。checkin 実行中に `open_case` の取り寄せが来れば `status: queued` で待ち、先行が done / failed になってから
+  走る。`elapsed_sec` は queued の間 0）。別の案件のジョブは並走する。UI の案件ページの「進行中のジョブ」にも queued を出す。
+  完了したジョブは 200 件または 24 時間で捨てる。
   **ジョブ表はサーバーのメモリ内にあり、`kairn serve` の再起動で消える**（設計上許容。消えた `job_id` は `job_status` が「unknown job」を返す。
   転送が終わったかは `case.json.last_checkin_at` と `checkin` event で分かる）。大きな初回投入（数百 MB）は MCP ではなく CLI の
   `kairn checkin <ws> <case>`（同期・タイムアウト無し）で行う（README「同期」）。
@@ -37,7 +40,7 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
 | `search(query, cases[]?, workspace?, limit=10)` | | `[{case, file, heading, snippet, score}]` | worklog 等の `## ` 節単位の全文検索。語は AND。3 文字未満の語は本文・案件 ID の部分一致（LIKE）で絞る。ワークスペース内のみ |
 | `find_cases(query, workspace?, k=5)` | | `[{case, score, reasons[]}]` | 案件カード（title/tickets/related/elements）×3 ＋ 本文節の bm25 を合算。語は OR（問いの一部にでも当たる案件を拾う）。3 文字未満の語だけなら `case_id` / `title` の LIKE で補う。案件を選ぶのは人 |
 | `checkin(case, workspace?, agent?)` | | `{job_id, status: "queued"\|"running", note}` | ローカル → Drive（`sync.checkin_job`、設定済み remote のみ）を**ジョブ**として起動し即座に返す。未知の案件はジョブを作らず `ToolError`。同じ案件の checkin が走っていればその `job_id`（新しく作らない）。完了時に**ジョブ側で** `case.json.last_checkin_at` / `last_checkin_events` の更新と `checkin` event の追記を行う（失敗時はどちらも書かない）。`job_status(job_id)` が `done` なら `result={ok, rclone, last_checkin_at}`（従来の返り値）、`failed` なら `error` に rclone の末尾。先に `events.jsonl` を Drive 版とマージするので他環境の event は消えない。**それ以外のファイルは Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする**（案件単位は rclone sync。ワークスペース全体の `kairn checkin <ws>` / `daily` は rclone copy で、ローカルに無い案件を Drive から消さない）。他環境で作業した後は先に `checkout` する運用 |
-| `job_status(job_id)` | | `{job_id, kind: checkin\|checkout, workspace, case, status: queued\|running\|done\|failed, created_at, started_at, finished_at, elapsed_sec, progress, result, error}` | `checkin` / `open_case` が返した `job_id` の状態。`progress` は rclone の出力の最新行（`Transferred: … ETA …`）、`elapsed_sec` は開始からの秒数。`done` なら `result`（checkin: `{ok, rclone, last_checkin_at}`、checkout: rclone の末尾）、`failed` なら `error`（`RcloneError: …` 等）。未知の `job_id`（捨てられた／サーバー再起動で消えた）は `ToolError` |
+| `job_status(job_id)` | | `{job_id, kind: checkin\|checkout, workspace, case, status: queued\|running\|done\|failed, created_at, started_at, finished_at, elapsed_sec, progress, result, error}` | `checkin` / `open_case` が返した `job_id` の状態。`queued` は同じ案件の先行ジョブが終わるのを待っている（同一案件のジョブは 1 つずつ）。`progress` は rclone の出力の最新行（`Transferred: … ETA …`）、`elapsed_sec` は開始からの秒数。`done` なら `result`（checkin: `{ok, rclone, last_checkin_at}`、checkout: rclone の末尾）、`failed` なら `error`（`RcloneError: …` 等）。未知の `job_id`（捨てられた／サーバー再起動で消えた）は `ToolError` |
 | `drive_index(pattern, workspace?, limit=50)` | 正規表現 | `[{path, size, mtime}]` | `index/drive-index.txt`（`kairn drive-index` で生成）を検索。無ければ空 |
 | `extract_card(case, workspace?)` | | `{ok, card, agent, elapsed_sec, error, raw_excerpt}` | 設定 `extract.agent` の子エージェント（`kairn/extract/adapters.py`）を案件ディレクトリの写し（一時ディレクトリ: 自案件＋兄弟案件の `case.json` のみ）を cwd に、最小限の環境変数で起動し、出力を `kairn/extract/schema.json` で検証した下書きを `card` に返す（docs/extract-agents.md）。`card.related` のうち実在しない案件 ID は `card.related_unknown` に分ける。**case.json には書かない**（適用は UI の人の操作のみ）。タイムアウト・非ゼロ終了・JSON 無し・スキーマ不一致は `ok=false, error` で返す（`is_error` にしない。未知の案件だけ `ToolError`）。毎回 `{actor: kairn, agent: "extract:<name>", action: extract, note, elapsed_sec, exit_code, timeout_sec}` を events に追記 |
 

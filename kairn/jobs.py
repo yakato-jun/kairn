@@ -6,6 +6,9 @@ MCP クライアント側の呼び出しタイムアウト（300 秒程度）に
 
 - JobTable: job_id → Job（queued / running / done / failed、開始・終了時刻、進捗テキスト、結果、エラー）
 - 同一案件に対する同種（kind）のジョブが queued / running なら新規に作らず既存の Job を返す（submit の created=False）
+- **同一案件（workspace, case）のジョブは種類を問わず直列**: (workspace, case) ごとの FIFO キューで 1 つずつ実行する
+  （checkin 実行中に checkout（open_case の取り寄せ）が来たら queued で待ち、先行が done / failed になってから走る）。
+  別の案件のジョブは並走する
 - 完了したジョブは MAX_DONE 件（既定 200）または TTL_SEC（既定 24 時間）で捨てる（prune。submit / get / active のたびに呼ぶ）
 - 進捗は fn に渡す progress(text) コールバックで更新する（sync._run が rclone の stderr を行単位で流す。最新行だけ保持）
 - テーブルはプロセス内のメモリだけ。サーバーが再起動するとジョブは消える（設計上許容。docs/mcp-tools.md に明記）。
@@ -16,6 +19,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -62,6 +66,7 @@ class Job:
         return self._done.wait(timeout)
 
     def to_dict(self) -> dict[str, Any]:
+        """job_status の返り値。queued は同じ案件の先行ジョブが終わるのを待っている（種類を問わず直列）。"""
         return {"job_id": self.id, "kind": self.kind, "workspace": self.workspace, "case": self.case, "status": self.status,
                 "created_at": self.created_at, "started_at": self.started_at, "finished_at": self.finished_at,
                 "elapsed_sec": self.elapsed_sec(), "progress": self.progress, "result": self.result, "error": self.error}
@@ -75,9 +80,13 @@ class JobTable:
         self.ttl_sec = ttl_sec
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
+        self._running: dict[tuple[str, str], Job] = {}                                   # (workspace, case) → 実行中のジョブ
+        self._queues: dict[tuple[str, str], deque[tuple[Job, Callable]]] = {}            # (workspace, case) → 待ち行列（FIFO）
 
     def submit(self, kind: str, workspace: str, case: str, fn: Callable[[Callable[[str], None]], Any]) -> tuple[Job, bool]:
-        """ジョブを登録して開始する。同じ (kind, workspace, case) が queued / running なら既存を返す（created=False）。"""
+        """ジョブを登録する。同じ (kind, workspace, case) が queued / running なら既存を返す（created=False）。
+        同じ (workspace, case) のジョブが実行中なら（種類を問わず）queued のままキューに入れ、先行が終わってから開始する。"""
+        key = (workspace, case)
         with self._lock:
             self._prune_locked()
             for j in self._jobs.values():
@@ -85,6 +94,10 @@ class JobTable:
                     return j, False
             job = Job(id=uuid.uuid4().hex[:12], kind=kind, workspace=workspace, case=case)
             self._jobs[job.id] = job
+            if key in self._running:
+                self._queues.setdefault(key, deque()).append((job, fn))
+                return job, True
+            self._running[key] = job
         self._start(job, fn)
         return job, True
 
@@ -113,10 +126,18 @@ class JobTable:
                 job.status = "done"
                 job.result = result
         finally:
+            key = (job.workspace, job.case)
             with self._lock:
                 job.finished_at = now_iso()
                 job._finished_mono = time.monotonic()
+                nxt = self._queues[key].popleft() if self._queues.get(key) else None   # 同じ案件の次のジョブ（FIFO）
+                if nxt is None:
+                    self._running.pop(key, None); self._queues.pop(key, None)
+                else:
+                    self._running[key] = nxt[0]
             job._done.set()
+            if nxt is not None:
+                self._start(*nxt)   # ロックの外で開始（テストの同期実行でも再入しない）
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:

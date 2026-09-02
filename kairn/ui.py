@@ -182,8 +182,9 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
         active = jobs.active(ws.name, cid) if jobs is not None else []
         running = ("<div class='jobs'><b>進行中のジョブ</b><ul>" + "".join(
             f"<li class='job'><b>{_esc(j.kind)}</b> <span class='muted'>{_esc(j.status)} · {_esc(j.elapsed_sec())}s · {_esc(j.id)}</span>"
-            f"<br><code>{_esc(j.progress or '(no output yet)')}</code></li>" for j in active)
-            + "</ul><small class='muted'>checkin / open_case の取り寄せ（MCP のジョブ）。完了すると時系列に checkin event が出る（取り寄せは出ない）。再読み込みで更新</small></div>"
+            f"<br><code>{_esc(j.progress or ('(waiting for the previous job of this case)' if j.status == 'queued' else '(no output yet)'))}</code></li>" for j in active)
+            + "</ul><small class='muted'>checkin / open_case の取り寄せ（MCP のジョブ）。同じ案件のジョブは 1 つずつ実行（queued は先行ジョブ待ち）。"
+              "完了すると時系列に checkin event が出る（取り寄せは出ない）。再読み込みで更新</small></div>"
             if active else "")
         causal = "".join(f"<li>{_esc(x.get('symptom', ''))} → {_esc(x.get('component', ''))} → {_esc(x.get('cause', ''))}"
                          f" <small class='muted'>({_esc(x.get('evidence', ''))})</small></li>" for x in c.get("causal", []) if isinstance(x, dict))

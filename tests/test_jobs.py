@@ -205,3 +205,70 @@ def test_checkin_job_marks_checkin_and_appends_event(conf, fake_popen, monkeypat
 
 def test_constants():
     assert jobs_mod.MAX_DONE == 200 and jobs_mod.TTL_SEC == 24 * 3600 and jobs_mod.JOB_STATUSES == ("queued", "running", "done", "failed")
+
+
+# ---------- 同一案件のジョブの直列化（(workspace, case) ごとの FIFO） ----------
+
+def test_same_case_jobs_run_one_at_a_time_in_fifo_order():
+    """同じ案件のジョブは種類を問わず 1 つずつ: checkin 実行中の checkout は queued で待ち、先行が終わってから走る。別案件は並走する。"""
+    table = JobTable()
+    events: list[str] = []
+    gates = {k: threading.Event() for k in ("ci", "co", "ci2", "other")}
+    started = {k: threading.Event() for k in gates}
+
+    def fn(name):
+        def run(progress):
+            events.append(f"start {name}"); started[name].set()
+            assert gates[name].wait(5)
+            events.append(f"end {name}")
+            return name
+        return run
+
+    ci, c1 = table.submit("checkin", "acme", "CASE-1", fn("ci"))
+    assert started["ci"].wait(5) and c1
+    co, c2 = table.submit("checkout", "acme", "CASE-1", fn("co"))       # 同じ案件・別種 → queued
+    other, c3 = table.submit("checkin", "acme", "CASE-2", fn("other"))  # 別案件 → 並走
+    assert c2 and c3 and co.status == "queued" and co.started_at is None and co.elapsed_sec() == 0.0
+    assert started["other"].wait(5) and other.status == "running"
+    time.sleep(0.05)
+    assert not started["co"].is_set() and co.status == "queued"
+    assert co.to_dict()["status"] == "queued" and [j.id for j in table.active("acme", "CASE-1")] == [ci.id, co.id]
+    # queued のジョブも同種の重複起動抑止の対象（既存の queued を返す）
+    co_dup, c4 = table.submit("checkout", "acme", "CASE-1", fn("co"))
+    assert not c4 and co_dup is co
+    # 先行に対しても同種は既存を返す
+    ci_dup, c5 = table.submit("checkin", "acme", "CASE-1", fn("ci"))
+    assert not c5 and ci_dup is ci
+    gates["ci"].set(); _wait(ci)
+    assert ci.status == "done" and started["co"].wait(5) and co.status == "running" and co.started_at
+    gates["co"].set(); _wait(co)
+    gates["other"].set(); _wait(other)
+    assert events[:2] == ["start ci", "start other"] or events[:2] == ["start other", "start ci"]
+    assert events.index("end ci") < events.index("start co") < events.index("end co")
+    assert co.result == "co" and table.active() == []
+    # 先行が failed でも次は走る
+    def boom(progress):
+        started["ci2"].set(); assert gates["ci2"].wait(5); raise RuntimeError("x")
+    f1, _ = table.submit("checkin", "acme", "CASE-1", boom)
+    assert started["ci2"].wait(5)
+    f2, _ = table.submit("checkout", "acme", "CASE-1", lambda p: "after failure")
+    assert f2.status == "queued"
+    gates["ci2"].set(); _wait(f1); _wait(f2)
+    assert f1.status == "failed" and f2.status == "done" and f2.result == "after failure"
+
+
+def test_queue_order_is_fifo_for_three_jobs_and_inline_start_does_not_deadlock(monkeypatch):
+    """3 つ以上でも登録順。テスト用の同期 _start（スレッド無し）でもロックを再入しない。"""
+    table = JobTable()
+    monkeypatch.setattr(JobTable, "_start", lambda self, job, fn: self._run(job, fn))
+    order = []
+    a, _ = table.submit("checkin", "acme", "CASE-1", lambda p: order.append("a"))   # 同期実行なので登録時に終わる
+    assert a.status == "done" and order == ["a"]
+    # 同期実行でも running 中に登録されたものを FIFO で流す: _run の中から submit する
+    def outer(p):
+        order.append("outer")
+        table.submit("checkout", "acme", "CASE-1", lambda q: order.append("q1"))
+        table.submit("bag2zst", "acme", "CASE-1", lambda q: order.append("q2"))
+        assert [j.status for j in table.active("acme", "CASE-1")][1:] == ["queued", "queued"]
+    b, _ = table.submit("checkin", "acme", "CASE-1", outer)
+    assert order == ["a", "outer", "q1", "q2"] and table.active() == []

@@ -197,13 +197,14 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
             raise _fail(e) from e
         agent_name = _agent(agent)
         job, created = jobs.submit("checkin", ws.name, case, lambda progress: sync.checkin_job(conf, ws, case, agent_name, progress))
-        note = ("checkin started in the background; poll job_status(job_id) until status is done (or failed: see error)"
+        note = (("checkin queued behind another job for this case (jobs for one case run one at a time); poll job_status(job_id) until status is done (or failed: see error)"
+                 if job.status == "queued" else "checkin started in the background; poll job_status(job_id) until status is done (or failed: see error)")
                 if created else "a checkin for this case is already running; poll job_status(job_id) for that one")
         return {"job_id": job.id, "status": job.status, "note": note}
 
     @mcp.tool()
     def job_status(job_id: str) -> dict[str, Any]:
-        """ジョブ（checkin / open_case の取り寄せ）の状態: {job_id, kind, case, status: queued|running|done|failed, progress, elapsed_sec, result, error}。done なら result に従来の結果（checkin: ok / rclone / last_checkin_at）。ジョブ表はサーバーのメモリ内（再起動で消える）。"""
+        """ジョブ（checkin / open_case の取り寄せ）の状態: {job_id, kind, case, status: queued|running|done|failed, progress, elapsed_sec, result, error}。queued は同じ案件の先行ジョブ待ち（同一案件のジョブは 1 つずつ実行）。done なら result に従来の結果（checkin: ok / rclone / last_checkin_at）。ジョブ表はサーバーのメモリ内（再起動で消える）。"""
         job = jobs.get(job_id)
         if job is None:
             raise ToolError(f"unknown job {job_id!r} (jobs live in the server's memory: finished ones are dropped after 24h / 200 entries, "

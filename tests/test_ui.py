@@ -192,3 +192,24 @@ def test_settings_page_shows_and_edits_rules(conf):
     # CSRF: 他サイトからの POST は 403（既存の same_origin）
     r = c.post("/ui/settings/set", data={"key": "bwlimit", "value": "off"}, headers={"Origin": "http://evil.example"}, follow_redirects=False)
     assert r.status_code == 403 and cfg.load(conf.path).rules["bwlimit"] == "4M"
+
+
+def test_case_page_shows_queued_jobs(conf):
+    """同じ案件の先行ジョブを待つ queued のジョブも進行中の表示に出る（status: queued、先行待ちの注記）。"""
+    import threading
+    _seed(conf)
+    jobs = JobTable()
+    c = TestClient(build_ui(conf, jobs=jobs))
+    started = threading.Event(); release = threading.Event()
+
+    def fn(progress):
+        started.set(); release.wait(5)
+    first, _ = jobs.submit("checkin", "acme", "CASE-123", fn)
+    assert started.wait(5)
+    second, _ = jobs.submit("checkout", "acme", "CASE-123", lambda p: None)
+    assert second.status == "queued"
+    page = c.get("/ui/acme/CASE-123").text
+    assert "<b>checkin</b>" in page and "running" in page and first.id in page
+    assert "<b>checkout</b>" in page and "queued" in page and second.id in page and "waiting for the previous job" in page
+    release.set(); first.wait(5); second.wait(5)
+    assert "進行中のジョブ" not in c.get("/ui/acme/CASE-123").text
