@@ -12,6 +12,12 @@ from kairn import config as cfg
 from kairn import sync
 
 
+@pytest.fixture(autouse=True)
+def _state_home(tmp_path: Path, monkeypatch):
+    """ワークスペース非依存の状態置き場（manifest のロックファイル等）を一時ディレクトリに向ける（実 ~/.local/state/kairn に触れない）。"""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
 @pytest.fixture
 def conf(tmp_path: Path) -> cfg.Config:
     """一時ディレクトリに閉じた設定: ワークスペース acme、remote my-drive（架空）。"""

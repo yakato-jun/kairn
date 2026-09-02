@@ -10,13 +10,15 @@
                          案件単位は rclone sync（削除・Drive 側の新しい版は _deleted/<日付>/ へ退避）、
                          ワークスペース全体（daily）は rclone copy（ローカルに無い案件ディレクトリを Drive から消さない。
                          上書きされる Drive 側の版は同じく _deleted/ へ）。転送後にワークスペースの manifest.json を更新する
-                         （update_manifest: rclone cat → 当該案件のエントリを書き換え → rclone rcat）。転送に失敗したら
-                         版マーカーは書く前の内容に戻す
+                         （update_manifest: ホスト内ロック → rclone cat → 当該案件のエントリを書き換え → rclone rcat）。転送に
+                         失敗したら版マーカーは書く前の内容に戻す
 - manifest.json:         <remote>:<root>/<ws>/manifest.json = {"cases": {"<case>": {"rev", "checked_in_at", "from"}}, "updated_at"}。
                          open_case（kairn/server.py）は rclone cat 1 回（MANIFEST_TIMEOUT_SEC）で当該案件の rev を見て、ローカルの
                          case.json.rev と同じなら取り寄せを省略する。直近に取得した内容は index/manifest.cache.json に置き、
-                         list_cases / UI 一覧の印（drive_state）に使う。同時 checkin の競合は「後勝ち」（案件ごとの独立エントリなので
-                         影響は当該案件のみ）
+                         list_cases / UI 一覧の印（drive_state）に使う。同一ホスト内の同時更新（serve のジョブと CLI の checkin、
+                         serve 内の別スレッド）は $XDG_STATE_HOME/kairn/locks/<ws>.manifest.lock への flock で直列化する
+                         （manifest_lock。読むのはロック取得後）。別ホスト間の競合は「後勝ち」（案件ごとの独立エントリなので影響は
+                         当該案件のみ）
 - checkin_job(ws, case, agent): MCP の checkin ジョブ本体（checkin → checkin event）。kairn/jobs.py のスレッドで走る
 - merge_events(local_path, remote_lines): 行の文字列一致で重複除去した和集合を `t` で安定ソートし、内容が変わる時だけ書き戻す
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
@@ -36,7 +38,9 @@ checkout / checkin は progress コールバック（1 行ずつ）を受け取�
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
+import fcntl
 import fnmatch
 import json
 import os
@@ -50,6 +54,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .config import Config, Workspace
+from .service import state_dir
 from .store import CaseStore, _atomic_write, new_rev, now_iso, parse_iso, validate_case_id
 
 
@@ -186,6 +191,46 @@ def merge_case_events(conf: Config, ws: Workspace, case: str) -> bool:
 MANIFEST_NAME = "manifest.json"
 MANIFEST_CACHE_NAME = "manifest.cache.json"
 MANIFEST_TIMEOUT_SEC = 10   # open_case が rclone cat を待つ上限秒（越えたら manifest unavailable としてローカルを返す）
+MANIFEST_LOCK_TIMEOUT_SEC = 60   # manifest の cat → rcat 区間のホスト内ロックを待つ上限秒（越えたら ManifestLockTimeout）
+MANIFEST_LOCK_POLL_SEC = 0.1
+
+
+class ManifestLockTimeout(RcloneError):
+    """manifest のロック待ちが MANIFEST_LOCK_TIMEOUT_SEC を超えた（RcloneError の一種: checkin は「転送は済んだが manifest 更新失敗」にする）。"""
+
+
+def manifest_lock_path(ws: Workspace) -> Path:
+    """ワークスペースごとのロックファイル（$XDG_STATE_HOME/kairn/locks/<ws>.manifest.lock。ローカルのみ）。"""
+    return state_dir() / "locks" / f"{ws.name}.manifest.lock"
+
+
+@contextlib.contextmanager
+def manifest_lock(ws: Workspace, timeout: float | None = None):
+    """manifest.json の read-modify-write（cat → 書き換え → rcat）を同一ホスト内で直列化する fcntl.flock(LOCK_EX)。
+    flock は open ごとの別 fd 間でも排他になるので、別プロセス（CLI の checkin と serve のジョブ）も serve 内の別スレッドも
+    同じロックで並ぶ。LOCK_NB で MANIFEST_LOCK_POLL_SEC ごとに再試行し、timeout（既定 MANIFEST_LOCK_TIMEOUT_SEC）を超えたら
+    ManifestLockTimeout。ロックファイルは消さない（unlink すると後続が別の inode を掴んで排他が壊れる）。"""
+    if timeout is None:
+        timeout = MANIFEST_LOCK_TIMEOUT_SEC
+    path = manifest_lock_path(ws)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ManifestLockTimeout(f"manifest lock {path} not acquired within {timeout:g}s (another checkin or manifest rebuild is holding it)") from None
+                time.sleep(MANIFEST_LOCK_POLL_SEC)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def manifest_drive_path(conf: Config, ws: Workspace) -> str:
@@ -250,13 +295,16 @@ def refresh_manifest(conf: Config, ws: Workspace, timeout: float = MANIFEST_TIME
 
 
 def update_manifest(conf: Config, ws: Workspace, entries: dict[str, dict]) -> dict:
-    """checkin 後: Drive の manifest を読み（取得できなければ新規作成）、渡された案件のエントリを書き換えて rcat で書き戻す。
-    同時 checkin は「後勝ち」（他案件のエントリには触れないので影響は当該案件のみ）。キャッシュも更新する。"""
-    m = fetch_manifest(conf, ws) or {"cases": {}}
-    m["cases"].update(entries)
-    m["updated_at"] = now_iso()
-    write_manifest(conf, ws, m)
-    save_manifest_cache(ws, m)
+    """checkin 後: ホスト内ロック（manifest_lock）を取ってから Drive の manifest を読み（取得できなければ新規作成）、渡された案件の
+    エントリを書き換えて rcat で書き戻す。読むのは必ずロック取得後（ロック前に読んだ値で書き戻すと、待っている間に他が書いた
+    エントリを消す）。同一ホストの同時 checkin はこのロックで直列化され、別ホスト間は「後勝ち」（他案件のエントリには触れないので
+    影響は当該案件のみ）。ロック待ちの上限は MANIFEST_LOCK_TIMEOUT_SEC（超えたら ManifestLockTimeout）。キャッシュも更新する。"""
+    with manifest_lock(ws):
+        m = fetch_manifest(conf, ws) or {"cases": {}}
+        m["cases"].update(entries)
+        m["updated_at"] = now_iso()
+        write_manifest(conf, ws, m)
+        save_manifest_cache(ws, m)
     return m
 
 
@@ -299,7 +347,14 @@ def manifest_rebuild(conf: Config, ws: Workspace, dry: bool = False) -> dict:
     それらから manifest.json を作り直す。ローカルに同じ案件があり rev が無い／違う場合はローカルの case.json にも同じ rev を書く
     （未 checkin のローカル変更がある案件、last_checkin_at の無い案件はそのまま local_skipped に列挙）。dry では何も書かない。
     返り値: {dry, manifest, cases: {case: {rev, rev_assigned, checked_in_at, checked_in_at_assigned, remote: same|updated, local: absent|same|updated|skipped}},
-             errors: {case: reason}, local_skipped: [case]}"""
+             errors: {case: reason}, local_skipped: [case]}
+    dry でなければ列挙から manifest の書き戻しまでをホスト内ロック（manifest_lock）の中で行う（同じホストの checkin の
+    manifest 更新と交錯させない。その間の checkin はロック待ちになる）。"""
+    with (contextlib.nullcontext() if dry else manifest_lock(ws)):
+        return _manifest_rebuild_locked(conf, ws, dry)
+
+
+def _manifest_rebuild_locked(conf: Config, ws: Workspace, dry: bool) -> dict:
     base = conf.drive_path(ws.name, "cases")
     r = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--format", "pt", "--separator", "\t", "--max-depth", "2",
                         "--include", "/*/case.json", base, *_flags(conf)], capture_output=True, text=True)
@@ -438,7 +493,8 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     case 指定は `rclone sync`（案件内の削除を追従）、ワークスペース全体は `rclone copy`
     （ローカルに無い案件ディレクトリは消してよい＝Drive から削除しない。README 原則 2）。どちらも上書きされる Drive 側の版は
     `_deleted/<日付>/` に退避する（--backup-dir）。転送が失敗したら版マーカーは書く前の内容（mtime も）に戻す。
-    転送後に manifest.json の当該案件のエントリを更新する（update_manifest。失敗は RcloneError: 転送は済んでいる）。
+    転送後に manifest.json の当該案件のエントリを更新する（update_manifest。失敗（ロック待ちタイムアウトを含む）は
+    RcloneError「transferred, but manifest update failed」: 転送は済んでいて、次の checkin が manifest を更新する）。
     dry ではマージも版マーカーも書かない。progress は転送本体の出力を行単位に受け取る（checkout と同じ）。"""
     src = ws.cases_dir / case if case else ws.cases_dir
     if not src.exists():

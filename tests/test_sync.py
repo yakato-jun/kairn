@@ -757,6 +757,120 @@ def test_drive_state(conf, fake):
     os.utime(ws.cases_dir / "CASE-1" / "worklog.md", None)
 
 
+# ---------- manifest の同時更新（ホスト内ロック） ----------
+
+class SlowCatRun(FakeRun):
+    """cat の応答を遅らせる FakeRun（read-modify-write の競合窓を広げる）。"""
+
+    def __init__(self, rules, delay: float = 0.05, **kw):
+        super().__init__(rules, **kw)
+        self.delay = delay
+
+    def __call__(self, cmd, **kw):
+        if cmd[:2] == ["rclone", "cat"]:
+            time.sleep(self.delay)
+        return super().__call__(cmd, **kw)
+
+
+def _entries(*ids: str) -> dict[str, dict]:
+    return {cid: {"rev": f"rev-{cid}", "checked_in_at": "2026-08-01T00:00:00+09:00", "from": "host-a"} for cid in ids}
+
+
+def test_update_manifest_parallel_keeps_every_entry(conf, monkeypatch):
+    """別案件の update_manifest を 4 スレッドで同時に呼んでも全エントリが残る（ロックで cat → rcat が直列化される）。
+    ロックファイルは $XDG_STATE_HOME/kairn/locks/<ws>.manifest.lock。"""
+    import threading
+    ws = conf.workspaces["acme"]
+    f = SlowCatRun(sync.raw_rules(conf)); f.manifest = {"cases": {"CASE-0": {"rev": "keep"}}, "updated_at": "x"}
+    monkeypatch.setattr(subprocess, "run", f)
+    ids = [f"CASE-{i}" for i in range(1, 5)]
+    errors: list[BaseException] = []
+
+    def go(cid):
+        try:
+            sync.update_manifest(conf, ws, _entries(cid))
+        except BaseException as e:
+            errors.append(e)
+    ts = [threading.Thread(target=go, args=(cid,)) for cid in ids]
+    for t in ts: t.start()
+    for t in ts: t.join(10)
+    assert errors == [] and set(f.manifest["cases"]) == {"CASE-0", *ids} and f.manifest["cases"]["CASE-0"] == {"rev": "keep"}
+    assert [c[1] for c in f.calls] == ["cat", "rcat"] * 4    # 交錯しない
+    assert sync.manifest_lock_path(ws) == Path(os.environ["XDG_STATE_HOME"]) / "kairn" / "locks" / "acme.manifest.lock"
+    assert sync.manifest_lock_path(ws).exists()
+
+
+def test_update_manifest_reads_only_after_lock(conf, fake):
+    """ロックが他に握られている間は cat しない（ロック取得後に読み直す）。解放後に cat → rcat。"""
+    import threading
+    ws = conf.workspaces["acme"]
+    fake.manifest = {"cases": {"CASE-0": {"rev": "keep"}}}
+    done = threading.Event()
+
+    def go():
+        sync.update_manifest(conf, ws, _entries("CASE-1"))
+        done.set()
+    with sync.manifest_lock(ws):
+        t = threading.Thread(target=go); t.start()
+        time.sleep(0.4)
+        assert fake.calls == [] and not done.is_set()
+        fake.manifest = {"cases": {"CASE-0": {"rev": "keep"}, "CASE-2": {"rev": "written while waiting"}}}
+    assert done.wait(5) and [c[1] for c in fake.calls] == ["cat", "rcat"]
+    assert set(fake.manifest["cases"]) == {"CASE-0", "CASE-1", "CASE-2"}    # ロック前の値ではなく待った後の値に足す
+
+
+def test_manifest_lock_timeout_is_recorded_in_checkin_result(conf, fake, monkeypatch):
+    """ロック待ちが上限を超えたら ManifestLockTimeout（RcloneError）。checkin は「転送は済んだが manifest 更新失敗」として返し、
+    版マーカーは残す。ジョブ経路（checkin_job。転送は Popen）では job.error に残る。"""
+    from kairn.jobs import JobTable
+    from tests.test_jobs import FakePopen
+    FakePopen.calls = []; FakePopen.rc = 0
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(sync, "MANIFEST_LOCK_TIMEOUT_SEC", 0.3)
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    with sync.manifest_lock(ws):
+        t0 = time.monotonic()
+        with pytest.raises(sync.RcloneError, match=r"transferred, but manifest update failed \(manifest lock .*not acquired within 0.3s"):
+            sync.checkin(conf, ws, "CASE-1")
+        assert 0.3 <= time.monotonic() - t0 < 5
+        assert [c[1] for c in fake.calls] == ["copyto", "sync"] and fake.manifest is None    # cat / rcat は呼ばない
+        assert st.load_case("CASE-1")["rev"] and st.load_case("CASE-1")["last_checkin_at"]
+        table = JobTable()
+        job, _ = table.submit("checkin", ws.name, "CASE-1", lambda p: sync.checkin_job(conf, ws, "CASE-1", "test-agent", p))
+        assert job.wait(5) and job.status == "failed" and "manifest update failed" in job.error and "manifest lock" in job.error
+        with pytest.raises(sync.ManifestLockTimeout):
+            with sync.manifest_lock(ws, timeout=0.1):
+                pass
+    # 解放後は通る
+    fake.calls.clear()
+    sync.checkin(conf, ws, "CASE-1")
+    assert [c[1] for c in fake.calls] == ["copyto", "sync", "cat", "rcat"] and set(fake.manifest["cases"]) == {"CASE-1"}
+
+
+def test_manifest_rebuild_holds_lock(conf, fake):
+    """manifest_rebuild（dry でない）は列挙〜書き戻しをロックの中で行う。dry はロックを取らない。"""
+    ws = conf.workspaces["acme"]
+    fake.remote_cases = {"CASE-1": {"id": "CASE-1", "title": "t", "rev": "r1", "last_checkin_at": "2026-08-01T00:00:00+09:00"}}
+    seen = {}
+    orig = sync.write_manifest
+
+    def probe(conf_, ws_, manifest):
+        try:
+            with sync.manifest_lock(ws_, timeout=0.1):
+                seen["locked_during_write"] = False
+        except sync.ManifestLockTimeout:
+            seen["locked_during_write"] = True
+        return orig(conf_, ws_, manifest)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sync, "write_manifest", probe)
+        sync.manifest_rebuild(conf, ws)
+    assert seen == {"locked_during_write": True} and set(fake.manifest["cases"]) == {"CASE-1"}
+    with sync.manifest_lock(ws):
+        assert sync.manifest_rebuild(conf, ws, dry=True)["cases"]["CASE-1"]["rev"] == "r1"     # dry は待たない
+
+
 # ---------- manifest rebuild（既存 Drive データの移行） ----------
 
 def test_manifest_rebuild_assigns_rev_and_aligns_local(conf, fake):

@@ -49,7 +49,8 @@ def _post(url: str, data: dict) -> int:
 def env(tmp_path, fake_rclone):
     config = tmp_path / "config.yaml"
     config.write_text("drive: {remote: my-drive, root: ws}\nextract: {agent: claude}\nworkspaces:\n  acme: {description: e2e, repos: []}\n", encoding="utf-8")
-    return with_fake_rclone_env(fake_rclone, KAIRN_CONFIG=str(config), KAIRN_DATA_ROOT=str(tmp_path / "data"))
+    return with_fake_rclone_env(fake_rclone, KAIRN_CONFIG=str(config), KAIRN_DATA_ROOT=str(tmp_path / "data"),
+                                XDG_STATE_HOME=str(tmp_path / "state"))
 
 
 def _cli(env, *args, **kw):
