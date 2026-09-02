@@ -25,3 +25,8 @@ kairn = "kairn.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+# データ領域（workspaces/）を絶対に収集しない
+testpaths = ["tests"]
+norecursedirs = ["workspaces", ".venv", "build", "dist"]
