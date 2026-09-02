@@ -12,11 +12,17 @@ open_case の取り寄せは、先に Drive の manifest.json（rclone cat 1 回
 停止（SIGTERM / SIGINT）: MCP クライアントが streamable HTTP のセッション（SSE）を張ったままだと uvicorn の graceful shutdown が
 接続の終了を待ち続け systemd の停止タイムアウトに当たるので、開いている接続は最大 GRACEFUL_SHUTDOWN_SEC 秒しか待たない。
 受信時に running のジョブがあれば一覧をログに 1 行出す（ジョブ表はメモリ内。整合は次回の checkin / checkout に任せる）。
+さらにデーモンスレッドのウォッチドッグ（start_shutdown_watchdog）を起動し、GRACEFUL_SHUTDOWN_SEC + SHUTDOWN_WATCHDOG_EXTRA_SEC 秒
+経ってもプロセスが残っていれば（同期ツールハンドラの実行中など、uvicorn の停止が終わらない場合）running ジョブを出して os._exit(0) する
+（systemd の TimeoutStopSec=15 で SIGKILL されるのを待たない）。
 """
 from __future__ import annotations
 
 import contextlib
-from collections.abc import AsyncIterator
+import os
+import threading
+import time
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -38,6 +44,7 @@ INSTRUCTIONS = (
 MCP_PATH = "/mcp"
 UI_PATH = "/ui"
 GRACEFUL_SHUTDOWN_SEC = 5   # SIGTERM 後、開いている接続（MCP の SSE 等）を待つ上限秒。systemd の TimeoutStopSec（15）より短くする
+SHUTDOWN_WATCHDOG_EXTRA_SEC = 2   # graceful shutdown の上限からさらにこれだけ待ってもプロセスが残っていれば os._exit(0)
 FETCH_WAIT_SEC = 20         # open_case が取り寄せジョブの完了を待つ上限秒（間に合えば取り寄せ後の内容を返す。越えたらローカル写し＋job_id）
 
 
@@ -323,9 +330,28 @@ def log_running_jobs(jobs: JobTable, sig: int, out=print) -> None:
         flush=True)
 
 
+def start_shutdown_watchdog(jobs: JobTable, sig: int, delay: float = GRACEFUL_SHUTDOWN_SEC + SHUTDOWN_WATCHDOG_EXTRA_SEC,
+                            exit_fn: Callable[[int], Any] = os._exit, out=print, sleep: Callable[[float], Any] = time.sleep) -> threading.Thread:
+    """停止シグナルの後、delay 秒待ってもプロセスが残っていれば running ジョブの一覧をログに出して exit_fn(0)（既定 os._exit）。
+    デーモンスレッドなので、uvicorn が先に正常終了すれば何もしない。同期ツールハンドラ（anyio.to_thread のワーカー）が走っていて
+    uvicorn の graceful shutdown が終わらない場合でも systemd の TimeoutStopSec（15 秒）を待たずに落とす。返り値: 起動したスレッド。"""
+    def run() -> None:
+        sleep(delay)
+        running = jobs.running_snapshot()
+        items = ", ".join(f"{j.kind} {j.workspace}/{j.case} ({j.elapsed_sec():.0f}s, {j.id})" for j in running) or "none"
+        out(f"kairn: still running {delay:g}s after signal {sig} (graceful shutdown did not finish): forcing exit with os._exit(0). "
+            f"running job(s): {items}. jobs are not persisted; a checkin/checkout cut short here is reconciled by the next checkin/checkout of that case",
+            flush=True)
+        exit_fn(0)
+    t = threading.Thread(target=run, name="kairn-shutdown-watchdog", daemon=True)
+    t.start()
+    return t
+
+
 def serve(conf: cfg.Config, host: str = "127.0.0.1", port: int = 8765):
     """uvicorn で app を動かす（ブロックする）。停止シグナルでは開いている接続を最大 GRACEFUL_SHUTDOWN_SEC 秒しか待たず、
-    running のジョブがあればログに出す。uvicorn.run は内部で Server を作りハンドラを差し込めないので Config + Server を直接使う。
+    running のジョブがあればログに出し、ウォッチドッグ（start_shutdown_watchdog。最初のシグナルで 1 回だけ）を起動する。
+    uvicorn.run は内部で Server を作りハンドラを差し込めないので Config + Server を直接使う。
     返り値は uvicorn.Server（テストが引数と handle_exit を確かめる用）。"""
     import uvicorn
     app = build_app(conf, host)
@@ -333,9 +359,12 @@ def serve(conf: cfg.Config, host: str = "127.0.0.1", port: int = 8765):
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning",
                                            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SEC))
     uvicorn_exit = server.handle_exit
+    watchdog: dict[str, threading.Thread] = {}
 
     def handle_exit(sig, frame) -> None:
         log_running_jobs(app.state.jobs, sig)
+        if "thread" not in watchdog:
+            watchdog["thread"] = start_shutdown_watchdog(app.state.jobs, sig)
         uvicorn_exit(sig, frame)
 
     server.handle_exit = handle_exit   # capture_signals は signal.signal(sig, self.handle_exit) なのでインスタンス属性で差し替わる

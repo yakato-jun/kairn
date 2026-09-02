@@ -4,6 +4,7 @@ open_case は manifest の rev がローカルと違うときだけ取り寄せ�
 from __future__ import annotations
 
 import threading
+import time
 
 import anyio
 import pytest
@@ -721,6 +722,8 @@ def test_serve_limits_graceful_shutdown_and_logs_running_jobs_on_signal(conf, mo
             created["ran"] = True
 
     monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    watchdogs = []
+    monkeypatch.setattr(srv, "start_shutdown_watchdog", lambda jobs, sig, **kw: watchdogs.append((jobs, sig)))
     server = srv.serve(conf, host="127.0.0.1", port=1)
     config = created["config"]
     assert isinstance(config, uvicorn.Config) and created["ran"] is True
@@ -751,6 +754,41 @@ def test_serve_limits_graceful_shutdown_and_logs_running_jobs_on_signal(conf, mo
     finally:
         release.set()
     assert job.wait(5) and queued.wait(5)
-    # running が無ければ何も出さない
+    # running が無ければ何も出さない。ウォッチドッグは最初のシグナルで 1 回だけ起動する
     server.handle_exit(signal.SIGTERM, None)
     assert "running job" not in capsys.readouterr().out and server.exits == [signal.SIGTERM, signal.SIGTERM]
+    assert watchdogs == [(jobs, signal.SIGTERM)]
+
+
+def test_shutdown_watchdog_forces_exit_after_delay():
+    """ウォッチドッグ: delay 秒（既定 GRACEFUL_SHUTDOWN_SEC + 2 = 7）待ってからも呼ばれる＝プロセスが残っていれば、running ジョブを
+    1 行出して os._exit(0)（モック）を呼ぶ。待っている間は何もしない。デーモンスレッド。"""
+    import signal
+    assert srv.SHUTDOWN_WATCHDOG_EXTRA_SEC == 2 and srv.GRACEFUL_SHUTDOWN_SEC + srv.SHUTDOWN_WATCHDOG_EXTRA_SEC == 7
+    jobs = JobTable()
+    release = threading.Event(); started = threading.Event()
+
+    def blocking(progress):
+        started.set(); release.wait(5)
+    job, _ = jobs.submit("checkout", "acme", "CASE-123", blocking)
+    assert started.wait(5)
+    exits: list[int] = []; lines: list[str] = []; slept: list[float] = []
+    gate = threading.Event()
+
+    def sleep(sec):
+        slept.append(sec); assert gate.wait(5)
+    t = srv.start_shutdown_watchdog(jobs, signal.SIGTERM, delay=7, exit_fn=exits.append, out=lambda msg, **kw: lines.append(msg), sleep=sleep)
+    assert t.daemon and t.name == "kairn-shutdown-watchdog"
+    time.sleep(0.05)
+    assert exits == [] and lines == [] and slept == [7]           # 待っている間は落とさない
+    gate.set(); t.join(5)
+    assert exits == [0] and len(lines) == 1
+    assert "still running 7s after signal 15" in lines[0] and "forcing exit" in lines[0] and f"checkout acme/CASE-123 (" in lines[0] and job.id in lines[0]
+    release.set(); job.wait(5)
+    # running が無ければ none と出して落とす。既定の exit_fn は os._exit
+    gate2 = threading.Event(); exits2: list[int] = []; lines2: list[str] = []
+    t2 = srv.start_shutdown_watchdog(jobs, signal.SIGINT, delay=0, exit_fn=exits2.append, out=lambda msg, **kw: lines2.append(msg), sleep=lambda s: gate2.wait(5))
+    gate2.set(); t2.join(5)
+    assert exits2 == [0] and "running job(s): none" in lines2[0]
+    import inspect, os
+    assert inspect.signature(srv.start_shutdown_watchdog).parameters["exit_fn"].default is os._exit
