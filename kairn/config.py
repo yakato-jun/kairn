@@ -7,7 +7,8 @@
               未知のキー・空文字は拒否）。repos は「cwd がどのワークスペースに属するか」を決めるためだけの対応表で、
               リポジトリ側には何も作らない（案件は DATA_ROOT/<name>/cases/ にだけある）
   serve:      {host: 127.0.0.1, port: 8765}               kairn install-service が書く。kairn ensure が /mcp の応答確認と起動に使う
-  rules:      同期・退避規則（既定値あり）
+  rules:      同期・退避規則（既定値あり）。kairn rules set / add-exclude / remove-exclude / add-raw-ext / remove-raw-ext
+              （または UI の /ui/settings）が書く（set_rule / add_exclude / … → Config.save()。他のキーは壊さない）
 
 規則:
 - drive.remote が無ければ起動しない。設定済みの remote 以外は決して使わない。
@@ -16,6 +17,7 @@
 """
 from __future__ import annotations
 
+import copy
 import glob as _glob
 import os
 import subprocess
@@ -132,6 +134,116 @@ class Config:
         tmp.write_text("# kairn 環境ローカル設定。kairn のコマンドが書く（手で編集しない・コミットしない）\n"
                        + yaml.safe_dump(self.to_dict(), allow_unicode=True, sort_keys=False), encoding="utf-8")
         os.replace(tmp, self.path)
+
+
+# ---------------------------------------------------------------------------
+# rules の編集（kairn rules … / UI の設定ページ）。値は検証し、不正なら ValueError（保存しない）
+# ---------------------------------------------------------------------------
+
+RULE_KEYS = ("raw_data.min_size", "raw_data.min_age", "bag_to_zst", "bwlimit")
+_TRUE = ("true", "yes", "on", "1")
+_FALSE = ("false", "no", "off", "0")
+
+
+def _rules_mut(conf: Config) -> dict:
+    """編集用に rules を深いコピーにしてから返す（DEFAULT_RULES や他の Config と入れ子のリストを共有しない）。"""
+    conf.rules = copy.deepcopy(conf.rules)
+    conf.rules.setdefault("exclude", [])
+    conf.rules.setdefault("raw_data", {}).setdefault("extensions", [])
+    return conf.rules
+
+
+def rules_view(conf: Config) -> dict:
+    """表示用: {raw_data.min_size, raw_data.min_age, bag_to_zst, bwlimit, exclude: [...], raw_data.extensions: [...]}"""
+    raw = conf.rules.get("raw_data") or {}
+    return {"raw_data.min_size": raw.get("min_size"), "raw_data.min_age": raw.get("min_age"),
+            "bag_to_zst": bool(conf.rules.get("bag_to_zst", True)), "bwlimit": conf.rules.get("bwlimit"),
+            "exclude": list(conf.rules.get("exclude") or []), "raw_data.extensions": list(raw.get("extensions") or [])}
+
+
+def set_rule(conf: Config, key: str, value: str) -> object:
+    """rules の単一値を検証して書き、保存する。返り値は保存した値。
+    raw_data.min_size: rclone の SizeSuffix（50M 等）、raw_data.min_age: Duration（14d 等）、bag_to_zst: true/false、
+    bwlimit: rclone の --bwlimit 表記（'off' は制限なし＝キーを消す）。"""
+    from . import sync  # 循環 import を避ける（sync が config を読む）
+    if key not in RULE_KEYS:
+        raise ValueError(f"unknown rule {key!r} (expected one of {', '.join(RULE_KEYS)})")
+    v = str(value).strip()
+    if not v:
+        raise ValueError(f"{key}: value is required")
+    rules = _rules_mut(conf)
+    if key == "raw_data.min_size":
+        sync.parse_size(v); rules["raw_data"]["min_size"] = v; out = v
+    elif key == "raw_data.min_age":
+        sync.parse_age(v); rules["raw_data"]["min_age"] = v; out = v
+    elif key == "bag_to_zst":
+        if v.lower() in _TRUE:
+            out = True
+        elif v.lower() in _FALSE:
+            out = False
+        else:
+            raise ValueError(f"bag_to_zst: expected true or false, got {v!r}")
+        rules["bag_to_zst"] = out
+    else:  # bwlimit
+        out = sync.parse_bwlimit(v)
+        if out == "off":
+            rules.pop("bwlimit", None); out = None
+        else:
+            rules["bwlimit"] = out
+    conf.save()
+    return out
+
+
+def _pattern(v: str, what: str) -> str:
+    v = str(v).strip()
+    if not v or any(ch.isspace() for ch in v):
+        raise ValueError(f"{what}: must be a non-empty string without whitespace, got {v!r}")
+    return v
+
+
+def add_exclude(conf: Config, pattern: str) -> bool:
+    """rules.exclude にパターンを足して保存する。既にあれば何もしない（返り値 False）。"""
+    pat = _pattern(pattern, "exclude pattern")
+    rules = _rules_mut(conf)
+    if pat in rules["exclude"]:
+        return False
+    rules["exclude"].append(pat); conf.save()
+    return True
+
+
+def remove_exclude(conf: Config, pattern: str) -> None:
+    """rules.exclude からパターンを外して保存する。無ければ ValueError。"""
+    pat = _pattern(pattern, "exclude pattern")
+    rules = _rules_mut(conf)
+    if pat not in rules["exclude"]:
+        raise ValueError(f"exclude pattern {pat!r} is not set (have: {rules['exclude']})")
+    rules["exclude"].remove(pat); conf.save()
+
+
+def _ext(v: str) -> str:
+    e = _pattern(v, "extension").lstrip(".").lower()
+    if not e or "/" in e or "*" in e:
+        raise ValueError(f"extension: expected e.g. bag or .bag, got {v!r}")
+    return e
+
+
+def add_raw_ext(conf: Config, ext: str) -> bool:
+    """rules.raw_data.extensions に拡張子（先頭の . は外す・小文字）を足して保存する。既にあれば何もしない（返り値 False）。"""
+    e = _ext(ext)
+    rules = _rules_mut(conf)
+    if e in rules["raw_data"]["extensions"]:
+        return False
+    rules["raw_data"]["extensions"].append(e); conf.save()
+    return True
+
+
+def remove_raw_ext(conf: Config, ext: str) -> None:
+    """rules.raw_data.extensions から拡張子を外して保存する。無ければ ValueError。"""
+    e = _ext(ext)
+    rules = _rules_mut(conf)
+    if e not in rules["raw_data"]["extensions"]:
+        raise ValueError(f"extension {e!r} is not set (have: {rules['raw_data']['extensions']})")
+    rules["raw_data"]["extensions"].remove(e); conf.save()
 
 
 def _expand_repo_spec(spec, ws_name: str) -> list[Path]:

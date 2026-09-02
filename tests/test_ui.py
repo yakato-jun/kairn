@@ -162,3 +162,33 @@ def test_case_page_shows_running_jobs(conf):
     release.set(); job.wait(5); other.wait(5)
     assert "進行中のジョブ" not in c.get("/ui/acme/CASE-123").text
     assert "進行中のジョブ" not in TestClient(build_ui(conf)).get("/ui/acme/CASE-123").text  # jobs 無し（UI 単体）でも動く
+
+
+def test_settings_page_shows_and_edits_rules(conf):
+    """/ui/settings: rules の現在値を表示し、フォームの POST で検証・保存する（CLI の kairn rules と同じ操作）。一覧のヘッダにリンク。"""
+    from kairn import config as cfg
+    c = TestClient(build_ui(conf))
+    assert "href='/ui/settings'" in c.get("/ui").text
+    page = c.get("/ui/settings").text
+    assert "raw_data.min_size" in page and "50M" in page and "14d" in page and "target/**" in page and "<code>bag</code>" in page and str(conf.path) in page
+    r = c.post("/ui/settings/set", data={"key": "raw_data.min_size", "value": "10M"}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"].startswith("/ui/settings?saved=")
+    assert cfg.load(conf.path).rules["raw_data"]["min_size"] == "10M"                       # 保存後の再読込
+    page = c.get(r.headers["location"]).text
+    assert "raw_data.min_size = 10M" in page and "value='10M'" in page
+    assert c.post("/ui/settings/set", data={"key": "raw_data.min_age", "value": "later"}, follow_redirects=False).status_code == 400
+    assert c.post("/ui/settings/set", data={"key": "nope", "value": "1"}, follow_redirects=False).status_code == 400
+    assert cfg.load(conf.path).rules["raw_data"]["min_age"] == "14d"                        # 不正な値は保存しない
+    assert c.post("/ui/settings/add-exclude", data={"pattern": "logs/**"}, follow_redirects=False).status_code == 303
+    assert "<code>logs/**</code>" in c.get("/ui/settings").text and "logs/**" in cfg.load(conf.path).rules["exclude"]
+    assert c.post("/ui/settings/remove-exclude", data={"pattern": "logs/**"}, follow_redirects=False).status_code == 303
+    assert c.post("/ui/settings/remove-exclude", data={"pattern": "logs/**"}, follow_redirects=False).status_code == 400
+    assert c.post("/ui/settings/add-raw-ext", data={"ext": ".mcap"}, follow_redirects=False).status_code == 303
+    assert "mcap" in cfg.load(conf.path).rules["raw_data"]["extensions"]
+    assert c.post("/ui/settings/remove-raw-ext", data={"ext": "mcap"}, follow_redirects=False).status_code == 303
+    assert c.post("/ui/settings/set", data={"key": "bwlimit", "value": "4M"}, follow_redirects=False).status_code == 303
+    assert cfg.load(conf.path).rules["bwlimit"] == "4M" and conf.rules["bwlimit"] == "4M"     # 実行中のプロセスの conf にも反映
+    assert c.post("/ui/settings/unknown", data={}, follow_redirects=False).status_code == 404
+    # CSRF: 他サイトからの POST は 403（既存の same_origin）
+    r = c.post("/ui/settings/set", data={"key": "bwlimit", "value": "off"}, headers={"Origin": "http://evil.example"}, follow_redirects=False)
+    assert r.status_code == 403 and cfg.load(conf.path).rules["bwlimit"] == "4M"

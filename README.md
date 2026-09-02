@@ -75,6 +75,10 @@ kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮
 kairn raw-move <ws> [<case>] [--dry-run]  # 生データを Drive へ移動し所在を記録
 kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move → drive-index → index
 kairn extract <case> [--ws <ws>] [--agent …] [--json]   # 子エージェントで case.json の下書き（書き込まない）
+kairn rules show                          # 同期・退避規則（rules）の現在値
+kairn rules set <key> <value>             # raw_data.min_size | raw_data.min_age | bag_to_zst | bwlimit（値を検証し、不正なら拒否）
+kairn rules add-exclude <pattern> | remove-exclude <pattern>   # 同期しないパターン（rclone のフィルタ規則）を足す／外す
+kairn rules add-raw-ext <ext> | remove-raw-ext <ext>           # 生データ扱いの拡張子を足す／外す
 kairn serve [--host 127.0.0.1] [--port 8765]            # MCP（/mcp）＋ UI（/ui）
 kairn install-skill [--home <dir>]        # skills/kairn を ~/.agents/skills と ~/.claude/skills からリンク
 kairn install-service [--yes] [--print]   # systemd user unit（常駐 kairn-serve.service ＋ 日次 kairn-daily@<ws>.timer）を生成して登録（対話式）
@@ -225,9 +229,12 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
   - 上限を下げる: `rules.raw_data.min_size: 10M` 等（超えたファイルはテキスト層から外れ、`min_age` 後に `raw-move` の対象になる）
   - 同期しないパターンを足す: `rules.exclude` に `logs/**`、`*.csv`、`*.log` 等（`**` で終わるパターンはどの階層のそのディレクトリにも、
     ファイルパターンはどの階層のそのファイルにも一致。rclone のフィルタ規則）。除外したものは同期も `raw-move` もされない（ローカルにだけ残る）
-  - 書き換える場所は `~/.config/kairn/config.yaml` の `rules:`（書式は `config/config.example.yaml`）。`rules:` だけは人が手で編集する
-    （`kairn setup` / `attach` / `install-service` は既存の `rules` を引き継ぐ）。変更後は `kairn checkin <ws> <case> --dry-run` で転送対象を確認する
-    （`-v` の出力に転送するファイル名が出る）。
+  - 書き換えは **`kairn rules …` か UI の設定ページ（`/ui/settings`）で行う**（`~/.config/kairn/config.yaml` の `rules:` を kairn が書く。
+    手では編集しない。値は検証され、不正なら拒否）: `kairn rules set raw_data.min_size 10M`、`kairn rules add-exclude 'logs/**'`、
+    `kairn rules add-raw-ext mcap`、`kairn rules set bwlimit "08:00,4M 20:00,off"`（`off` で制限なし）、`kairn rules show` で現在値。
+    `kairn setup` / `attach` / `install-service` は既存の `rules` を引き継ぐ。**常駐中の `kairn serve` は起動時に読んだ `rules` を使い続ける**
+    （CLI で変えた後は `systemctl --user restart kairn-serve.service`。UI から変えた場合はそのプロセスに即時反映される）。
+    変更後は `kairn checkin <ws> <case> --dry-run` で転送対象を確認する（`-v` の出力に転送するファイル名が出る）。
 - 日次実行（systemd user timer、既定は毎日 12:30 ± 10 分、停止中だった分は次回起動時に実行）は `kairn install-service` がワークスペースごとに
   `kairn-daily@<ws>.timer` を生成・登録する（「各エージェントへの適用」1）。確認:
   ```

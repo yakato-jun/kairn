@@ -27,7 +27,7 @@ LIST_STATUSES = ("open", "closed", "suspended", "all")
 
 CSS = """
 body{font-family:system-ui,sans-serif;margin:0;background:#f5f6f8;color:#222}header{background:#22313f;color:#fff;padding:.6em 1em}
-header a{color:#fff;text-decoration:none;margin-right:1em}main{padding:1em;max-width:1200px;margin:auto}
+header a{color:#fff;text-decoration:none;margin-right:1em}header a.right{float:right;margin:0;font-size:.9em}main{padding:1em;max-width:1200px;margin:auto}
 table{border-collapse:collapse;width:100%;background:#fff}th,td{border-bottom:1px solid #e3e5e8;padding:.4em .6em;text-align:left;font-size:.92em;vertical-align:top}
 .bar{background:#dde;height:8px;border-radius:4px;overflow:hidden;width:120px;display:inline-block;vertical-align:middle}.bar i{display:block;height:100%;background:#3a8}
 .kanban{display:grid;grid-template-columns:repeat(4,1fr);gap:.6em}.col{background:#e9ecf0;border-radius:6px;padding:.5em;min-height:120px}
@@ -37,6 +37,7 @@ form.inline{display:inline}input,textarea,select{font:inherit}button{font:inheri
 .stale{color:#b00;font-weight:bold}.card.stale{border-left:4px solid #c33}.age{font-size:.85em}
 details{margin:.4em 0}pre{background:#fff;padding:.6em;overflow-x:auto;font-size:.85em;white-space:pre-wrap}
 .tag{display:inline-block;background:#e3e8f0;border-radius:3px;padding:0 .4em;margin:0 .2em;font-size:.85em}
+.ok{color:#3a8;font-weight:bold}
 .jobs{background:#fff7e0;border-left:4px solid #e9a825;padding:.4em .8em;margin:.5em 0;font-size:.9em}.jobs ul{margin:.3em 0}.job code{font-size:.85em}
 """
 
@@ -89,7 +90,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
 
     def _page(title: str, body: str) -> HTMLResponse:
         return HTMLResponse(f"<!doctype html><meta charset='utf-8'><title>kairn – {_esc(title)}</title><style>{CSS}</style>"
-                            f"<header><a href='{P}'>kairn</a> {_esc(title)}</header><main>{body}</main>")
+                            f"<header><a href='{P}'>kairn</a> {_esc(title)} <a class='right' href='{P}/settings'>設定</a></header><main>{body}</main>")
 
     def _ws(name: str) -> cfg.Workspace:
         if name not in conf.workspaces:
@@ -208,6 +209,58 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
                 f"<h3>時系列</h3>{evs}")
         return _page(cid, body)
 
+    async def settings(req: Request) -> Response:
+        """rules の現在値と編集フォーム（docs/ui.md「設定」）。保存後は ?saved=<メッセージ> で戻ってくる。"""
+        v = cfg.rules_view(conf)
+        message = req.query_params.get("saved") or ""
+        note = f"<p class='ok'>{_esc(message)}</p>" if message else ""
+
+        def _set_form(key: str, current: object, hint: str) -> str:
+            cur = "" if current is None else ("true" if current is True else "false" if current is False else str(current))
+            return (f"<tr><th>{_esc(key)}</th><td><code>{_esc(cur) or '(none)'}</code></td><td>"
+                    f"<form class='inline' method=post action='{P}/settings/set' accept-charset='utf-8'><input type=hidden name=key value='{_esc(key)}'>"
+                    f"<input name=value value='{_esc(cur)}' size=24><button>保存</button></form> <small class='muted'>{_esc(hint)}</small></td></tr>")
+        rows = (_set_form("raw_data.min_size", v["raw_data.min_size"], "これを超えるファイルはテキスト層の同期から外れ、min_age 後に raw-move の対象（rclone の表記: 10M, 1G）")
+                + _set_form("raw_data.min_age", v["raw_data.min_age"], "更新からこの期間を過ぎた生データだけ raw-move で Drive へ移動（14d, 12h, 2w）")
+                + _set_form("bag_to_zst", v["bag_to_zst"], "*.bag / *.bag.active を zstd 圧縮してから扱う（true / false）")
+                + _set_form("bwlimit", v["bwlimit"], "rclone の --bwlimit にそのまま渡す（4M、\"08:00,4M 20:00,off\"。off で制限なし）"))
+
+        def _list(title: str, items: list[str], add: str, remove: str, name: str, hint: str) -> str:
+            lis = "".join(f"<li><code>{_esc(x)}</code> <form class='inline' method=post action='{P}/settings/{remove}' accept-charset='utf-8'>"
+                          f"<input type=hidden name={name} value='{_esc(x)}'><button>削除</button></form></li>" for x in items)
+            return (f"<h3>{title}</h3><ul>{lis or '<li><small>(none)</small></li>'}</ul>"
+                    f"<form method=post action='{P}/settings/{add}' accept-charset='utf-8'><input name={name} size=24 placeholder='{_esc(hint)}'><button>追加</button></form>")
+        body = (f"<h2>設定 <small>rules（同期・退避規則）</small></h2>{note}"
+                f"<p><small class='muted'>設定ファイル: <code>{_esc(conf.path)}</code>（kairn が書く。手で編集しない）。CLI の <code>kairn rules …</code> と同じ操作。"
+                f"変更後は <code>kairn checkin &lt;ws&gt; &lt;case&gt; --dry-run</code> で転送対象を確認できる</small></p>"
+                f"<table><tr><th>key</th><th>現在値</th><th></th></tr>{rows}</table>"
+                + _list("exclude（同期・移動しないパターン。rclone のフィルタ規則）", v["exclude"], "add-exclude", "remove-exclude", "pattern", "logs/** や *.csv")
+                + _list("raw_data.extensions（生データ扱いの拡張子）", v["raw_data.extensions"], "add-raw-ext", "remove-raw-ext", "ext", "bag"))
+        return _page("settings", body)
+
+    async def settings_act(req: Request) -> Response:
+        if not same_origin(req):
+            return PlainTextResponse("forbidden: cross-site request", status_code=403)
+        op = req.path_params["op"]
+        form = await req.form()
+        try:
+            if op == "set":
+                key = str(form.get("key", "")); out = cfg.set_rule(conf, key, str(form.get("value", "")))
+                msg = f"{key} = {'(none)' if out is None else out}"
+            elif op == "add-exclude":
+                pat = str(form.get("pattern", "")); msg = f"exclude += {pat}" if cfg.add_exclude(conf, pat) else f"exclude already has {pat}"
+            elif op == "remove-exclude":
+                pat = str(form.get("pattern", "")); cfg.remove_exclude(conf, pat); msg = f"exclude -= {pat}"
+            elif op == "add-raw-ext":
+                ext = str(form.get("ext", "")); msg = f"raw_data.extensions += {ext}" if cfg.add_raw_ext(conf, ext) else f"raw_data.extensions already has {ext}"
+            elif op == "remove-raw-ext":
+                ext = str(form.get("ext", "")); cfg.remove_raw_ext(conf, ext); msg = f"raw_data.extensions -= {ext}"
+            else:
+                return PlainTextResponse("unknown action", status_code=404)
+        except ValueError as e:  # 検証エラー: 保存しない（他の UI 操作と同じく 400）
+            return PlainTextResponse(f"invalid: {e}", status_code=400)
+        return RedirectResponse(f"{P}/settings?saved={quote(msg, safe='')}", status_code=303)
+
     async def act(req: Request) -> Response:
         if not same_origin(req):
             return PlainTextResponse("forbidden: cross-site request", status_code=403)
@@ -289,8 +342,9 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
                 f"<button>この下書きを case.json に適用</button> <small>title / summary / elements / related / causal を置き換え、decision として記録する</small></form>"
                 f"<details><summary>下書き JSON</summary><pre>{_esc(json.dumps(card, ensure_ascii=False, indent=1))}</pre></details>")
 
-    return [Route(P, index), Route(P + "/", index), Route(P + "/{ws}/{case}", case_page),
-            Route(P + "/{ws}/{case}/{kind}", act, methods=["POST"])]
+    return [Route(P, index), Route(P + "/", index),
+            Route(P + "/settings", settings), Route(P + "/settings/{op}", settings_act, methods=["POST"]),
+            Route(P + "/{ws}/{case}", case_page), Route(P + "/{ws}/{case}/{kind}", act, methods=["POST"])]
 
 
 def same_origin(req: Request) -> bool:

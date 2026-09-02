@@ -24,6 +24,11 @@
   - 時系列（events の直近 100 件、新しい順。actor で色分け（human / ai。kairn 等その他は既定色）、agent、task、note、証拠）
   - related（存在する案件はリンク）、elements（タグ。クリックで一覧の絞り込み）
 
+- **設定** `GET /ui/settings`（各ページのヘッダ右の「設定」リンク）
+  同期・退避規則 `rules` の現在値（`raw_data.min_size` / `raw_data.min_age` / `bag_to_zst` / `bwlimit`、`exclude` の一覧、
+  `raw_data.extensions` の一覧）と、CLI の `kairn rules …` と同じ操作のフォーム。設定ファイル（`~/.config/kairn/config.yaml`）は
+  kairn が書き、人は手で編集しない。保存後は `?saved=<メッセージ>` 付きで同じページに戻る（303）。案件の event には記録しない。
+
 ## 操作（すべて event として記録。AI は次に open_case した時に `human_feedback` で受け取る）
 
 | 操作 | POST | 記録 |
@@ -34,6 +39,10 @@
 | 案件の close/suspend | `/ui/<ws>/<case>/status` `status, note` | case.json の status 更新＋ `{actor: human, action: status}` |
 | 下書きを取得 | `/ui/<ws>/<case>/extract` | `extract.extract_card` を threadpool で実行し（子プロセス待ちの間も同じプロセスの MCP を止めない）、結果画面（agent・所要時間・ok/失敗理由、現在の case.json と下書きの対比、症状→部品→原因、下書き JSON）を返す（200、リダイレクトしない）。下書きの `related` にワークスペースに実在しない案件 ID があれば `related_unknown` として ⚠ 印を付ける（適用しても related に入らない）。case.json は書かない。`{actor: kairn, agent: extract:<name>, action: extract}` |
 | この下書きを case.json に適用 | `/ui/<ws>/<case>/apply` `card`（下書き JSON。結果画面の hidden） | `related_unknown` を捨てて schema.json で再検証し、title / summary / elements / related / causal を置き換え＋ `{actor: human, action: decision, note: "applied extract draft"}`。不正な JSON・スキーマ不一致は 400 |
+
+| 設定: 単一値 | `/ui/settings/set` `key, value` | `config.set_rule`（`raw_data.min_size` は `sync.parse_size`、`raw_data.min_age` は `parse_age`、`bag_to_zst` は true/false、`bwlimit` は `parse_bwlimit` で検証。`off` はキーを消す）→ `Config.save()`。不正な値・未知の key は 400 で保存しない。event は書かない |
+| 設定: exclude の追加／削除 | `/ui/settings/add-exclude` / `remove-exclude` `pattern` | `rules.exclude` に足す（重複は no-op）／外す（無ければ 400）→ 保存 |
+| 設定: 生データ拡張子の追加／削除 | `/ui/settings/add-raw-ext` / `remove-raw-ext` `ext` | `rules.raw_data.extensions` に足す（先頭の `.` は外し小文字。重複は no-op）／外す（無ければ 400）→ 保存 |
 
 フォームは `application/x-www-form-urlencoded`（UTF-8、percent-encoding）。日本語・記号は復号してそのまま記録する。成功時は 303 で案件ページへ戻る。
 `owner` は ai | human 以外を 400 で拒否する。

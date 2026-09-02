@@ -14,6 +14,10 @@
   kairn daily <ws> [--dry-run]              # bag2zst -> checkin -> raw-move -> drive-index -> index（systemd timer 用）
   kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]
                                          # 子エージェントで case.json の下書きを作る（書き込まない。適用は UI）
+  kairn rules show                       # 同期・退避規則（rules）の現在値
+  kairn rules set <key> <value>          # raw_data.min_size | raw_data.min_age | bag_to_zst | bwlimit（値を検証。不正なら拒否）
+  kairn rules add-exclude <pattern> | remove-exclude <pattern>   # 同期しないパターン（rclone のフィルタ規則）
+  kairn rules add-raw-ext <ext> | remove-raw-ext <ext>           # 生データ扱いの拡張子
   kairn serve [--port 8765]              # MCP + UI
   kairn install-service [--yes] [--print]  # systemd user unit（kairn-serve.service / kairn-daily@<ws>.timer）を生成して登録（対話式。--yes は既定値、--print は内容表示のみ）
   kairn ensure [--timeout 15]            # 設定の serve.host/port の /mcp が応答しなければ kairn serve を切り離して起動し、応答まで待つ（service が止まっていた時の保険）
@@ -219,6 +223,39 @@ def cmd_extract(a):
         sys.exit(1)
 
 
+def rules_lines(conf: cfg.Config) -> list[str]:
+    """`kairn rules show` の表示（1 行ずつ）。"""
+    v = cfg.rules_view(conf)
+    return [f"config: {conf.path}",
+            f"raw_data.min_size:   {v['raw_data.min_size'] or '(none)'}",
+            f"raw_data.min_age:    {v['raw_data.min_age'] or '(none)'}",
+            f"bag_to_zst:          {'true' if v['bag_to_zst'] else 'false'}",
+            f"bwlimit:             {v['bwlimit'] or '(none)'}",
+            f"raw_data.extensions: {' '.join(v['raw_data.extensions']) or '(none)'}",
+            "exclude:"] + [f"  {pat}" for pat in v["exclude"]]
+
+
+def cmd_rules(a):
+    conf = cfg.load()
+    try:
+        if a.sub == "show":
+            print("\n".join(rules_lines(conf))); return
+        if a.sub == "set":
+            out = cfg.set_rule(conf, a.key, a.value)
+            print(f"{a.key} = {'(none)' if out is None else str(out).lower() if isinstance(out, bool) else out}")
+        elif a.sub == "add-exclude":
+            print(f"exclude += {a.pattern}" if cfg.add_exclude(conf, a.pattern) else f"exclude already has {a.pattern}")
+        elif a.sub == "remove-exclude":
+            cfg.remove_exclude(conf, a.pattern); print(f"exclude -= {a.pattern}")
+        elif a.sub == "add-raw-ext":
+            print(f"raw_data.extensions += {a.ext}" if cfg.add_raw_ext(conf, a.ext) else f"raw_data.extensions already has {a.ext}")
+        elif a.sub == "remove-raw-ext":
+            cfg.remove_raw_ext(conf, a.ext); print(f"raw_data.extensions -= {a.ext}")
+    except ValueError as e:
+        raise SystemExit(f"kairn: {e}") from None
+    print(f"saved: {conf.path} (a running kairn serve keeps its loaded rules until restarted)")
+
+
 def cmd_serve(a):
     conf = cfg.load()
     from .server import serve
@@ -301,6 +338,14 @@ def main() -> None:
     s = sub.add_parser("drive-index", help="list all files on the drive into index/drive-index.txt"); s.add_argument("ws", nargs="?"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("daily", help="bag2zst -> checkin -> raw-move -> drive-index -> index"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("extract", help="draft case.json with an isolated child agent (read-only; apply in the UI)"); s.add_argument("case"); s.add_argument("--ws"); s.add_argument("--agent", choices=["claude", "codex", "opencode", "antigravity"]); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_extract)
+    s = sub.add_parser("rules", help="show / edit the sync rules (rules: in the config; never edit the file by hand)"); ss = s.add_subparsers(dest="sub", required=True)
+    ss.add_parser("show")
+    c = ss.add_parser("set"); c.add_argument("key", choices=list(cfg.RULE_KEYS)); c.add_argument("value")
+    for name in ("add-exclude", "remove-exclude"):
+        c = ss.add_parser(name); c.add_argument("pattern")
+    for name in ("add-raw-ext", "remove-raw-ext"):
+        c = ss.add_parser(name); c.add_argument("ext")
+    s.set_defaults(f=cmd_rules)
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8765); s.set_defaults(f=cmd_serve)
     s = sub.add_parser("install-skill", help="symlink skills/kairn into ~/.agents/skills and ~/.claude/skills (existing entries are kept)"); s.add_argument("--home", default="~", help="HOME to install into (default: ~)"); s.set_defaults(f=cmd_install_skill)
     s = sub.add_parser("install-service", help="generate systemd user units (kairn-serve.service, kairn-daily@<ws>.timer) and enable them"); s.add_argument("--yes", action="store_true", help="非対話（既定値: 127.0.0.1:8765、設定の全ワークスペースを 12:30、enable --now、linger なし。既存 unit は上書き）"); s.add_argument("--print", action="store_true", help="書き込む unit の内容を表示するだけ（ファイルもコマンドも実行しない）"); s.set_defaults(f=cmd_install_service)

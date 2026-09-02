@@ -278,6 +278,22 @@ def parse_age(v) -> float:
     return float(m.group(1)) * _AGE_UNITS[m.group(2) or "s"]
 
 
+_BW_RATE = r"(?:off|\d+(?:\.\d+)?[bBkKmMgGtTpP]?)"
+_BW_TOKEN = re.compile(rf"^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)-)?(?:\d{{1,2}}:\d{{2}},)?{_BW_RATE}(?::{_BW_RATE})?$")
+
+
+def parse_bwlimit(v) -> str:
+    """rclone の --bwlimit 表記を検証して正規化（空白区切りを 1 つに）する: '4M'、'off'、'1M:2M'（上り:下り）、
+    '08:00,4M 20:00,off'（時間帯別。曜日付き 'Sat-10:00,1M' も可）。不正なら ValueError。"""
+    tokens = str(v).split()
+    if not tokens:
+        raise ValueError("invalid bwlimit: empty (expected e.g. 4M, off, or \"08:00,4M 20:00,off\")")
+    for t in tokens:
+        if not _BW_TOKEN.match(t):
+            raise ValueError(f"invalid bwlimit token {t!r} (expected e.g. 4M, off, 1M:2M, 08:00,4M)")
+    return " ".join(tokens)
+
+
 def raw_rules(conf: Config) -> dict:
     """rules.raw_data を解釈した形: {extensions: [...], min_size: bytes, min_age: sec, min_size_str, min_age_str}"""
     raw = conf.rules.get("raw_data") or {}

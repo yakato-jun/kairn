@@ -185,3 +185,100 @@ def test_cli_attach_detach_status_record_mapping_only(conf, tmp_path, monkeypatc
     assert "detached" in capsys.readouterr().out
     assert conf.workspace_for_path(repo) is None and (repo / "tmp" / "notes" / "a.md").read_text() == "keep"
     assert str(repo) not in conf.path.read_text(encoding="utf-8")
+
+
+# ---------- rules の編集（kairn rules … / UI）: 検証して保存、他のキーは壊さない ----------
+
+def test_rules_edit_functions_validate_and_save(tmp_path):
+    from kairn import sync
+    p = tmp_path / "config.yaml"
+    p.write_text("drive: {remote: my-drive}\nextract: {agent: codex, timeout: 42}\nserve: {port: 9000}\n"
+                 "workspaces: {acme: {description: d, repos: []}}\n", encoding="utf-8")
+    conf = cfg.load(p)
+    defaults_before = __import__("copy").deepcopy(cfg.DEFAULT_RULES)
+    assert cfg.set_rule(conf, "raw_data.min_size", "10M") == "10M"
+    assert cfg.set_rule(conf, "raw_data.min_age", "7d") == "7d"
+    assert cfg.set_rule(conf, "bag_to_zst", "false") is False and cfg.set_rule(conf, "bag_to_zst", "YES") is True
+    assert cfg.set_rule(conf, "bwlimit", "08:00,4M   20:00,off") == "08:00,4M 20:00,off"
+    assert cfg.add_exclude(conf, "logs/**") is True and cfg.add_exclude(conf, "logs/**") is False    # 重複は no-op
+    assert cfg.add_raw_ext(conf, ".MCAP") is True and cfg.add_raw_ext(conf, "mcap") is False        # 先頭の . を外し小文字
+    re_ = cfg.load(p)
+    assert re_.rules["raw_data"]["min_size"] == "10M" and re_.rules["raw_data"]["min_age"] == "7d" and re_.rules["bag_to_zst"] is True
+    assert re_.rules["bwlimit"] == "08:00,4M 20:00,off" and re_.rules["exclude"][-1] == "logs/**" and re_.rules["raw_data"]["extensions"][-1] == "mcap"
+    assert re_.rules["exclude"][:-1] == cfg.DEFAULT_RULES["exclude"]                             # 既存の項目はそのまま
+    assert re_.extract_agent == "codex" and re_.extract_timeout == 42 and re_.serve_port == 9000     # 他のキーは壊さない
+    assert list(re_.workspaces) == ["acme"] and re_.workspaces["acme"].description == "d"
+    assert sync._filters(re_)[-2:] == ["--max-size", "10M"] and "--exclude" in sync._filters(re_) and sync._bw(re_) == ["--bwlimit", "08:00,4M 20:00,off"]
+    cfg.remove_exclude(conf, "logs/**"); cfg.remove_raw_ext(conf, "mcap")
+    assert cfg.set_rule(conf, "bwlimit", "off") is None                                             # off = 制限なし（キーを消す）
+    re_ = cfg.load(p)
+    assert "logs/**" not in re_.rules["exclude"] and "mcap" not in re_.rules["raw_data"]["extensions"] and "bwlimit" not in re_.rules
+    assert cfg.DEFAULT_RULES == defaults_before                                                      # 既定値の入れ子を壊していない
+    view = cfg.rules_view(re_)
+    assert view["raw_data.min_size"] == "10M" and view["bwlimit"] is None and view["bag_to_zst"] is True and "*.pyc" in view["exclude"]
+
+
+@pytest.mark.parametrize("fn, args, msg", [
+    ("set_rule", ("raw_data.min_size", "10X"), "invalid size"),
+    ("set_rule", ("raw_data.min_age", "soon"), "invalid age"),
+    ("set_rule", ("bag_to_zst", "maybe"), "true or false"),
+    ("set_rule", ("bwlimit", "4M,08:00"), "invalid bwlimit"),
+    ("set_rule", ("bwlimit", ""), "value is required"),
+    ("set_rule", ("exclude", "x"), "unknown rule"),
+    ("add_exclude", ("",), "non-empty"),
+    ("add_exclude", ("a b",), "without whitespace"),
+    ("remove_exclude", ("nope/**",), "is not set"),
+    ("add_raw_ext", ("a/b",), "expected e.g. bag"),
+    ("add_raw_ext", ("*.bag",), "expected e.g. bag"),
+    ("remove_raw_ext", ("xyz",), "is not set"),
+])
+def test_rules_edit_rejects_invalid_values_without_saving(tmp_path, fn, args, msg):
+    p = tmp_path / "config.yaml"
+    p.write_text("drive: {remote: my-drive}\nworkspaces: {}\n", encoding="utf-8")
+    conf = cfg.load(p)
+    before = p.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match=msg):
+        getattr(cfg, fn)(conf, *args)
+    assert p.read_text(encoding="utf-8") == before
+
+
+def test_parse_bwlimit():
+    from kairn.sync import parse_bwlimit
+    for ok in ("4M", "off", "1M:2M", "08:00,4M 20:00,off", "Sat-10:00,1M Sun-20:00,off", "512k", "1.5G"):
+        assert parse_bwlimit(ok) == ok
+    for bad in ("", "fast", "4M,08:00", "1M:", "4M:off:1M", "08:00:4M"):
+        with pytest.raises(ValueError):
+            parse_bwlimit(bad)
+
+
+def test_cli_rules_show_set_add_remove(conf, monkeypatch, capsys):
+    from kairn import cli
+    conf.save()
+    orig_load = cfg.load
+    monkeypatch.setattr(cfg, "load", lambda path=None: orig_load(conf.path))
+    monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
+
+    def run(*argv):
+        monkeypatch.setattr("sys.argv", ["kairn", "rules", *argv])
+        cli.main()
+        return capsys.readouterr().out
+    out = run("show")
+    assert "raw_data.min_size:   50M" in out and "bag_to_zst:          true" in out and "bwlimit:             (none)" in out and "  target/**" in out
+    assert "raw_data.min_size = 10M" in run("set", "raw_data.min_size", "10M") and cfg.load(conf.path).rules["raw_data"]["min_size"] == "10M"
+    assert "bag_to_zst = false" in run("set", "bag_to_zst", "false") and cfg.load(conf.path).rules["bag_to_zst"] is False
+    assert "bwlimit = 4M" in run("set", "bwlimit", "4M") and cfg.load(conf.path).rules["bwlimit"] == "4M"
+    assert "exclude += logs/**" in run("add-exclude", "logs/**") and "logs/**" in cfg.load(conf.path).rules["exclude"]
+    assert "already has" in run("add-exclude", "logs/**")
+    assert "exclude -= logs/**" in run("remove-exclude", "logs/**") and "logs/**" not in cfg.load(conf.path).rules["exclude"]
+    assert "raw_data.extensions += mcap" in run("add-raw-ext", "mcap") and "mcap" in cfg.load(conf.path).rules["raw_data"]["extensions"]
+    assert "raw_data.extensions -= mcap" in run("remove-raw-ext", "mcap") and "mcap" not in cfg.load(conf.path).rules["raw_data"]["extensions"]
+    assert "raw_data.min_size:   10M" in run("show") and "saved" not in capsys.readouterr().out
+    # 検証エラー: 終了コード 1 相当（SystemExit にメッセージ）、保存しない
+    before = conf.path.read_text(encoding="utf-8")
+    with pytest.raises(SystemExit, match="invalid size"):
+        run("set", "raw_data.min_size", "lots")
+    with pytest.raises(SystemExit, match="is not set"):
+        run("remove-exclude", "nope/**")
+    with pytest.raises(SystemExit):                                                 # 未知のキーは argparse が拒否
+        run("set", "exclude", "x")
+    assert conf.path.read_text(encoding="utf-8") == before
