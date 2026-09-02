@@ -29,8 +29,11 @@
   - summary（あれば objective の下）、症状 → 部品 → 原因（case.json の `causal[]`。あれば）
   - worklog.md（折りたたみ。全文）
   - 時系列（events の直近 100 件、新しい順。actor で色分け（human / ai。kairn 等その他は既定色）、agent、task、note、証拠。
-    ステータス変更（`action: status`）は `status <from> → <to> — note` で出す）
-  - related（存在する案件はリンク）、elements（タグ。クリックで一覧の絞り込み）
+    ステータス変更（`action: status`）は `status <from> → <to> — note`、跨ぎ参照（`action: xref`。参照元の案件にだけある）は
+    `xref 他 ws 参照: <ws>/<case> (<tool>)` で出す）
+  - related（存在する案件はリンク。`<ws>/<case>` は ws 名付きで表示し、登録済み ws に実在すれば `/ui/<ws>/<case>` へリンク）、
+    elements（タグ。クリックで一覧の絞り込み）
+  - 一覧ページに「他 ws からの参照あり」の印は出さない（参照された側には events が無く、access.log はローカルの閲覧記録）
 
 - **設定** `GET /ui/settings`（各ページのヘッダ右の「設定」リンク）
   同期・退避規則 `rules` の現在値（`raw_data.min_size` / `raw_data.min_age` / `bag_to_zst` / `bwlimit` / `rclone_flags`、`exclude` の一覧、

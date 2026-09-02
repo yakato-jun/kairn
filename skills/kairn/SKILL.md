@@ -53,6 +53,19 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
   done も引き継がないと新版の進捗に数えない。
 - 過去の経緯を探す: `search(query)`（worklog 等の `## ` 節単位。語は AND）。Drive 上の生データの所在: `drive_index(pattern)`。
 
+## 他のワークスペースの知見（跨ぎ参照）
+- 自ワークスペースに無ければ他ワークスペースも検索してよい。`find_cases` / `search` は `scope=auto` が既定で、自 ws にヒットが無ければ
+  自動的に全 ws を検索する（`scope=workspace` で自 ws のみ、`scope=all` で常に全 ws）。返り値は `{workspace, scope, searched, results}` で、
+  他 ws のヒットは `cross_workspace: true`。
+- **案件の文脈があるときは `from_case="<ws>/<case>"` を必ず渡す**（`open_case` / `find_cases` / `search`。開いている案件の
+  `case.workspace` と `case.id`）。これが跨ぎ参照の記録になる（対象 ws の access.log と、自案件の `xref` event）。
+  `workspaces/` 配下を直接 grep して他 ws を読む経路は記録に残らないので使わない。
+- 他 ws の案件を開くときは `open_case(case, workspace=<ws>, from_case=…)`。`related` の展開（他 ws は title と status だけ）で足りるなら開かない。
+- **他 ws の案件から得た内容を worklog・タスク・成果物に書くときは、相手の案件 ID や顧客固有の情報（機体名・拠点名・図面等）を書かず
+  一般化した表現にする**（例: 「別案件で同種の UART 送信量超過を 1 バイト送信の廃止で解決した」）。出典は `related` に `"<ws>/<case>"`
+  として残す（`case.json.related`）。related を書く MCP ツールは無いので、書いた内容の出典として `<ws>/<case>` を related に足してほしいと
+  人に伝える（`case.json` を直接編集しない）。相手の案件 ID を書いてよいのは related だけ。
+
 ## 案件のステータス（閉じる・保留する・再開する）
 - 案件を閉じる（closed）・保留する（suspended）・再開する（open）のは**人の判断**。AI の判断で変えない
   （タスクが全部 done でも、長く動きが無くても、AI からは閉じない。提案もしない）。
@@ -82,6 +95,7 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 ## してはいけないこと
 - `checkin` の `job_status` が `done` になる前に「Drive に戻した」と報告する（`failed` を黙って流す）。
 - ファイルを直接編集してタスク状態・計画・イベントを変える（`case.json` / `plan/` / `events.jsonl` は必ず MCP 経由）。
-- ワークスペースをまたいで案件を参照する（人の明示指定があるときだけ `workspace=` を渡す）。
+- 他ワークスペースの案件を `from_case` 無しで開く・検索する、または `workspaces/` を直接 grep する（記録に残らない）。
+- 他ワークスペースの案件 ID・顧客固有の情報を自案件の worklog・タスク・成果物にそのまま書く（一般化し、出典は `related`）。
 - `extract_card` の下書きを確認なしに case.json や worklog に書き込む。
 - 証拠なしで done にする（`note` 型や空の `evidence` は拒否される）。

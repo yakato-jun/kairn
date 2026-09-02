@@ -14,7 +14,7 @@ workspaces/<ws>/
     …                    作業ファイル（MMdd_hhmm_ prefix 等、従来どおり）
   index/kairn.sqlite     索引（case / plan / task / event / section の検索用）。再生成可
   index/drive-index.txt  Drive 上の全ファイル一覧（path, size, mtime）。`kairn drive-index` / `kairn daily` が生成
-  index/access.log       open_case の閲覧記録（1 行 `<時刻>\t<案件>\t<agent>`）。ローカルのみ、Drive に同期しない
+  index/access.log       open_case の閲覧記録（1 行 `<時刻>\t<案件>\t<agent>`。他 ws の案件からの跨ぎ参照は `\tcross_from=<ws>/<case>\ttool=<tool>` 付き）。ローカルのみ、Drive に同期しない
   index/drive_revs.cache.json  直近に読んだ Drive の版（`{"revs": {case: rev | null}, "fetched_at"}`）。list_cases / UI 一覧の印に使う。ローカルのみ
 ```
 
@@ -27,7 +27,7 @@ workspaces/<ws>/
   "workspace": "acme",
   "repos": ["acme-robot", "acme-plc"],
   "tickets": ["CASE-123"], "prs": [42],
-  "related": ["CASE-100", "CASE-118"],      // 人／AI が明示的に書く関係（抽出に頼らない）
+  "related": ["CASE-100", "beta/CASE-7"],   // 人／AI が明示的に書く関係（抽出に頼らない）。同 ws の案件 ID か "<ws>/<case>"（他 ws。下記「跨ぎ参照」）
   "elements": {"machine": ["unit-2"], "component": ["acme-plc"], "symptom": ["起動時に driver init 未完了"]},
   "summary": "起動直後に driver init が終わらない。UART の送信量超過が原因。",   // 3 行以内（extract の下書きを人が適用した時に入る）
   "causal": [{"symptom": "起動時に driver init 未完了", "component": "acme-plc", "cause": "UART 460800 で送信量が超過",
@@ -76,6 +76,14 @@ workspaces/<ws>/
   `checked_in_at` / `from` はローカル `case.json` の `last_checkin_at` / `checked_in_from`。
 - 既存の Drive データ（マーカーの無い案件）は `kairn drive-markers <ws>` で一度だけ、Drive の `case.json` の `rev` がローカルと一致する案件に
   マーカーを置く（README「同期」）。それ以外の案件は各環境の次の checkin でマーカーが付く。
+
+### related（関係する案件）
+- 要素は `"<case>"`（同じワークスペースの案件 ID）か `"<ws>/<case>"`（他ワークスペースの案件）。ワークスペース名・案件 ID とも
+  `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`（`..` 不可。`kairn/store.py` `parse_related` / `validate_related`）。`create_case` と extract の
+  `apply_card` が検証し、不正な形は ValueError（MCP では `ToolError`）。実在しない案件を指してもよい（検証は形だけ）。
+- `open_case` は各要素を `{ref, workspace, case, cross_workspace, exists, title, status}` に展開して返す。他ワークスペースの案件は
+  **title と status だけ**（内容は開かない。開くなら `open_case(case, workspace=…, from_case=…)`）。UI の関連欄は実在する案件へリンクする。
+- 他ワークスペースの案件から得た内容を worklog 等に書くときの出典はここに `<ws>/<case>` として残す（skills/kairn/SKILL.md）。
 
 ### summary / elements / related / causal（抽出の下書きの適用先）
 - `kairn/extract`（MCP `extract_card` / `kairn extract` / UI「下書きを取得」）は下書きを返すだけで case.json には書かない。
@@ -144,12 +152,22 @@ bag2zst・全文索引の対象外になる（`kairn/sync.py` `WORKAREA_MARKERS`
 {"t": "…", "actor": "human", "action": "status", "from": "open", "to": "closed", "note": "対応完了"}
 {"t": "…", "actor": "ai", "agent": "claude-code", "action": "status", "from": "closed", "to": "open", "note": "この案件を再開して"}
 ```
-`action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | status | extract
+`action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | status | extract | xref
 （`checkout` は旧版が `open_case` のたびに書いていた action。読めるが、もう書かない）
+`xref`（跨ぎ参照。`CaseStore.append_xref`）は**参照元**の案件の events に書く: `{actor: ai, agent, action: xref, workspace: <対象 ws>, case: <対象案件>, tool: open_case | search | find_cases}`
+（`case` は他の event と違い**参照した相手**の案件 ID）。同じ対象（workspace, case）への参照は同じ日（JST）に 1 回だけ（ツールの違いは数えない）。
+参照された側の events には書かない（対象 ws の `index/access.log` に `cross_from=` 付きで 1 行。ローカルのみ）。
 `status`（案件のステータス変更。`CaseStore.set_case_status`）は `from` / `to`（open | closed | suspended）と `note` を持つ。人の操作（UI の「案件の状態を変更」・
 CLI `kairn close | suspend | reopen`）は `actor: human`、MCP `set_case_status` は `actor: ai` で `note` に人の発言（`instruction`）そのもの。
 同じステータスへの変更は event を書かない（case.json も触らない）。旧版が書いた `from` / `to` の無い `status` 行（`note: "closed: 理由"`）は読める。
 `actor`: ai | human | kairn（kairn の自動処理: raw-move・extract 等。UI では既定色）。extract の event は `agent: "extract:<name>"`、`note`（ok / 失敗理由）、`elapsed_sec`、`exit_code`、`timeout_sec` を持つ
+
+## 跨ぎ参照（ワークスペースをまたぐ参照）の記録
+ワークスペース（顧客・組織）は保存先・索引・抽出の境界だが、**参照**はまたいでよい（docs/decisions.md 22）。記録は 2 か所:
+- 対象ワークスペースの `index/access.log`: `<時刻>\t<対象案件>\t<agent>\tcross_from=<from ws>/<from 案件>\ttool=<open_case | search | find_cases>`
+  （通常の閲覧行は 3 列。`search` / `find_cases` は他 ws のヒット案件ごとに 1 行）。ローカルのみ、同期しない。
+- 参照元の案件の `events.jsonl`: 上の `xref` event（同期される。UI の時系列に「他 ws 参照: <ws>/<case>」で出る）。
+記録されるのは MCP ツールに `from_case="<ws>/<case>"` が渡されたときだけ。`related` の展開（`open_case` の返り値）は参照に数えない。
 
 ## 証拠（evidence）の型
 `type` は commit / pr / file / test / url。`note` は actor=human のみ（AI の証拠にはならない）。型ごとの必須キー:
