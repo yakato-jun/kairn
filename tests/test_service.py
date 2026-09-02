@@ -52,6 +52,7 @@ def test_render_units_embeds_exec_path_port_and_workspaces():
     serve = units["kairn-serve.service"]
     assert "ExecStart=/home/someone/.local/bin/kairn serve --host 127.0.0.1 --port 9999" in serve
     assert "Restart=on-failure" in serve and "WantedBy=default.target" in serve
+    assert "TimeoutStopSec=15" in serve and "KillSignal=SIGTERM" in serve   # 停止が systemd 既定の 90 秒を待たない
     daily = units["kairn-daily@.service"]
     assert "ExecStart=/home/someone/.local/bin/kairn daily %i" in daily and "Type=oneshot" in daily
     timer = units["kairn-daily@acme.timer"]
@@ -81,6 +82,7 @@ def test_install_service_print_only(env, monkeypatch, capsys):
     assert f"ExecStart={KAIRN} daily %i" in out
     assert "kairn-daily@acme.timer" in out and "Unit=kairn-daily@acme.service" in out and "OnCalendar=*-*-* 12:30:00" in out
     assert str(env["units"] / "kairn-serve.service") in out
+    assert "TimeoutStopSec=15" in out
     assert not env["units"].exists() and env["calls"] == []      # ファイルもコマンドも実行しない
     assert not env["conf"].path.exists()
 

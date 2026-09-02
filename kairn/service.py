@@ -1,7 +1,7 @@
 """常駐の登録（kairn install-service）と保険起動（kairn ensure）。
 
 install-service: systemd user unit をコード内テンプレートから生成し、~/.config/systemd/user/ に書いて登録する。
-  kairn-serve.service         MCP + UI の常駐（kairn serve --host <h> --port <p>）。Restart=on-failure
+  kairn-serve.service         MCP + UI の常駐（kairn serve --host <h> --port <p>）。Restart=on-failure、TimeoutStopSec=15（停止が 90 秒待たないため）
   kairn-daily@.service        日次同期のテンプレート unit（%i = ワークスペース名）
   kairn-daily@<ws>.timer      ワークスペースごとの timer（Persistent=true、RandomizedDelaySec=10m）
   ExecStart には install-service を実行した kairn 自身の実行パス（sys.argv[0] を resolve）を埋める
@@ -125,6 +125,8 @@ def render_units(opts: ServiceOptions, cmd: list[str]) -> dict[str, str]:
             f"ExecStart={exec_line(cmd, 'serve', '--host', opts.host, '--port', str(opts.port))}",
             "Restart=on-failure",
             "RestartSec=5",
+            "KillSignal=SIGTERM",
+            "TimeoutStopSec=15",   # kairn serve は SIGTERM 後、開いている MCP 接続を最大 5 秒しか待たない（server.GRACEFUL_SHUTDOWN_SEC）
             "",
             "[Install]",
             "WantedBy=default.target",

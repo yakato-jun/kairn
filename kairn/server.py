@@ -6,6 +6,9 @@
 ツール内の失敗は ToolError で返す（呼び出し元のエージェントに理由が文章で届く）。
 rclone の転送（checkin、open_case の取り寄せ）はジョブ（kairn/jobs.py、デーモンスレッド）にして即座に job_id を返す
 （大きな案件で MCP クライアントの呼び出しタイムアウトに当たらないため）。状態は job_status で見る。
+停止（SIGTERM / SIGINT）: MCP クライアントが streamable HTTP のセッション（SSE）を張ったままだと uvicorn の graceful shutdown が
+接続の終了を待ち続け systemd の停止タイムアウトに当たるので、開いている接続は最大 GRACEFUL_SHUTDOWN_SEC 秒しか待たない。
+受信時に running のジョブがあれば一覧をログに 1 行出す（ジョブ表はメモリ内。整合は次回の checkin / checkout に任せる）。
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ INSTRUCTIONS = (
 )
 MCP_PATH = "/mcp"
 UI_PATH = "/ui"
+GRACEFUL_SHUTDOWN_SEC = 5   # SIGTERM 後、開いている接続（MCP の SSE 等）を待つ上限秒。systemd の TimeoutStopSec（15）より短くする
 
 
 def _fail(e: Exception) -> ToolError:
@@ -269,8 +273,33 @@ def build_app(conf: cfg.Config, host: str = "127.0.0.1", default_agent: str = "u
     return app
 
 
-def serve(conf: cfg.Config, host: str = "127.0.0.1", port: int = 8765) -> None:
+def log_running_jobs(jobs: JobTable, sig: int, out=print) -> None:
+    """停止シグナル受信時: running のジョブ（kind / workspace / case / 経過秒）を 1 行で出す。無ければ何も出さない。
+    シグナルハンドラから呼ぶのでジョブ表のロックは取らない（JobTable.running_snapshot）。"""
+    running = jobs.running_snapshot()
+    if not running:
+        return
+    items = ", ".join(f"{j.kind} {j.workspace}/{j.case} ({j.elapsed_sec():.0f}s, {j.id})" for j in running)
+    out(f"kairn: signal {sig}: shutting down with {len(running)} running job(s): {items}. "
+        "jobs are not persisted; a checkin/checkout cut short here is reconciled by the next checkin/checkout of that case",
+        flush=True)
+
+
+def serve(conf: cfg.Config, host: str = "127.0.0.1", port: int = 8765):
+    """uvicorn で app を動かす（ブロックする）。停止シグナルでは開いている接続を最大 GRACEFUL_SHUTDOWN_SEC 秒しか待たず、
+    running のジョブがあればログに出す。uvicorn.run は内部で Server を作りハンドラを差し込めないので Config + Server を直接使う。
+    返り値は uvicorn.Server（テストが引数と handle_exit を確かめる用）。"""
     import uvicorn
     app = build_app(conf, host)
     print(f"kairn: MCP http://{host}:{port}{MCP_PATH}   UI http://{host}:{port}{UI_PATH}", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning",
+                                           timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SEC))
+    uvicorn_exit = server.handle_exit
+
+    def handle_exit(sig, frame) -> None:
+        log_running_jobs(app.state.jobs, sig)
+        uvicorn_exit(sig, frame)
+
+    server.handle_exit = handle_exit   # capture_signals は signal.signal(sig, self.handle_exit) なのでインスタンス属性で差し替わる
+    server.run()
+    return server

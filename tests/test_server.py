@@ -611,3 +611,61 @@ def test_open_case_drive_job_id_and_dedupe(conf, monkeypatch, jobs):
             r3 = await _open(c, jobs, "CASE-1")
             assert r3.structured_content["case"]["title"] == "after fetch" and r3.structured_content["drive"]["job_id"] != d["job_id"]
     run(main)
+
+
+# ---- serve: 停止時の graceful shutdown 上限と running ジョブのログ ---------------------------------
+
+def test_serve_limits_graceful_shutdown_and_logs_running_jobs_on_signal(conf, monkeypatch, capsys):
+    """serve は uvicorn.Config に timeout_graceful_shutdown=5 を渡し、SIGTERM のハンドラ（handle_exit）で running ジョブを 1 行出してから
+    uvicorn の handle_exit に渡す。uvicorn.Server はモックして実際には listen しない。"""
+    import signal
+
+    import uvicorn
+
+    created = {}
+
+    class FakeServer:
+        def __init__(self, config):
+            created["config"] = config
+            self.exits = []
+
+        def handle_exit(self, sig, frame):
+            self.exits.append(sig)
+
+        def run(self):
+            created["ran"] = True
+
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    server = srv.serve(conf, host="127.0.0.1", port=1)
+    config = created["config"]
+    assert isinstance(config, uvicorn.Config) and created["ran"] is True
+    assert config.timeout_graceful_shutdown == srv.GRACEFUL_SHUTDOWN_SEC == 5
+    assert config.host == "127.0.0.1" and config.port == 1
+    capsys.readouterr()
+
+    jobs = config.app.state.jobs
+    release = threading.Event(); started = threading.Event()
+
+    def blocking(progress):
+        started.set(); release.wait(5)
+        return "ok"
+    job, _ = jobs.submit("checkin", "acme", "CASE-123", blocking)
+    assert started.wait(5)
+    # 何も走っていない案件のジョブは出ない: queued（同じ案件の後続）は running ではないので一覧に含めない
+    queued, _ = jobs.submit("checkout", "acme", "CASE-123", lambda progress: "later")
+    assert queued.status == "queued"
+    try:
+        server.handle_exit(signal.SIGTERM, None)
+        out = capsys.readouterr().out
+        assert server.exits == [signal.SIGTERM]                       # uvicorn 側の停止処理に渡している
+        lines = [ln for ln in out.splitlines() if "running job" in ln]
+        assert len(lines) == 1, out
+        listed = lines[0].split("running job(s): ", 1)[1].split(". jobs are not persisted", 1)[0]
+        assert "1 running job(s)" in lines[0] and "next checkin/checkout" in lines[0]
+        assert listed.startswith("checkin acme/CASE-123 (") and job.id in listed and queued.id not in listed
+    finally:
+        release.set()
+    assert job.wait(5) and queued.wait(5)
+    # running が無ければ何も出さない
+    server.handle_exit(signal.SIGTERM, None)
+    assert "running job" not in capsys.readouterr().out and server.exits == [signal.SIGTERM, signal.SIGTERM]

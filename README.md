@@ -100,12 +100,16 @@ systemctl --user status kairn-serve.service; journalctl --user -u kairn-serve
 - 対話項目: バインド先（既定 `127.0.0.1`。他を選ぶと「ネットワークに公開される」確認が出る）、ポート（既定 8765）、日次同期を回すワークスペース
   （設定にあるものから複数選択。無しも可）、日次の時刻（既定 12:30）、`enable --now` するか、ログインしていなくても起動するか
   （`loginctl enable-linger`。管理者認証を求められることがある。失敗しても他は続行）。
-- 生成先: `~/.config/systemd/user/kairn-serve.service`（`Restart=on-failure`）、`kairn-daily@.service`（テンプレート unit、`%i` = ワークスペース名）、
+- 生成先: `~/.config/systemd/user/kairn-serve.service`（`Restart=on-failure`、`TimeoutStopSec=15`）、`kairn-daily@.service`（テンプレート unit、`%i` = ワークスペース名）、
   `kairn-daily@<ws>.timer`（`Persistent=true`、`RandomizedDelaySec=10m`）。`ExecStart` には install-service を実行した `kairn` 自身の絶対パスが入る
   （`uv tool install` なら `~/.local/bin/kairn`、`.venv/bin/kairn` から実行すればそのパス）。既存の unit と差分があれば表示して上書きを確認する（`--yes` は上書き）。
 - 実行するもの: `systemctl --user daemon-reload` → `enable [--now] kairn-serve.service kairn-daily@<ws>.timer …` → （選んだ時だけ）`loginctl enable-linger` → `is-active` の表示。
   `systemctl` の無い環境では unit を書くだけにして案内を出す。
 - 選んだバインド先とポートは `~/.config/kairn/config.yaml` の `serve:` に書かれ、`kairn ensure` がそれを見る。ポートを変えたら各エージェントの MCP 登録 URL も合わせる。
+- 停止・再起動: `kairn serve` は SIGTERM を受けると開いている MCP 接続（SSE セッション）を最大 5 秒しか待たずに終了し、unit 側も
+  `TimeoutStopSec=15` で打ち切る。**`systemctl --user restart kairn-serve` が 90 秒待つ（`Failed with result 'timeout'`）場合は古い unit なので
+  `kairn install-service` を再実行して unit を更新する**（既存 unit との差分を表示して上書きを確認。`--yes` で確認なし。その後 `daemon-reload` まで行う）。
+  停止時に走っていたジョブ（checkin / 取り寄せ）はログ（`journalctl --user -u kairn-serve`）に 1 行残り、次回の checkin / checkout で整合する。
 
 `kairn ensure`: 設定のポートで `/mcp` が応答しなければ `kairn serve` を切り離して起動（`start_new_session`。出力は `~/.local/state/kairn/serve.log`）し、
 応答が出るまで最大 15 秒待つ（`--timeout`）。動いていれば何もしない。終了コード 0 = 応答あり。skill は案件を開く前にこれを 1 回実行する（service が止まっていた時の保険）。

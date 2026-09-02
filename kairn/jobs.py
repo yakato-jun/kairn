@@ -158,6 +158,11 @@ class JobTable:
             hits = [j for j in self._jobs.values() if (j.kind, j.workspace, j.case) == (kind, workspace, case)]
             return max(hits, key=lambda j: j._created_mono) if hits else None
 
+    def running_snapshot(self) -> list[Job]:
+        """running のジョブ（ロックを取らない）。停止シグナルのハンドラから呼ぶ用: ハンドラはメインスレッドで走るので、
+        メインスレッドがロック中に割り込むと通常の active() では固まる。list() のコピーは CPython では GIL の下で一気に行われる。"""
+        return [j for j in list(self._jobs.values()) if j.status == "running"]
+
     def all(self) -> list[Job]:
         with self._lock:
             self._prune_locked()
