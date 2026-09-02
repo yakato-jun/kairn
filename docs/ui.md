@@ -28,7 +28,8 @@
   - データ所在（case.json の `data[]`: Drive パスと復元コマンド `rclone copy <remote>:<path> <case_dir>/`）
   - summary（あれば objective の下）、症状 → 部品 → 原因（case.json の `causal[]`。あれば）
   - worklog.md（折りたたみ。全文）
-  - 時系列（events の直近 100 件、新しい順。actor で色分け（human / ai。kairn 等その他は既定色）、agent、task、note、証拠）
+  - 時系列（events の直近 100 件、新しい順。actor で色分け（human / ai。kairn 等その他は既定色）、agent、task、note、証拠。
+    ステータス変更（`action: status`）は `status <from> → <to> — note` で出す）
   - related（存在する案件はリンク）、elements（タグ。クリックで一覧の絞り込み）
 
 - **設定** `GET /ui/settings`（各ページのヘッダ右の「設定」リンク）
@@ -43,7 +44,7 @@
 | 差し戻し | `/ui/<ws>/<case>/sendback` `task, note` | `{actor: human, action: sendback, task, note}`。存在しない task は 400 |
 | コメント／指示 | `/ui/<ws>/<case>/comment` `note` | `{actor: human, action: comment, note}`。空は 400 |
 | タスク追加 | `/ui/<ws>/<case>/task` `title, owner` | 生きているタスク（open/doing/blocked/done）を全部引き継いだ**計画の新版**＋追加（actor=human）。superseded は出ない |
-| 案件の close/suspend | `/ui/<ws>/<case>/status` `status, note` | case.json の status 更新＋ `{actor: human, action: status}` |
+| 案件の close/suspend/reopen | `/ui/<ws>/<case>/status` `status, note` | case.json の status 更新＋ `{actor: human, action: status, from, to, note}`。既にそのステータスなら何も書かず案件ページへ戻る。open/closed/suspended 以外は 400 |
 | 下書きを取得 | `/ui/<ws>/<case>/extract` | `extract.extract_card` を threadpool で実行し（子プロセス待ちの間も同じプロセスの MCP を止めない）、結果画面（agent・所要時間・ok/失敗理由、現在の case.json と下書きの対比、症状→部品→原因、下書き JSON）を返す（200、リダイレクトしない）。下書きの `related` にワークスペースに実在しない案件 ID があれば `related_unknown` として ⚠ 印を付ける（適用しても related に入らない）。case.json は書かない。`{actor: kairn, agent: extract:<name>, action: extract}` |
 | この下書きを case.json に適用 | `/ui/<ws>/<case>/apply` `card`（下書き JSON。結果画面の hidden） | `related_unknown` を捨てて schema.json で再検証し、title / summary / elements / related / causal を置き換え＋ `{actor: human, action: decision, note: "applied extract draft"}`。不正な JSON・スキーマ不一致は 400 |
 

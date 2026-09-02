@@ -123,9 +123,14 @@ workspaces/<ws>/
  "evidence": [{"type": "commit", "repo": "acme-robot", "id": "abc1234"}, {"type": "pr", "id": 42}]}
 {"t": "…", "actor": "human", "action": "sendback", "task": "T012", "note": "unit-6 でも確認"}
 {"t": "…", "actor": "ai", "action": "plan", "plan": 3, "note": "指摘を受けて再計画"}
+{"t": "…", "actor": "human", "action": "status", "from": "open", "to": "closed", "note": "対応完了"}
+{"t": "…", "actor": "ai", "agent": "claude-code", "action": "status", "from": "closed", "to": "open", "note": "この案件を再開して"}
 ```
 `action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | status | extract
 （`checkout` は旧版が `open_case` のたびに書いていた action。読めるが、もう書かない）
+`status`（案件のステータス変更。`CaseStore.set_case_status`）は `from` / `to`（open | closed | suspended）と `note` を持つ。人の操作（UI の「案件の状態を変更」・
+CLI `kairn close | suspend | reopen`）は `actor: human`、MCP `set_case_status` は `actor: ai` で `note` に人の発言（`instruction`）そのもの。
+同じステータスへの変更は event を書かない（case.json も触らない）。旧版が書いた `from` / `to` の無い `status` 行（`note: "closed: 理由"`）は読める。
 `actor`: ai | human | kairn（kairn の自動処理: raw-move・extract 等。UI では既定色）。extract の event は `agent: "extract:<name>"`、`note`（ok / 失敗理由）、`elapsed_sec`、`exit_code`、`timeout_sec` を持つ
 
 ## 証拠（evidence）の型
