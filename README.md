@@ -45,7 +45,7 @@ docs/                  データモデル・MCP ツール・UI の仕様
 ```
 git clone <このリポジトリ> ~/kairn && cd ~/kairn
 uv tool install --editable . --python 3.13     # ~/.local/bin/kairn（--editable なので clone 先の変更がそのまま効く）
-kairn setup --remote <rclone remote>           # 使う remote（これ以外は使わない）。rclone config create <name> drive scope=drive で先に作る
+kairn setup --remote <rclone remote>           # 使う remote（これ以外は使わない）。rclone config create <name> drive scope=drive で先に作る（後述「専用 OAuth クライアント」を推奨）
 kairn attach <ws>                              # 各リポジトリで。ワークスペースが無ければ kairn ws create <ws>
 kairn install-skill                            # 各エージェントに skill を置き、workspaces/ の許可手順を表示
 kairn install-service                          # systemd user service（常駐・日次同期）を生成・登録（後述）
@@ -54,6 +54,28 @@ kairn install-service                          # systemd user service（常駐�
 - 更新: `cd ~/kairn && git pull && uv tool upgrade kairn`（`--editable` なので通常は `git pull` だけで反映される。依存が変わった時に upgrade）
 - 削除: `uv tool uninstall kairn`
 - 開発（テスト）: `uv sync --group dev && .venv/bin/pytest`。`.venv/bin/kairn` も同じ CLI だが、常駐 unit には `install-service` を実行した側の `kairn` のパスが入る
+
+### 専用 OAuth クライアント（推奨）
+
+rclone の Google Drive バックエンドはファイルごとに Drive API を呼ぶ。`rclone config create … drive` だけで作った remote は
+rclone 共有の client_id を使い、全 rclone 利用者で API レートを分け合うため、小ファイル多数の案件では転送が極端に遅い
+（実測: 1.3 MiB・多数の小ファイルで約 5 分）。rclone 公式も自前の OAuth client_id を推奨している（ https://rclone.org/drive/#making-your-own-client-id ）。
+`kairn setup` / `kairn status` は remote が `type = drive` で `client_id` が無いと「共有 client_id のため Drive API が絞られます」と警告する
+（`rclone config show <remote>` の `type` と `client_id` だけを見る。token 等の値は読まない）。
+
+1. Google Cloud のプロジェクトで Drive API を有効化する: `gcloud services enable drive.googleapis.com --project <project id>`、
+   または Cloud Console の「API とサービス」→「ライブラリ」→ Google Drive API →「有効にする」。
+2. **OAuth クライアントの作成は Cloud Console のみ**（`gcloud iap oauth-clients` は IAP 専用で 2026 年に停止済み。gcloud では作れない）:
+   Google Auth platform → Clients → Create Client → Application type「Desktop app」。表示される client ID と client secret を控える
+   （初回は Branding / Audience（External、テストユーザーに自分のアカウント）の設定を求められる）。
+3. remote に設定する: `rclone config` → `e`（edit existing remote）→ 対象の remote → `client_id` / `client_secret` に貼り付け（他はそのまま）。
+4. 再認可する: `rclone config reconnect <remote>:`（ブラウザで同意。client_id を変えると既存の token は使えない）。
+5. `kairn status` で警告が消えたことを確認し、`kairn rules set rclone_flags "--transfers 8 --checkers 16 --drive-pacer-min-sleep 10ms --drive-pacer-burst 200"`
+   で並列度を上げる（「同期」の `rules.rclone_flags`）。
+
+併せて、**小ファイル群（生成物: ビルド産物・ログ・CSV・キャッシュ等）は `kairn rules add-exclude '<pattern>'` で同期対象から外す**
+（例 `kairn rules add-exclude 'logs/**'`、`kairn rules add-exclude '*.csv'`）。client_id を変えても 1 ファイル 1 API 呼び出しは変わらないので、
+件数を減らすのが最も効く。`kairn checkin <ws> <case> --dry-run` で転送対象を確認できる。
 
 ## CLI（`kairn --help`）
 
@@ -64,7 +86,7 @@ kairn setup --remote <rclone remote> [--agent claude|codex|opencode|antigravity]
 kairn ws list | kairn ws create <name> [--description "…"]   # ワークスペース一覧（Drive 上の有無つき）／作成
 kairn attach <ws> [<repo path>...]        # リポジトリの所属を設定に記録する（省略時は cwd。リポジトリ側には何も作らない）
 kairn detach [<repo path>]                # 所属を外す（glob: 由来なら exclude: を書く）
-kairn status                              # 設定・cwd の所属・各ワークスペースの案件数と所属リポジトリ
+kairn status                              # 設定・cwd の所属・各ワークスペースの案件数と所属リポジトリ（remote が共有 client_id の Drive なら警告）
 kairn cases [<ws>] [--all]                # 案件一覧（既定は open のみ）
 kairn new <case id> "<title>" [--ws <ws>] # 案件を作る（case.json）
 kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新（--dry-run では索引を書き換えない）。同期実行（タイムアウト無し）。案件省略時は manifest の rev がローカルと違う案件だけ
@@ -265,7 +287,8 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
     ファイルパターンはどの階層のそのファイルにも一致。rclone のフィルタ規則）。除外したものは同期も `raw-move` もされない（ローカルにだけ残る）
   - 書き換えは **`kairn rules …` か UI の設定ページ（`/ui/settings`）で行う**（`~/.config/kairn/config.yaml` の `rules:` を kairn が書く。
     手では編集しない。値は検証され、不正なら拒否）: `kairn rules set raw_data.min_size 10M`、`kairn rules add-exclude 'logs/**'`、
-    `kairn rules add-raw-ext mcap`、`kairn rules set bwlimit "08:00,4M 20:00,off"`（`off` で制限なし）、`kairn rules show` で現在値。
+    `kairn rules add-raw-ext mcap`、`kairn rules set bwlimit "08:00,4M 20:00,off"`（`off` で制限なし）、
+    `kairn rules set rclone_flags "--transfers 8 --checkers 16"`（空文字で既定の空に戻す）、`kairn rules show` で現在値。
     `kairn setup` / `attach` / `install-service` は既存の `rules` を引き継ぐ。**常駐中の `kairn serve` は起動時に読んだ `rules` を使い続ける**
     （CLI で変えた後は `systemctl --user restart kairn-serve.service`。UI から変えた場合はそのプロセスに即時反映される）。
     変更後は `kairn checkin <ws> <case> --dry-run` で転送対象を確認する（`-v` の出力に転送するファイル名が出る）。
