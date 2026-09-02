@@ -325,7 +325,7 @@ def cmd_rules(a):
             cfg.remove_raw_ext(conf, a.ext); print(f"raw_data.extensions -= {a.ext}")
     except ValueError as e:
         raise SystemExit(f"kairn: {e}") from None
-    print(f"saved: {conf.path} (a running kairn serve keeps its loaded rules until restarted)")
+    print(f"saved: {conf.path}")
 
 
 def cmd_serve(a):

@@ -36,6 +36,8 @@
   同期・退避規則 `rules` の現在値（`raw_data.min_size` / `raw_data.min_age` / `bag_to_zst` / `bwlimit` / `rclone_flags`、`exclude` の一覧、
   `raw_data.extensions` の一覧）と、CLI の `kairn rules …` と同じ操作のフォーム。設定ファイル（`~/.config/kairn/config.yaml`）は
   kairn が書き、人は手で編集しない。保存後は `?saved=<メッセージ>` 付きで同じページに戻る（303）。案件の event には記録しない。
+  保存は設定ファイルに書くだけで、同じプロセスの MCP を含む次のリクエストから反映される（各ハンドラは入口で `ConfigHolder.current()` を取る。
+  CLI で変えた設定・足したワークスペースも同様に次のページ表示から出る。docs/mcp-tools.md「設定」）。
 
 ## 操作（すべて event として記録。AI は次に open_case した時に `human_feedback` で受け取る）
 

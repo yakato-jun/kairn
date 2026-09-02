@@ -51,7 +51,8 @@ kairn install-skill                            # 各エージェントに skill 
 kairn install-service                          # systemd user service（常駐・日次同期）を生成・登録（後述）
 ```
 
-- 更新: `cd ~/kairn && git pull && uv tool upgrade kairn`（`--editable` なので通常は `git pull` だけで反映される。依存が変わった時に upgrade）
+- 更新: `cd ~/kairn && git pull && uv tool upgrade kairn`（`--editable` なので通常は `git pull` だけで反映される。依存が変わった時に upgrade）。
+  常駐中の `kairn serve` は古いコードのまま動いているので `systemctl --user restart kairn-serve.service`（「設定の反映と再起動」）
 - 削除: `uv tool uninstall kairn`
 - 開発（テスト）: `uv sync --group dev && .venv/bin/pytest`。`.venv/bin/kairn` も同じ CLI だが、常駐 unit には `install-service` を実行した側の `kairn` のパスが入る
 
@@ -143,6 +144,22 @@ systemctl --user status kairn-serve.service; journalctl --user -u kairn-serve
 
 `kairn ensure`: 設定のポートで `/mcp` が応答しなければ `kairn serve` を切り離して起動（`start_new_session`。出力は `~/.local/state/kairn/serve.log`）し、
 応答が出るまで最大 15 秒待つ（`--timeout`）。動いていれば何もしない。終了コード 0 = 応答あり。skill は案件を開く前にこれを 1 回実行する（service が止まっていた時の保険）。
+
+#### 設定の反映と再起動
+
+常駐中の `kairn serve` は、MCP のツール呼び出しと UI のリクエストのたびに `~/.config/kairn/config.yaml` の更新（mtime / size / inode）を
+確認し、変わっていれば読み直す（`kairn/config.py` `ConfigHolder`）。**再起動は要らない**:
+
+- `kairn ws create` / `attach` / `detach`、`kairn rules …`、UI の設定ページ、`kairn setup`（remote / extract）の変更は、次のツール呼び出し・
+  次のページ表示から効く（新しいワークスペースの案件を `open_case` で開ける。`rclone_flags` は次に起動する checkin / 取り寄せジョブから）。
+  1 回の呼び出しの間は入口で読んだ設定を使い、走っているジョブは投入時点の設定のまま終わる。
+- 読み直せない設定（壊れた YAML・`drive.remote` 無し・ファイル消失）は無視して直前の設定で動き続け、ログ（`journalctl --user -u kairn-serve`）に
+  警告が 1 行出る。
+
+再起動が要るのは次の 2 つだけ: **kairn 自体の更新**（`git pull` / `uv tool upgrade` の後: `systemctl --user restart kairn-serve.service`）と
+**unit の変更**（バインド先・ポート: `kairn install-service` を再実行して unit を書き直し、`systemctl --user restart kairn-serve.service`。
+`serve:` の `host` / `port` は unit の `ExecStart` と `kairn ensure` が使うもので、常駐中のプロセスが読み直しても bind し直さない）。
+日次同期（`kairn-daily@<ws>.service`）は CLI として毎回設定を読むので何もしなくてよい。
 
 ### 2. skill を置く（Claude Code / Codex / OpenCode 共通の SKILL.md）
 
@@ -292,8 +309,8 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkout → checkin →
     手では編集しない。値は検証され、不正なら拒否）: `kairn rules set raw_data.min_size 10M`、`kairn rules add-exclude 'logs/**'`、
     `kairn rules add-raw-ext mcap`、`kairn rules set bwlimit "08:00,4M 20:00,off"`（`off` で制限なし）、
     `kairn rules set rclone_flags "--transfers 8 --checkers 16"`（空文字で既定の空に戻す）、`kairn rules show` で現在値。
-    `kairn setup` / `attach` / `install-service` は既存の `rules` を引き継ぐ。**常駐中の `kairn serve` は起動時に読んだ `rules` を使い続ける**
-    （CLI で変えた後は `systemctl --user restart kairn-serve.service`。UI から変えた場合はそのプロセスに即時反映される）。
+    `kairn setup` / `attach` / `install-service` は既存の `rules` を引き継ぐ。常駐中の `kairn serve` はリクエストのたびに設定ファイルの
+    更新を確認して読み直すので、CLI で変えても UI で変えても次の呼び出しから効く（再起動不要。「設定の反映と再起動」）。
     変更後は `kairn checkin <ws> <case> --dry-run` で転送対象を確認する（`-v` の出力に転送するファイル名が出る）。
 - **作業領域は同期しない**: 案件フォルダ内に git worktree（`.git` がファイル）や `.kairn-nosync`（空ファイル）を直下に置いたディレクトリは、
   配下ごと checkout / checkin / raw-move / 索引の対象外（docs/data-model.md「作業領域の除外」）。通常の clone は `.git/` だけが既定の

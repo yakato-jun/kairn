@@ -26,6 +26,11 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
   次回の同じ案件の `checkin` / `checkout`（`open_case` の取り寄せ）で整合する（checkin は `events.jsonl` をマージしてから rclone sync、
   checkout は `--update` なので、やり直せば同じ結果になる）。停止時に running だったジョブは `kairn serve` のログに 1 行残る。大きな初回投入（数百 MB）は MCP ではなく CLI の
   `kairn checkin <ws> <case>`（同期・タイムアウト無し）で行う（README「同期」）。
+- **設定**: 全ツールは呼び出しの入口で `ConfigHolder.current()`（`kairn/config.py`）から設定を取る。`~/.config/kairn/config.yaml` が
+  変わっていれば（mtime / size / inode）そこで読み直すので、`kairn ws create` / `attach` / `rules …` や UI の設定ページの変更は
+  `kairn serve` を再起動せずに次の呼び出しから効く（新しいワークスペースを `workspace=` に渡せる）。1 回の呼び出しの間は同じ設定を使い、
+  ジョブ（`checkin` / 取り寄せ）は投入時点の設定を使う。読み直せない設定（壊れた YAML 等）は無視して直前の設定で動き、ログに警告 1 行。
+  再起動が要るのは kairn 自体の更新と unit（バインド先・ポート）の変更だけ（README「設定の反映と再起動」）。
 - **索引**: `search` / `find_cases` は呼び出しのたびに SQLite FTS5（trigram）索引を差分更新してから検索する（`kairn/index.py`）。
   シンボリックリンクと生成物ディレクトリ（target / build / node_modules / .venv / __pycache__）は索引しない。
   **trigram の制約**: 3 文字未満の語は索引に載らない（MATCH に渡せない）。3 文字未満の語だけの問いは LIKE（`search`: 節本文・案件 ID、
