@@ -6,6 +6,7 @@
               kairn attach / detach が書く（glob: は展開時にディレクトリだけ採る。exclude: は glob: の展開から外す（detach が書く）。
               未知のキー・空文字は拒否）。repos は「cwd がどのワークスペースに属するか」を決めるためだけの対応表で、
               リポジトリ側には何も作らない（案件は DATA_ROOT/<name>/cases/ にだけある）
+  serve:      {host: 127.0.0.1, port: 8765}               kairn install-service が書く。kairn ensure が /mcp の応答確認と起動に使う
   rules:      同期・退避規則（既定値あり）
 
 規則:
@@ -36,6 +37,8 @@ DEFAULT_RULES = {
 }
 DEFAULT_EXTRACT_TIMEOUT_SEC = 600  # extract の子エージェントのタイムアウト（秒）。extract.timeout
 DEFAULT_EXTRACT_AGENT = "claude"
+DEFAULT_SERVE_HOST = "127.0.0.1"
+DEFAULT_SERVE_PORT = 8765
 
 
 @dataclass
@@ -93,6 +96,8 @@ class Config:
     workspaces: dict[str, Workspace]
     path: Path = USER_CONFIG_PATH
     extract_timeout: int = DEFAULT_EXTRACT_TIMEOUT_SEC
+    serve_host: str = DEFAULT_SERVE_HOST
+    serve_port: int = DEFAULT_SERVE_PORT
 
     def drive_path(self, ws: str, *parts: str) -> str:
         return f"{self.remote}:{'/'.join([self.drive_root, ws, *parts]).strip('/')}"
@@ -113,6 +118,7 @@ class Config:
         return {
             "drive": {"remote": self.remote, "root": self.drive_root},
             "extract": {"agent": self.extract_agent, "timeout": self.extract_timeout},
+            "serve": {"host": self.serve_host, "port": self.serve_port},
             "rules": self.rules,
             "workspaces": {
                 n: {"description": w.description, "repos": list(w.repo_specs)}
@@ -183,8 +189,15 @@ def _parse(raw: dict, path: Path) -> Config:
     timeout = ext.get("timeout", DEFAULT_EXTRACT_TIMEOUT_SEC)
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise SystemExit(f"kairn: extract.timeout must be a positive integer (seconds), got {timeout!r}")
+    serve = raw.get("serve") or {}
+    port = serve.get("port", DEFAULT_SERVE_PORT)
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+        raise SystemExit(f"kairn: serve.port must be an integer 1..65535, got {port!r}")
+    host = serve.get("host", DEFAULT_SERVE_HOST)
+    if not isinstance(host, str) or not host.strip():
+        raise SystemExit(f"kairn: serve.host must be a non-empty string, got {host!r}")
     return Config(remote=remote, drive_root=drive.get("root", "ws"), extract_agent=ext.get("agent", DEFAULT_EXTRACT_AGENT),
-                  rules=rules, workspaces=wss, path=path, extract_timeout=timeout)
+                  rules=rules, workspaces=wss, path=path, extract_timeout=timeout, serve_host=host, serve_port=port)
 
 
 def load(path: Path | None = None) -> Config:
@@ -196,7 +209,7 @@ def load(path: Path | None = None) -> Config:
 
 def create(remote: str, agent: str | None = None, path: Path | None = None, drive_root: str = "ws",
            extract_timeout: int | None = None) -> Config:
-    """設定を書く（既存の rules / workspaces / extract.agent / extract.timeout は引き継ぐ）。
+    """設定を書く（既存の rules / workspaces / extract.agent / extract.timeout / serve は引き継ぐ）。
     agent=None / extract_timeout=None なら既存値（無ければ既定 claude / 600）。"""
     path = path or USER_CONFIG_PATH
     existing = load(path) if path.exists() else None
@@ -207,7 +220,9 @@ def create(remote: str, agent: str | None = None, path: Path | None = None, driv
     if extract_timeout <= 0:
         raise SystemExit(f"kairn: extract timeout must be a positive integer (seconds), got {extract_timeout!r}")
     conf = Config(remote=remote, drive_root=drive_root, extract_agent=agent, rules=dict(existing.rules if existing else DEFAULT_RULES),
-                  workspaces=dict(existing.workspaces if existing else {}), path=path, extract_timeout=extract_timeout)
+                  workspaces=dict(existing.workspaces if existing else {}), path=path, extract_timeout=extract_timeout,
+                  serve_host=existing.serve_host if existing else DEFAULT_SERVE_HOST,
+                  serve_port=existing.serve_port if existing else DEFAULT_SERVE_PORT)
     conf.save()
     return conf
 

@@ -14,6 +14,7 @@
   kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]
                                          # 子エージェントで case.json の下書きを作る（書き込まない。適用は UI）
   kairn serve [--port 8765]              # MCP + UI
+  kairn install-service [--yes] [--print]  # systemd user unit（kairn-serve.service / kairn-daily@<ws>.timer）を生成して登録（対話式。--yes は既定値、--print は内容表示のみ）
   kairn install-skill [--home <dir>]     # <home>/.agents/skills/kairn と <home>/.claude/skills/kairn を skills/kairn へのリンクにする（既存は上書きしない）。
                                          # 最後に、各エージェントがデータ領域（workspaces/）を読み書きするための許可設定手順を表示する
 """
@@ -264,6 +265,18 @@ def cmd_install_skill(a):
     print(permission_notes())
 
 
+def cmd_install_service(a):
+    conf = cfg.load()
+    from . import service
+    if a.print:
+        opts = service.interview(conf, yes=True)
+        for name, body in service.render_units(opts, service.self_command()).items():
+            print(f"# ==== {service.unit_dir() / name}\n{body}")
+        return
+    opts = service.interview(conf, yes=a.yes)
+    sys.exit(service.install(conf, opts, yes=a.yes))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="kairn", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -282,6 +295,7 @@ def main() -> None:
     s = sub.add_parser("extract", help="draft case.json with an isolated child agent (read-only; apply in the UI)"); s.add_argument("case"); s.add_argument("--ws"); s.add_argument("--agent", choices=["claude", "codex", "opencode", "antigravity"]); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_extract)
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8765); s.set_defaults(f=cmd_serve)
     s = sub.add_parser("install-skill", help="symlink skills/kairn into ~/.agents/skills and ~/.claude/skills (existing entries are kept)"); s.add_argument("--home", default="~", help="HOME to install into (default: ~)"); s.set_defaults(f=cmd_install_skill)
+    s = sub.add_parser("install-service", help="generate systemd user units (kairn-serve.service, kairn-daily@<ws>.timer) and enable them"); s.add_argument("--yes", action="store_true", help="非対話（既定値: 127.0.0.1:8765、設定の全ワークスペースを 12:30、enable --now、linger なし。既存 unit は上書き）"); s.add_argument("--print", action="store_true", help="書き込む unit の内容を表示するだけ（ファイルもコマンドも実行しない）"); s.set_defaults(f=cmd_install_service)
     a = ap.parse_args()
     cfg.assert_data_not_tracked()
     a.f(a)

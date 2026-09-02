@@ -77,6 +77,7 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 kairn extract <case> [--ws <ws>] [--agent …] [--json]   # 子エージェントで case.json の下書き（書き込まない）
 kairn serve [--host 127.0.0.1] [--port 8765]            # MCP（/mcp）＋ UI（/ui）
 kairn install-skill [--home <dir>]        # skills/kairn を ~/.agents/skills と ~/.claude/skills からリンク
+kairn install-service [--yes] [--print]   # systemd user unit（常駐 kairn-serve.service ＋ 日次 kairn-daily@<ws>.timer）を生成して登録（対話式）
 ```
 
 ## 各エージェントへの適用
