@@ -4,6 +4,8 @@
 - UI : /ui                      （kairn/ui.py。Mount ではなく同じ Starlette にルートを直接載せる）
 規則の実体は store（証拠必須・superseded 自動化）。ここでは引数を検証して委譲する。
 ツール内の失敗は ToolError で返す（呼び出し元のエージェントに理由が文章で届く）。
+rclone の転送（checkin、open_case の取り寄せ）はジョブ（kairn/jobs.py、デーモンスレッド）にして即座に job_id を返す
+（大きな案件で MCP クライアントの呼び出しタイムアウトに当たらないため）。状態は job_status で見る。
 """
 from __future__ import annotations
 
@@ -19,12 +21,13 @@ from starlette.routing import Mount, Route
 
 from . import config as cfg
 from .index import Index
+from .jobs import JobTable
 from .store import CaseNotFound, CaseStore, append_access_log, validate_case_id
 
 INSTRUCTIONS = (
     "kairn: 案件（case）単位の作業ログ。案件を開くときは open_case（無ければ find_cases / list_cases で選ぶ。選ぶのは人）。"
     "作業したら log_event / update_task（done は証拠必須）。方針が変わったら plan で計画を出し直す（載せなかった open タスクは superseded になる）。"
-    "終わったら checkin。ワークスペースをまたぐ参照はしない。"
+    "終わったら checkin（ジョブとして走る。job_status で done を確認する）。ワークスペースをまたぐ参照はしない。"
 )
 MCP_PATH = "/mcp"
 UI_PATH = "/ui"
@@ -36,9 +39,11 @@ def _fail(e: Exception) -> ToolError:
     return ToolError(f"{type(e).__name__}: {e}")
 
 
-def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer:
-    """設定に閉じた MCP サーバーを作る（テストでは in-process の Client から直接繋ぐ）。"""
+def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTable | None = None) -> MCPServer:
+    """設定に閉じた MCP サーバーを作る（テストでは in-process の Client から直接繋ぐ）。
+    jobs は checkin / 取り寄せのジョブ表（UI と共有する。省略時は専用に作る）。"""
     mcp = MCPServer("kairn", instructions=INSTRUCTIONS, version="0.0.1")
+    jobs = jobs if jobs is not None else JobTable()
 
     def _ws(workspace: str | None, case: str | None = None) -> cfg.Workspace:
         if case is not None:  # ファイルシステムに触れる前に案件 ID を検証する（"../x" 等）
@@ -77,12 +82,15 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
         ws = _ws(workspace, case); st = _store(ws)
         try:
             st.case_dir(case)  # ID の検証（Drive 取り寄せの前）
-            # 順序: ワークスペース解決 → checkout（events.jsonl はマージ、他は --update）→ 読み込み。返り値はすべて取り寄せ後のディスクから読む
-            fetched = _fetch_from_drive(conf, ws, st, case)
+            # 順序: ワークスペース解決 → 取り寄せジョブの起動（events.jsonl はマージ、他は --update。待たない）→ 今のローカル内容を読む。
+            # 取り寄せ完了後（job_status が done）にもう一度 open_case すると最新になる
+            fetched = _fetch_from_drive(conf, ws, st, case, jobs)
             try:
                 c = st.load_case(case)
             except CaseNotFound:
-                raise ToolError(f"unknown case {case!r} in workspace {ws.name!r} (drive: {fetched})") from None
+                raise ToolError(f"unknown case {case!r} in workspace {ws.name!r} (drive: {fetched})"
+                                + ("; the case may exist only on the drive: wait for job_status to report done, then open_case again"
+                                   if fetched.get("job_id") else "")) from None
             plan = st.current_plan(case)
             all_events = st.events(case)
             feedback = [e for e in all_events if e.get("actor") == "human" and e.get("action") in ("sendback", "comment")][-5:]
@@ -166,16 +174,27 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
 
     @mcp.tool()
     def checkin(case: str, workspace: str | None = None, agent: str = "") -> dict[str, Any]:
-        """ローカルの案件を Drive（設定済み remote）に戻し、checkin event を記録する。"""
+        """ローカルの案件を Drive（設定済み remote）に戻すジョブを起動し、即座に {job_id, status, note} を返す。完了は job_status(job_id) が done になったとき（result に従来の結果と last_checkin_at）。同じ案件の checkin が走っていればその job_id を返す。"""
         from . import sync
         ws = _ws(workspace, case); st = _store(ws)
         try:
             st.load_case(case)
-            msg = sync.checkin(conf, ws, case)  # 成功時に case.json.last_checkin_at を更新する
         except Exception as e:
             raise _fail(e) from e
-        st.append_event(case, {"actor": "ai", "agent": _agent(agent), "action": "checkin", "note": msg[-200:]})
-        return {"ok": True, "rclone": msg, "last_checkin_at": st.load_case(case).get("last_checkin_at")}
+        agent_name = _agent(agent)
+        job, created = jobs.submit("checkin", ws.name, case, lambda progress: sync.checkin_job(conf, ws, case, agent_name, progress))
+        note = ("checkin started in the background; poll job_status(job_id) until status is done (or failed: see error)"
+                if created else "a checkin for this case is already running; poll job_status(job_id) for that one")
+        return {"job_id": job.id, "status": job.status, "note": note}
+
+    @mcp.tool()
+    def job_status(job_id: str) -> dict[str, Any]:
+        """ジョブ（checkin / open_case の取り寄せ）の状態: {job_id, kind, case, status: queued|running|done|failed, progress, elapsed_sec, result, error}。done なら result に従来の結果（checkin: ok / rclone / last_checkin_at）。ジョブ表はサーバーのメモリ内（再起動で消える）。"""
+        job = jobs.get(job_id)
+        if job is None:
+            raise ToolError(f"unknown job {job_id!r} (jobs live in the server's memory: finished ones are dropped after 24h / 200 entries, "
+                            "and all are lost when kairn serve restarts. the case's last_checkin_at and checkin event still show whether a checkin completed)")
+        return job.to_dict()
 
     @mcp.tool()
     def extract_card(case: str, workspace: str | None = None) -> dict[str, Any]:
@@ -199,24 +218,27 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown") -> MCPServer
     return mcp
 
 
-def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, st: CaseStore, case: str) -> dict[str, Any]:
+def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, st: CaseStore, case: str, jobs: JobTable) -> dict[str, Any]:
     """open_case の取り寄せ。case.json.last_checkin_at より新しいローカル変更があれば skip（未 checkin の変更を Drive で上書きしない）。
     open_case 自身は events.jsonl に書かない（閲覧記録は index/access.log）ので、繰り返し開いても skip にならない。
-    失敗してもローカル写しで続行し、その旨を返す（docs/mcp-tools.md）。"""
+    skip でなければ checkout をジョブとして起動し、待たずに {fetched: False, job_id, status, note} を返す（open_case は今のローカル内容を返す。
+    取り寄せ完了後の再 open_case で最新になる）。同じ案件の取り寄せが走っていればその job_id。rclone の失敗はジョブの error に残る（docs/mcp-tools.md）。"""
     from . import sync
     changed = st.local_changes_since_checkin(case)
     if changed:
         return {"fetched": False, "skipped": "local changes newer than last checkin", "files": changed}
-    try:
-        return {"fetched": True, "rclone": sync.checkout(conf, ws, case)}
-    except Exception as e:  # rclone 不在・remote 不達など
-        return {"fetched": False, "error": str(e)[-300:], "note": "continuing with local copy"}
+    job, created = jobs.submit("checkout", ws.name, case, lambda progress: sync.checkout(conf, ws, case, progress=progress))
+    return {"fetched": False, "job_id": job.id, "status": job.status,
+            "note": ("fetching from the drive in the background; this result is the current local copy. "
+                     "open_case again after job_status(job_id) reports done" if created
+                     else "a fetch for this case is already running; this result is the current local copy")}
 
 
 def build_app(conf: cfg.Config, host: str = "127.0.0.1", default_agent: str = "unknown") -> Starlette:
     """UI（/ui…）と MCP（/mcp）を 1 つの Starlette に載せる。/ は /ui へ。"""
     from .ui import ui_routes
-    mcp = create_server(conf, default_agent)
+    jobs = JobTable()  # MCP と UI で共有（UI は案件ページに進行中のジョブを出す）
+    mcp = create_server(conf, default_agent, jobs)
     mcp_app = mcp.streamable_http_app(streamable_http_path=MCP_PATH, host=host)
 
     @contextlib.asynccontextmanager
@@ -224,10 +246,11 @@ def build_app(conf: cfg.Config, host: str = "127.0.0.1", default_agent: str = "u
         async with mcp.session_manager.run():
             yield
 
-    routes = [Route("/", lambda r: RedirectResponse(UI_PATH)), *ui_routes(conf, UI_PATH),
+    routes = [Route("/", lambda r: RedirectResponse(UI_PATH)), *ui_routes(conf, UI_PATH, jobs),
               Mount("/", app=mcp_app)]  # Mount は残り全部を受けるので最後
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.mcp = mcp
+    app.state.jobs = jobs
     return app
 
 

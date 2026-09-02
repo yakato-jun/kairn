@@ -18,6 +18,7 @@ from starlette.responses import HTMLResponse, PlainTextResponse, RedirectRespons
 from starlette.routing import Route
 
 from . import config as cfg
+from .jobs import JobTable
 from .store import JST, TASK_OWNERS, CaseStore
 
 STALE_DAYS = 7  # これを超えて動きの無い open タスクを目立たせる（自動では消さない）
@@ -81,7 +82,8 @@ def _age(f: dict | None) -> str:
     return f"<span class='{cls}'>{f['days']}d{' ⚠' if f['stale'] else ''}</span>"
 
 
-def ui_routes(conf: cfg.Config, prefix: str = "/ui") -> list[Route]:
+def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = None) -> list[Route]:
+    """jobs: MCP と共有するジョブ表（進行中の checkin / 取り寄せを案件ページに出す。None なら表示しない）。"""
     P = prefix.rstrip("/")
 
     def _page(title: str, body: str) -> HTMLResponse:
@@ -304,6 +306,6 @@ def _evidence(e: object) -> str:
     return str(e)
 
 
-def build_ui(conf: cfg.Config, prefix: str = "/ui") -> Starlette:
+def build_ui(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = None) -> Starlette:
     """UI 単体のアプリ（テスト用）。本番は server.build_app が同じルートを /mcp と同居させる。"""
-    return Starlette(routes=ui_routes(conf, prefix))
+    return Starlette(routes=ui_routes(conf, prefix, jobs))

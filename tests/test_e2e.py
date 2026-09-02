@@ -55,6 +55,16 @@ def _cli(env, *args, **kw):
     return subprocess.run([PY, "-m", "kairn.cli", *args], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60, **kw)
 
 
+async def _job(c, job_id, timeout=30.0):
+    """job_status を done / failed になるまでポーリングする（HTTP 経由なので job 表には触れない）。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        s = (await c.call_tool("job_status", {"job_id": job_id})).structured_content
+        if s["status"] in ("done", "failed") or time.monotonic() > deadline:
+            return s
+        await anyio.sleep(0.05)
+
+
 def test_end_to_end(tmp_path, env, fake_rclone):
     repo = tmp_path / "acme-robot"; (repo / "tmp" / "old-notes").mkdir(parents=True)   # 既存の tmp/ 実体があっても attach できる
     r = _cli(env, "attach", "acme", str(repo)); assert r.returncode == 0, r.stderr
@@ -87,7 +97,7 @@ def test_end_to_end(tmp_path, env, fake_rclone):
         async def mcp_flow():
             async with Client(base + "/mcp") as c:
                 names = {t.name for t in (await c.list_tools()).tools}
-                assert names == {"open_case", "list_cases", "plan", "update_task", "log_event", "search", "find_cases", "checkin", "drive_index", "extract_card"}
+                assert names == {"open_case", "list_cases", "plan", "update_task", "log_event", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status"}
                 r = await c.call_tool("plan", {"case": "CASE-123", "objective": "boot works", "reason": "initial", "tasks": [{"title": "調査"}, {"title": "修正"}]})
                 assert not r.is_error and r.structured_content["version"] == 1
                 r = await c.call_tool("update_task", {"case": "CASE-123", "task": "T001", "status": "done", "note": "x"})
@@ -103,9 +113,14 @@ def test_end_to_end(tmp_path, env, fake_rclone):
                 r = await c.call_tool("open_case", {"case": "CASE-123"})
                 oc = r.structured_content
                 assert not r.is_error and oc["human_feedback"][-1]["note"] == "unit-6 でも確認" and oc["human_feedback"][-1]["task"] == "T002"
-                assert oc["drive"]["fetched"] is True  # 偽 rclone が成功を返す
+                assert oc["drive"]["job_id"] and oc["drive"]["fetched"] is False  # 取り寄せはジョブ（待たない）
+                assert (await _job(c, oc["drive"]["job_id"]))["status"] == "done"   # 偽 rclone が成功を返す
                 r = await c.call_tool("checkin", {"case": "CASE-123"})
-                assert not r.is_error and r.structured_content["ok"]
+                assert not r.is_error and r.structured_content["job_id"]
+                js = await _job(c, r.structured_content["job_id"])
+                assert js["status"] == "done" and js["result"]["ok"] and js["result"]["last_checkin_at"], js
+                r = await c.call_tool("job_status", {"job_id": "nope"})
+                assert r.is_error and "unknown job" in r.content[0].text
         anyio.run(mcp_flow)
 
         # UI 操作: 一覧・案件・タスク追加・コメント

@@ -1,5 +1,8 @@
-"""MCP サーバー（mcp 2.x）: in-process の Client で 10 ツールを呼ぶ。rclone は monkeypatch。"""
+"""MCP サーバー（mcp 2.x）: in-process の Client で 11 ツールを呼ぶ。rclone は monkeypatch。
+checkin と open_case の取り寄せはジョブ（スレッド）なので、結果を見る前に job.wait() で完了を待つ（_checkin / _open）。"""
 from __future__ import annotations
+
+import threading
 
 import anyio
 import pytest
@@ -7,21 +10,52 @@ from mcp.client import Client
 
 from kairn import server as srv
 from kairn import sync
+from kairn.jobs import JobTable
 from kairn.store import CaseStore
 
-TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "search", "find_cases", "checkin", "drive_index", "extract_card"}
+TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status"}
 
 
 @pytest.fixture
 def mocked_rclone(monkeypatch, conf):
     calls = []
-    monkeypatch.setattr(sync, "checkout", lambda c, ws, case=None, dry=False: calls.append(("checkout", ws.name, case)) or "fake checkout")
-    monkeypatch.setattr(sync, "checkin", lambda c, ws, case=None, dry=False: calls.append(("checkin", ws.name, case)) or "fake checkin")
+    monkeypatch.setattr(sync, "checkout", lambda c, ws, case=None, dry=False, **kw: calls.append(("checkout", ws.name, case)) or "fake checkout")
+    monkeypatch.setattr(sync, "checkin", lambda c, ws, case=None, dry=False, **kw: calls.append(("checkin", ws.name, case)) or "fake checkin")
     return calls
+
+
+@pytest.fixture
+def jobs():
+    return JobTable()
 
 
 def run(coro_fn):
     return anyio.run(coro_fn)
+
+
+def _wait(jobs: JobTable, job_id: str, timeout: float = 5.0):
+    job = jobs.get(job_id)
+    assert job is not None and job.wait(timeout), f"job {job_id} did not finish"
+    return job
+
+
+async def _checkin(c, jobs, case, **kw):
+    """checkin を呼び、ジョブの完了を待って job_status の結果（dict）を返す。"""
+    r = await c.call_tool("checkin", {"case": case, **kw})
+    assert not r.is_error, r.content
+    job_id = r.structured_content["job_id"]
+    _wait(jobs, job_id)
+    s = await c.call_tool("job_status", {"job_id": job_id})
+    assert not s.is_error, s.content
+    return s.structured_content
+
+
+async def _open(c, jobs, case, **kw):
+    """open_case を呼び、取り寄せジョブが起動していればその完了を待つ（返り値は open_case の結果そのまま＝取り寄せ前のローカル内容）。"""
+    r = await c.call_tool("open_case", {"case": case, **kw})
+    if not r.is_error and r.structured_content["drive"].get("job_id"):
+        _wait(jobs, r.structured_content["drive"]["job_id"])
+    return r
 
 
 def test_tools_listed_with_instructions(conf):
@@ -36,12 +70,12 @@ def test_tools_listed_with_instructions(conf):
     run(main)
 
 
-def test_full_flow(conf, mocked_rclone):
+def test_full_flow(conf, mocked_rclone, jobs):
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-123", "起動時に driver が初期化されない", "acme", actor="human", elements={"machine": ["unit-2"]}, related=["CASE-100"])
     (ws.cases_dir / "CASE-123" / "worklog.md").write_text("# t\n## Objective\n起動時に widget driver の init が終わらない\n## Notes\nUART 460800 で送信量が超過する\n", encoding="utf-8")
-    mcp = srv.create_server(conf, default_agent="test-agent")
+    mcp = srv.create_server(conf, default_agent="test-agent", jobs=jobs)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
@@ -79,20 +113,22 @@ def test_full_flow(conf, mocked_rclone):
             assert lc[0]["case"] == "CASE-123" and lc[0]["progress"] == {"total": 2, "done": 1, "open": 1, "plan": 1}
             # human sendback via store (UI と同じ書き込み) -> open_case の human_feedback に出る
             st.append_event("CASE-123", {"actor": "human", "action": "sendback", "task": "T001", "note": "unit-6 でも確認"})
-            r = await c.call_tool("open_case", {"case": "CASE-123"})
+            r = await _open(c, jobs, "CASE-123")
             oc = r.structured_content
             assert not r.is_error and oc["case"]["id"] == "CASE-123" and oc["plan"]["version"] == 1
             assert [t["id"] for t in oc["open_tasks"]] == ["T002"]
             assert oc["human_feedback"][-1]["note"] == "unit-6 でも確認" and oc["related"] == ["CASE-100"]
-            assert "460800" in oc["worklog_tail"] and oc["drive"]["fetched"] is True
+            assert "460800" in oc["worklog_tail"] and oc["drive"]["fetched"] is False and oc["drive"]["job_id"]
+            assert jobs.get(oc["drive"]["job_id"]).kind == "checkout" and jobs.get(oc["drive"]["job_id"]).result == "fake checkout"
             assert st.events("CASE-123")[-1]["action"] == "sendback"  # open_case は events.jsonl に書かない
             assert (ws.index_dir / "access.log").read_text().splitlines()[-1].split("\t")[1:] == ["CASE-123", "test-agent"]
             # re-plan without carrying T002 -> superseded
             r = await c.call_tool("plan", {"case": "CASE-123", "objective": "unit-6 も", "reason": "sendback", "tasks": [{"title": "unit-6 で確認"}]})
             assert r.structured_content["superseded"] == ["T002"]
-            # checkin / drive_index
-            r = await c.call_tool("checkin", {"case": "CASE-123"})
-            assert not r.is_error and r.structured_content["ok"] and st.events("CASE-123")[-1]["action"] == "checkin"
+            # checkin（ジョブ）/ drive_index
+            js = await _checkin(c, jobs, "CASE-123")
+            assert js["status"] == "done" and js["kind"] == "checkin" and js["result"]["ok"] and js["result"]["rclone"] == "fake checkin"
+            assert st.events("CASE-123")[-1]["action"] == "checkin" and st.events("CASE-123")[-1]["agent"] == "test-agent"
             (ws.index_dir / "drive-index.txt").write_text("acme/cases/CASE-123/0901_1200_run.bag.zst\t123456\t2026-09-01T00:00:00\nacme/cases/other.txt\t1\t\n")
             r = await c.call_tool("drive_index", {"pattern": r"CASE-123.*\.zst$"})
             assert r.structured_content["result"] == [{"path": "acme/cases/CASE-123/0901_1200_run.bag.zst", "size": "123456", "mtime": "2026-09-01T00:00:00"}]
@@ -105,19 +141,25 @@ def test_full_flow(conf, mocked_rclone):
     assert ("checkout", "acme", "CASE-123") in mocked_rclone and ("checkin", "acme", "CASE-123") in mocked_rclone
 
 
-def test_open_case_continues_when_drive_fails(conf, monkeypatch):
+def test_open_case_continues_when_drive_fails(conf, monkeypatch, jobs):
+    """rclone の失敗は open_case を止めず（ローカル写しを返す）、取り寄せジョブの failed / error に残る。"""
     ws = conf.workspaces["acme"]
     CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
 
     def boom(*a, **k):
         raise sync.RcloneError("remote unreachable")
     monkeypatch.setattr(sync, "checkout", boom)
-    mcp = srv.create_server(conf)
+    mcp = srv.create_server(conf, jobs=jobs)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
-            r = await c.call_tool("open_case", {"case": "CASE-1"})
-            assert not r.is_error and r.structured_content["drive"] == {"fetched": False, "error": "remote unreachable", "note": "continuing with local copy"}
+            r = await _open(c, jobs, "CASE-1")
+            assert not r.is_error and r.structured_content["case"]["id"] == "CASE-1"
+            d = r.structured_content["drive"]
+            assert d["fetched"] is False and d["job_id"] and "local copy" in d["note"]
+            s = await c.call_tool("job_status", {"job_id": d["job_id"]})
+            assert s.structured_content["status"] == "failed" and s.structured_content["error"] == "RcloneError: remote unreachable"
+            assert s.structured_content["kind"] == "checkout" and s.structured_content["case"] == "CASE-1"
     run(main)
 
 
@@ -141,10 +183,12 @@ def test_search_survives_broken_symlink(conf, monkeypatch):
 # ---------- open_case の順序・checkout skip（項目 1） ----------
 
 def _fake_checkout_creating_case(conf, calls):
-    """Drive にしか無い案件を取り寄せる偽 checkout: 案件ディレクトリを作って成功を返す。"""
-    def checkout(c, ws, case=None, dry=False):
+    """Drive にしか無い案件を取り寄せる偽 checkout: 案件ディレクトリを作って成功を返す（2 回目以降は何もしない）。"""
+    def checkout(c, ws, case=None, dry=False, **kw):
         calls.append(("checkout", ws.name, case))
         st = CaseStore(ws.cases_dir)
+        if (ws.cases_dir / case / "case.json").exists():
+            return "fake checkout (already local)"
         st.create_case(case, "from drive", ws.name, actor="human")
         st.new_plan_version(case, "obj", [{"title": "t1"}], reason="on drive", actor="ai")
         (ws.cases_dir / case / "worklog.md").write_text("# from drive\n## Notes\nfetched text\n", encoding="utf-8")
@@ -152,25 +196,31 @@ def _fake_checkout_creating_case(conf, calls):
     return checkout
 
 
-def test_open_case_fetches_before_reading(conf, monkeypatch):
-    """Drive にしか無い案件: checkout → load の順なので CaseNotFound にならず、返り値は取り寄せ後のディスクを反映する。"""
+def test_open_case_fetches_in_background_then_reads(conf, monkeypatch, jobs):
+    """Drive にしか無い案件: 1 回目の open_case は取り寄せジョブを起動して unknown case（job_id 付き）を返す。
+    ジョブ完了後の 2 回目は取り寄せ後のディスクを反映する。"""
     calls = []
     monkeypatch.setattr(sync, "checkout", _fake_checkout_creating_case(conf, calls))
-    mcp = srv.create_server(conf)
+    mcp = srv.create_server(conf, jobs=jobs)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
             r = await c.call_tool("open_case", {"case": "CASE-9"})
+            assert r.is_error and "CASE-9" in r.content[0].text and "job_id" in r.content[0].text and "open_case again" in r.content[0].text
+            job = jobs.active("acme", "CASE-9") or jobs.all()
+            _wait(jobs, job[0].id)
+            assert job[0].status == "done" and job[0].result == "fake checkout created case"
+            r = await _open(c, jobs, "CASE-9")
             assert not r.is_error, r.content
             oc = r.structured_content
-            assert oc["drive"]["fetched"] is True and oc["case"]["title"] == "from drive"
+            assert oc["drive"]["job_id"] and oc["case"]["title"] == "from drive"
             assert oc["plan"]["version"] == 1 and [t["id"] for t in oc["open_tasks"]] == ["T001"]
             assert "fetched text" in oc["worklog_tail"] and oc["recent_events"][0]["action"] == "opened"
             # 不正な ID は取り寄せる前に拒否
             r = await c.call_tool("open_case", {"case": "../etc"})
             assert r.is_error and "invalid case id" in r.content[0].text
     run(main)
-    assert calls == [("checkout", "acme", "CASE-9")]
+    assert calls == [("checkout", "acme", "CASE-9"), ("checkout", "acme", "CASE-9")]
     ev = CaseStore(conf.workspaces["acme"].cases_dir).events("CASE-9")
     assert [e["action"] for e in ev] == ["opened", "plan"]  # 閲覧では events.jsonl に何も足さない
 
@@ -199,23 +249,25 @@ def test_invalid_case_id_is_rejected_before_touching_filesystem(conf, monkeypatc
     run(main)
 
 
-def test_open_case_unknown_case_reports_drive_result(conf, mocked_rclone):
-    mcp = srv.create_server(conf)
+def test_open_case_unknown_case_reports_drive_result(conf, mocked_rclone, jobs):
+    mcp = srv.create_server(conf, jobs=jobs)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
             r = await c.call_tool("open_case", {"case": "CASE-404"})
-            assert r.is_error and "CASE-404" in r.content[0].text and "fetched" in r.content[0].text
+            assert r.is_error and "CASE-404" in r.content[0].text and "fetched" in r.content[0].text and "job_id" in r.content[0].text
     run(main)
-    assert ("checkout", "acme", "CASE-404") in mocked_rclone  # 取り寄せは試みた
+    for j in jobs.all():
+        _wait(jobs, j.id)
+    assert ("checkout", "acme", "CASE-404") in mocked_rclone  # 取り寄せは試みた（ジョブ）
 
 
-def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, monkeypatch):
+def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, monkeypatch, jobs):
     """rclone は _run の層で偽装し、sync.checkout / sync.checkin 本体（last_checkin_at の記録を含む）を通す。"""
     import os, subprocess, time
     mocked_rclone = []
 
-    def fake_run(cmd, dry=False):
+    def fake_run(cmd, dry=False, progress=None):
         if cmd[1] == "copyto":  # events.jsonl の取り寄せ: Drive に無い → 失敗（マージは飛ばす）
             raise sync.RcloneError("object not found")
         mocked_rclone.append(({"copy": "checkout", "sync": "checkin"}[cmd[1]], "acme", cmd[2].rsplit("/", 1)[-1]))
@@ -225,42 +277,42 @@ def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, mo
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "t", "acme", actor="human")
     wl = ws.cases_dir / "CASE-1" / "worklog.md"
-    mcp = srv.create_server(conf)
+    mcp = srv.create_server(conf, jobs=jobs)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
-            # last_checkin_at 未記録 → checkout する
-            r = await c.call_tool("open_case", {"case": "CASE-1"})
-            assert r.structured_content["drive"]["fetched"] is True
+            # last_checkin_at 未記録 → checkout する（ジョブ）
+            r = await _open(c, jobs, "CASE-1")
+            assert r.structured_content["drive"]["job_id"] and "skipped" not in r.structured_content["drive"]
             assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 1
             # checkin → last_checkin_at が記録される。直後の open_case は（ローカル変更なし）checkout する
-            r = await c.call_tool("checkin", {"case": "CASE-1"})
-            assert not r.is_error and r.structured_content["last_checkin_at"]
-            assert st.load_case("CASE-1")["last_checkin_at"] == r.structured_content["last_checkin_at"]
-            r = await c.call_tool("open_case", {"case": "CASE-1"})
-            assert r.structured_content["drive"]["fetched"] is True and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2
-            # checkin より新しいローカル変更（worklog.md の mtime を進める）→ checkout を skip
+            js = await _checkin(c, jobs, "CASE-1")
+            assert js["status"] == "done" and js["result"]["last_checkin_at"]
+            assert st.load_case("CASE-1")["last_checkin_at"] == js["result"]["last_checkin_at"]
+            r = await _open(c, jobs, "CASE-1")
+            assert r.structured_content["drive"]["job_id"] and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2
+            # checkin より新しいローカル変更（worklog.md の mtime を進める）→ checkout を skip（ジョブも作らない）
             t = time.time() + 30
             os.utime(wl, (t, t))
-            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            r = await _open(c, jobs, "CASE-1")
             d = r.structured_content["drive"]
-            assert d["skipped"] == "local changes newer than last checkin" and d["fetched"] is False and "worklog.md" in d["files"]
+            assert d["skipped"] == "local changes newer than last checkin" and d["fetched"] is False and "worklog.md" in d["files"] and "job_id" not in d
             assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2  # 呼ばれていない
             assert st.events("CASE-1")[-1]["action"] == "checkin"             # open_case は event を書かない
             # もう一度 checkin すれば skip は解ける（偽装した未来の mtime は現在に戻す）
             os.utime(wl, None)
-            await c.call_tool("checkin", {"case": "CASE-1"})
-            r = await c.call_tool("open_case", {"case": "CASE-1"})
-            assert r.structured_content["drive"]["fetched"] is True and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 3
+            await _checkin(c, jobs, "CASE-1")
+            r = await _open(c, jobs, "CASE-1")
+            assert r.structured_content["drive"]["job_id"] and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 3
     run(main)
 
 
-def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, monkeypatch):
+def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, monkeypatch, jobs):
     """checkin 後に open_case を繰り返しても（events.jsonl の mtime が CHECKIN_SLACK_SEC を超えて進んでも）checkout は skip されない。
-    人／AI の実質的な変更（log_event / update_task / UI 操作）があれば skip する。checkin ツール自身の checkin event は変更に数えない。"""
+    人／AI の実質的な変更（log_event / update_task / UI 操作）があれば skip する。checkin ジョブ自身の checkin event は変更に数えない。"""
     import os, subprocess, time
     calls = []
-    monkeypatch.setattr(sync, "_run", lambda cmd, dry=False: calls.append(cmd[1]) or subprocess.CompletedProcess(cmd, 0, "fake", ""))
+    monkeypatch.setattr(sync, "_run", lambda cmd, dry=False, progress=None: calls.append(cmd[1]) or subprocess.CompletedProcess(cmd, 0, "fake", ""))
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "t", "acme", actor="human")
@@ -271,33 +323,33 @@ def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, mon
         t = time.time() + 5
         os.utime(p, (t, t))
 
-    mcp = srv.create_server(conf)
+    mcp = srv.create_server(conf, jobs=jobs)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
-            await c.call_tool("checkin", {"case": "CASE-1"})
+            await _checkin(c, jobs, "CASE-1")
             for i in range(3):
                 bump(ev)
-                r = await c.call_tool("open_case", {"case": "CASE-1"})
-                assert r.structured_content["drive"]["fetched"] is True, (i, r.structured_content["drive"])
+                r = await _open(c, jobs, "CASE-1")
+                assert r.structured_content["drive"].get("job_id"), (i, r.structured_content["drive"])
             assert calls.count("copy") == 3 and st.events("CASE-1")[-1]["action"] == "checkin"
             # AI の実質的な変更 → skip
             await c.call_tool("log_event", {"case": "CASE-1", "action": "progress", "note": "worked"})
             bump(ev)
-            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            r = await _open(c, jobs, "CASE-1")
             d = r.structured_content["drive"]
             assert d["fetched"] is False and d["skipped"] == "local changes newer than last checkin" and d["files"] == ["events.jsonl"]
             # checkin で解け、UI 操作（人の comment）で再び skip、update_task でも skip
-            await c.call_tool("checkin", {"case": "CASE-1"})
+            await _checkin(c, jobs, "CASE-1")
             bump(ev)
-            assert (await c.call_tool("open_case", {"case": "CASE-1"})).structured_content["drive"]["fetched"] is True
+            assert (await _open(c, jobs, "CASE-1")).structured_content["drive"].get("job_id")
             st.append_event("CASE-1", {"actor": "human", "action": "comment", "note": "check unit-6"})
             bump(ev)
-            assert (await c.call_tool("open_case", {"case": "CASE-1"})).structured_content["drive"]["fetched"] is False
-            await c.call_tool("checkin", {"case": "CASE-1"})
+            assert (await _open(c, jobs, "CASE-1")).structured_content["drive"].get("skipped")
+            await _checkin(c, jobs, "CASE-1")
             await c.call_tool("update_task", {"case": "CASE-1", "task": "T001", "status": "doing"})
             bump(ev); bump(ws.cases_dir / "CASE-1" / "plan" / "v0001.json")
-            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            r = await _open(c, jobs, "CASE-1")
             assert r.structured_content["drive"]["fetched"] is False and "plan/v0001.json" in r.structured_content["drive"]["files"]
     run(main)
 
@@ -360,7 +412,7 @@ def test_plan_validation_via_mcp(conf):
     run(main)
 
 
-def test_open_case_writes_access_log_not_events(conf, mocked_rclone):
+def test_open_case_writes_access_log_not_events(conf, mocked_rclone, jobs):
     """open_case を繰り返しても events.jsonl は変わらず（内容も mtime も）、index/access.log（ローカル）に 1 行ずつ増える。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
@@ -368,16 +420,123 @@ def test_open_case_writes_access_log_not_events(conf, mocked_rclone):
     ev = ws.cases_dir / "CASE-1" / "events.jsonl"
     before = (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns)
     log = ws.index_dir / "access.log"
-    mcp = srv.create_server(conf, default_agent="test-agent")
+    mcp = srv.create_server(conf, default_agent="test-agent", jobs=jobs)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
             for i in range(3):
-                r = await c.call_tool("open_case", {"case": "CASE-1", "agent": f"agent-{i}"})
-                assert not r.is_error and r.structured_content["drive"]["fetched"] is True
+                r = await _open(c, jobs, "CASE-1", agent=f"agent-{i}")
+                assert not r.is_error and r.structured_content["drive"]["job_id"]
                 assert (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns) == before
                 lines = log.read_text(encoding="utf-8").splitlines()
                 assert len(lines) == i + 1 and lines[-1].split("\t")[1:] == ["CASE-1", f"agent-{i}"]
     run(main)
     assert [e["action"] for e in st.events("CASE-1")] == ["opened"]
     assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 3
+
+
+# ---------- ジョブ化した checkin / 取り寄せ（docs/mcp-tools.md「ジョブ」） ----------
+
+def test_checkin_returns_job_immediately_and_job_status_follows(conf, monkeypatch, jobs):
+    """rclone が長く走っても checkin はすぐ返る（job_id、queued/running）。job_status が running → done（result に従来の結果と
+    last_checkin_at）と進む。同じ案件の 2 回目は既存の job_id。mark_checkin と checkin event はジョブ側が完了時に書く。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    started = threading.Event(); release = threading.Event()
+
+    def slow_checkin(c, w, case=None, dry=False, progress=None):
+        started.set()
+        progress("Transferred: 1 MiB / 700 MiB, 0%, ETA 10m")
+        assert release.wait(5)
+        progress("Transferred: 700 MiB / 700 MiB, 100%, ETA 0s")
+        st.mark_checkin(case)
+        return "fake sync done"
+    monkeypatch.setattr(sync, "checkin", slow_checkin)
+    mcp = srv.create_server(conf, default_agent="test-agent", jobs=jobs)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("checkin", {"case": "CASE-1"})
+            assert not r.is_error and r.structured_content["status"] in ("queued", "running") and "job_status" in r.structured_content["note"]
+            job_id = r.structured_content["job_id"]
+            assert started.wait(5)
+            r2 = await c.call_tool("checkin", {"case": "CASE-1"})
+            assert r2.structured_content["job_id"] == job_id and "already running" in r2.structured_content["note"]
+            s = (await c.call_tool("job_status", {"job_id": job_id})).structured_content
+            assert s["status"] == "running" and s["kind"] == "checkin" and s["case"] == "CASE-1" and s["workspace"] == "acme"
+            assert s["progress"].startswith("Transferred: 1 MiB") and s["result"] is None and s["error"] is None and s["started_at"]
+            assert "last_checkin_at" not in st.load_case("CASE-1") and st.events("CASE-1")[-1]["action"] != "checkin"
+            release.set()
+            _wait(jobs, job_id)
+            s = (await c.call_tool("job_status", {"job_id": job_id})).structured_content
+            assert s["status"] == "done" and s["finished_at"] and s["progress"].endswith("ETA 0s")
+            assert s["result"] == {"ok": True, "rclone": "fake sync done", "last_checkin_at": st.load_case("CASE-1")["last_checkin_at"]}
+            ev = st.events("CASE-1")[-1]
+            assert ev["action"] == "checkin" and ev["agent"] == "test-agent" and ev["note"] == "fake sync done"
+            # 完了後は同じ案件で新しいジョブになる
+            release.set()
+            r3 = await c.call_tool("checkin", {"case": "CASE-1"})
+            assert r3.structured_content["job_id"] != job_id
+            _wait(jobs, r3.structured_content["job_id"])
+            # 未知の案件・ワークスペースはジョブを作らずに拒否
+            r = await c.call_tool("checkin", {"case": "CASE-404"})
+            assert r.is_error and "CASE-404" in r.content[0].text
+            assert len(jobs.all()) == 2
+    run(main)
+
+
+def test_job_status_failed_and_unknown(conf, monkeypatch, jobs):
+    ws = conf.workspaces["acme"]
+    CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
+
+    def boom(*a, **k):
+        raise sync.RcloneError("Failed to sync: quota exceeded")
+    monkeypatch.setattr(sync, "checkin", boom)
+    mcp = srv.create_server(conf, jobs=jobs)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("checkin", {"case": "CASE-1"})
+            job_id = r.structured_content["job_id"]
+            _wait(jobs, job_id)
+            s = (await c.call_tool("job_status", {"job_id": job_id})).structured_content
+            assert s["status"] == "failed" and s["error"] == "RcloneError: Failed to sync: quota exceeded" and s["result"] is None
+            assert "last_checkin_at" not in CaseStore(ws.cases_dir).load_case("CASE-1")
+            assert not any(e["action"] == "checkin" for e in CaseStore(ws.cases_dir).events("CASE-1"))
+            r = await c.call_tool("job_status", {"job_id": "nope"})
+            assert r.is_error and "unknown job 'nope'" in r.content[0].text and "restart" in r.content[0].text
+    run(main)
+
+
+def test_open_case_drive_job_id_and_dedupe(conf, monkeypatch, jobs):
+    """open_case は取り寄せを待たず今のローカル内容を返し、drive に job_id / status を入れる。取り寄せ中にもう一度開いても新しいジョブは作らない。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "before fetch", "acme", actor="human")
+    started = threading.Event(); release = threading.Event()
+
+    def slow_checkout(c, w, case=None, dry=False, progress=None):
+        started.set()
+        assert release.wait(5)
+        case_json = st.load_case(case); case_json["title"] = "after fetch"; st.save_case(case_json)
+        return "fake copy done"
+    monkeypatch.setattr(sync, "checkout", slow_checkout)
+    mcp = srv.create_server(conf, jobs=jobs)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            d = r.structured_content["drive"]
+            assert d["fetched"] is False and d["status"] in ("queued", "running") and "open_case again" in d["note"]
+            assert r.structured_content["case"]["title"] == "before fetch"
+            assert started.wait(5)
+            r2 = await c.call_tool("open_case", {"case": "CASE-1"})
+            assert r2.structured_content["drive"]["job_id"] == d["job_id"] and "already running" in r2.structured_content["drive"]["note"]
+            release.set()
+            _wait(jobs, d["job_id"])
+            s = (await c.call_tool("job_status", {"job_id": d["job_id"]})).structured_content
+            assert s["status"] == "done" and s["kind"] == "checkout" and s["result"] == "fake copy done"
+            r3 = await _open(c, jobs, "CASE-1")
+            assert r3.structured_content["case"]["title"] == "after fetch" and r3.structured_content["drive"]["job_id"] != d["job_id"]
+    run(main)

@@ -1,7 +1,8 @@
-# MCP ツール（10 個以内。説明文は短く）
+# MCP ツール（説明文は短く）
 
-実装: `kairn/server.py`（mcp 2.x `mcp.server.mcpserver.MCPServer`、streamable HTTP を `/mcp` に提供。UI と同一プロセス）。ツールは 10 個。
+実装: `kairn/server.py`（mcp 2.x `mcp.server.mcpserver.MCPServer`、streamable HTTP を `/mcp` に提供。UI と同一プロセス）。ツールは 11 個。
 判断の規則の実体は `kairn/store.py`（証拠必須・superseded 自動化）。server は引数を検証して委譲する。
+rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（`kairn/jobs.py`）として走らせ、ツールは待たずに `job_id` を返す（後述）。
 
 ## 共通
 
@@ -11,6 +12,14 @@
   省略時は `create_server(conf, default_agent)` の既定値（`serve` では `unknown`）。
 - **失敗の返し方**: 規則違反・未知の案件／タスク・rclone 失敗は `ToolError` → `CallToolResult(is_error=True)` で理由の文章を返す
   （エージェントが読める。JSON-RPC エラーにはしない）。
+- **ジョブ**（`kairn/jobs.py`）: rclone の転送は数百 MB・数百ファイルの案件で数分かかり、MCP クライアント側の呼び出しタイムアウト（300 秒程度）に
+  当たる（サーバー側は最後まで走るがクライアントは失敗扱い）。そのため `checkin` と `open_case` の取り寄せはデーモンスレッドのジョブにし、
+  ツールは即座に `job_id` を返す。状態は `job_status(job_id)` で見る（queued → running → done | failed。`progress` は rclone の
+  `--stats 5s --stats-one-line` の最新行、`elapsed_sec` は開始からの秒数）。**同じ案件に対する同種のジョブが queued / running なら新しく作らず
+  既存の `job_id` を返す**（`note` に "already running"）。完了したジョブは 200 件または 24 時間で捨てる。
+  **ジョブ表はサーバーのメモリ内にあり、`kairn serve` の再起動で消える**（設計上許容。消えた `job_id` は `job_status` が「unknown job」を返す。
+  転送が終わったかは `case.json.last_checkin_at` と `checkin` event で分かる）。大きな初回投入（数百 MB）は MCP ではなく CLI の
+  `kairn checkin <ws> <case>`（同期・タイムアウト無し）で行う（README「同期」）。
 - **索引**: `search` / `find_cases` は呼び出しのたびに SQLite FTS5（trigram）索引を差分更新してから検索する（`kairn/index.py`）。
   シンボリックリンクと生成物ディレクトリ（target / build / node_modules / .venv / __pycache__）は索引しない。
   **trigram の制約**: 3 文字未満の語は索引に載らない（MATCH に渡せない）。3 文字未満の語だけの問いは LIKE（`search`: 節本文・案件 ID、
@@ -20,14 +29,15 @@
 
 | ツール | 引数 | 返り値 | 実装で強制する規則 |
 |---|---|---|---|
-| `open_case(case, workspace?, agent?)` | | `{case, plan, open_tasks, recent_events(直近20), human_feedback(人の sendback/comment 直近5), related, worklog_tail(末尾3000字), drive, paths}` | 順序: ワークスペース解決 → Drive から取り寄せ（`sync.checkout`: `events.jsonl` は Drive 版と行の和集合にマージ、他は `rclone copy --update` でローカルの方が新しいファイルは上書きしない）→ 読み込み。返り値はすべて取り寄せ後のディスクから読む（Drive にしか無い案件も開ける）。`case.json.last_checkin_at` より新しいローカル変更（人／AI の実質的な変更。`events.jsonl` が kairn 自身の `checkin` event で伸びただけなら数えない）があれば取り寄せを skip し `drive={fetched:false, skipped:"local changes newer than last checkin", files:[…]}`。rclone 失敗はローカル写しで続行し `drive={fetched:false, error, note}`。**events.jsonl には書かない**（閲覧記録は `index/access.log` にローカルで 1 行追記） |
+| `open_case(case, workspace?, agent?)` | | `{case, plan, open_tasks, recent_events(直近20), human_feedback(人の sendback/comment 直近5), related, worklog_tail(末尾3000字), drive, paths}` | 順序: ワークスペース解決 → Drive からの取り寄せ**ジョブ**を起動（`sync.checkout`: `events.jsonl` は Drive 版と行の和集合にマージ、他は `rclone copy --update` でローカルの方が新しいファイルは上書きしない）→ **待たずに**今のローカル内容を読んで返す。`drive={fetched:false, job_id, status:"queued"|"running", note}`（同じ案件の取り寄せが走っていればその `job_id`）。取り寄せ完了（`job_status` が `done`）後にもう一度 `open_case` すると最新になる。Drive にしか無い案件は 1 回目が `unknown case …（job_id 付き）` のエラーになり、ジョブ完了後の 2 回目で開ける。`case.json.last_checkin_at` より新しいローカル変更（人／AI の実質的な変更。`events.jsonl` が kairn 自身の `checkin` event で伸びただけなら数えない）があれば取り寄せをジョブにせず skip し `drive={fetched:false, skipped:"local changes newer than last checkin", files:[…]}`（従来どおり）。rclone の失敗はジョブの `failed` / `error` に残り、`open_case` はローカル写しを返す。**events.jsonl には書かない**（閲覧記録は `index/access.log` にローカルで 1 行追記） |
 | `list_cases(workspace?, status="open", query="")` | `status`: open\|closed\|suspended\|all。`query` は id/title 部分一致 | `[{case, title, status, progress{total,done,open,plan}, last_event}]` | |
 | `plan(case, objective, tasks[], reason, workspace?, agent?)` | `tasks: [{title, owner?: ai\|human, carried_from?: "T012"}]` | 新版の plan（`superseded: [...]` を含む） | 版番号は自動。`carried_from` で引き継がれなかった open/doing/blocked は前版で `superseded`。未知の `carried_from`・同じタスクの二重 `carried_from`・`title` も `carried_from` も無い要素・`owner` が ai/human 以外は拒否。**`done` を `carried_from` しないと旧版にだけ残る**（UI のタスク追加は done も引き継ぐ） |
 | `update_task(case, task, status, evidence[]?, note?, workspace?, agent?)` | `status`: open\|doing\|blocked\|done\|dropped | 更新後の task | `done` は `evidence` 必須。各要素は `{type: commit\|pr\|file\|test\|url, ...}` で型ごとの必須キー（commit/pr→`id`、file→`path`、test→`cmd`、url→`url`）を検証、`note` 型（必須キー `text`）は human のみ（docs/data-model.md）。存在しない task・計画未作成は拒否。event（started/done/dropped/progress）を追記 |
 | `log_event(case, action, note, evidence[]?, workspace?, agent?)` | `action`: progress\|decision\|comment | 追記した event | actor/agent 自動付与。他の action は拒否。`evidence` は update_task と同じ検証 |
 | `search(query, cases[]?, workspace?, limit=10)` | | `[{case, file, heading, snippet, score}]` | worklog 等の `## ` 節単位の全文検索。語は AND。3 文字未満の語は本文・案件 ID の部分一致（LIKE）で絞る。ワークスペース内のみ |
 | `find_cases(query, workspace?, k=5)` | | `[{case, score, reasons[]}]` | 案件カード（title/tickets/related/elements）×3 ＋ 本文節の bm25 を合算。語は OR（問いの一部にでも当たる案件を拾う）。3 文字未満の語だけなら `case_id` / `title` の LIKE で補う。案件を選ぶのは人 |
-| `checkin(case, workspace?, agent?)` | | `{ok, rclone, last_checkin_at}` | ローカル → Drive（`sync.checkin`、設定済み remote のみ）＋ `case.json.last_checkin_at` 更新＋ `checkin` event。先に `events.jsonl` を Drive 版とマージするので他環境の event は消えない。**それ以外のファイルは Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする**（案件単位は rclone sync。ワークスペース全体の `kairn checkin <ws>` / `daily` は rclone copy で、ローカルに無い案件を Drive から消さない）。他環境で作業した後は先に `checkout` する運用 |
+| `checkin(case, workspace?, agent?)` | | `{job_id, status: "queued"\|"running", note}` | ローカル → Drive（`sync.checkin_job`、設定済み remote のみ）を**ジョブ**として起動し即座に返す。未知の案件はジョブを作らず `ToolError`。同じ案件の checkin が走っていればその `job_id`（新しく作らない）。完了時に**ジョブ側で** `case.json.last_checkin_at` / `last_checkin_events` の更新と `checkin` event の追記を行う（失敗時はどちらも書かない）。`job_status(job_id)` が `done` なら `result={ok, rclone, last_checkin_at}`（従来の返り値）、`failed` なら `error` に rclone の末尾。先に `events.jsonl` を Drive 版とマージするので他環境の event は消えない。**それ以外のファイルは Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする**（案件単位は rclone sync。ワークスペース全体の `kairn checkin <ws>` / `daily` は rclone copy で、ローカルに無い案件を Drive から消さない）。他環境で作業した後は先に `checkout` する運用 |
+| `job_status(job_id)` | | `{job_id, kind: checkin\|checkout, workspace, case, status: queued\|running\|done\|failed, created_at, started_at, finished_at, elapsed_sec, progress, result, error}` | `checkin` / `open_case` が返した `job_id` の状態。`progress` は rclone の出力の最新行（`Transferred: … ETA …`）、`elapsed_sec` は開始からの秒数。`done` なら `result`（checkin: `{ok, rclone, last_checkin_at}`、checkout: rclone の末尾）、`failed` なら `error`（`RcloneError: …` 等）。未知の `job_id`（捨てられた／サーバー再起動で消えた）は `ToolError` |
 | `drive_index(pattern, workspace?, limit=50)` | 正規表現 | `[{path, size, mtime}]` | `index/drive-index.txt`（`kairn drive-index` で生成）を検索。無ければ空 |
 | `extract_card(case, workspace?)` | | `{ok, card, agent, elapsed_sec, error, raw_excerpt}` | 設定 `extract.agent` の子エージェント（`kairn/extract/adapters.py`）を案件ディレクトリの写し（一時ディレクトリ: 自案件＋兄弟案件の `case.json` のみ）を cwd に、最小限の環境変数で起動し、出力を `kairn/extract/schema.json` で検証した下書きを `card` に返す（docs/extract-agents.md）。`card.related` のうち実在しない案件 ID は `card.related_unknown` に分ける。**case.json には書かない**（適用は UI の人の操作のみ）。タイムアウト・非ゼロ終了・JSON 無し・スキーマ不一致は `ok=false, error` で返す（`is_error` にしない。未知の案件だけ `ToolError`）。毎回 `{actor: kairn, agent: "extract:<name>", action: extract, note, elapsed_sec, exit_code, timeout_sec}` を events に追記 |
 
@@ -35,7 +45,7 @@
 
 「kairn: 案件（case）単位の作業ログ。案件を開くときは open_case（無ければ find_cases / list_cases で選ぶ。選ぶのは人）。
 作業したら log_event / update_task（done は証拠必須）。方針が変わったら plan で計画を出し直す（載せなかった open タスクは superseded になる）。
-終わったら checkin。ワークスペースをまたぐ参照はしない。」
+終わったら checkin（ジョブとして走る。job_status で done を確認する）。ワークスペースをまたぐ参照はしない。」
 
 ## 起動と登録
 

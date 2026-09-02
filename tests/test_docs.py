@@ -65,7 +65,7 @@ def test_mcp_tools_doc_matches_server(conf):
                 got[t.name] = set(t.input_schema.get("required", []))
     anyio.run(main)
     assert set(doc) == set(got), f"doc={sorted(doc)} server={sorted(got)}"
-    assert len(got) == 10
+    assert len(got) == 11
     for name in got:
         assert doc[name] == got[name], f"{name}: doc requires {sorted(doc[name])}, server requires {sorted(got[name])}"
-    assert "ツールは 10 個" in MCP_DOC
+    assert "ツールは 11 個" in MCP_DOC
