@@ -225,38 +225,48 @@ def test_case_page_shows_queued_jobs(conf):
     assert "進行中のジョブ" not in c.get("/ui/acme/CASE-123").text
 
 
-def test_index_shows_drive_state_and_refresh_button(conf, drive_manifest):
+def test_index_shows_drive_state_and_refresh_button(conf, fake_drive, monkeypatch):
     """一覧の Drive 列: キャッシュ無し → 不明、rev 一致 → 同期済み、rev 違い → Drive の方が新しい、未 checkin の変更 → ローカル未 checkin。
-    「更新確認」（POST /ui/refresh）は manifest を取得してキャッシュを更新し、一覧に戻る（案件は取り寄せない）。CSRF は既存の same_origin。"""
+    「更新確認」（POST /ui/refresh）は Drive の版マーカーを 1 回読んでキャッシュを更新し、rev が違う案件だけ取り寄せて一覧に戻る。CSRF は既存の same_origin。"""
     import os, time
     from kairn import sync
+    from kairn.store import hostname
     st = _seed(conf)
     ws = conf.workspaces["acme"]
     c = TestClient(build_ui(conf))
     page = c.get("/ui").text
-    assert "<th>Drive</th>" in page and "class='drive muted'" in page and ">不明<" in page and "manifest 未取得" in page and "action='/ui/refresh'" in page and "更新確認" in page
+    assert "<th>Drive</th>" in page and "class='drive muted'" in page and ">不明<" in page and "版 未取得" in page and "action='/ui/refresh'" in page and "更新確認" in page
     st.mark_checkin("CASE-123"); rev = st.load_case("CASE-123")["rev"]
-    sync.save_manifest_cache(ws, {"cases": {"CASE-123": {"rev": rev, "checked_in_at": "2026-09-01T00:00:00+09:00", "from": "host-a"}}})
+    sync.save_drive_revs_cache(ws, {"CASE-123": rev})
     page = c.get("/ui").text
-    assert "class='drive ok'" in page and ">同期済み<" in page and "host-a" in page and "manifest " in page and "取得" in page and "class='drive muted'" not in page
-    sync.save_manifest_cache(ws, {"cases": {"CASE-123": {"rev": "newer"}}})
+    assert "class='drive ok'" in page and ">同期済み<" in page and f"checked in from {hostname()}" in page and "版 " in page and "取得" in page and "class='drive muted'" not in page
+    sync.save_drive_revs_cache(ws, {"CASE-123": "newer"})
     assert "Drive の方が新しい" in c.get("/ui").text
+    sync.save_drive_revs_cache(ws, {"CASE-123": None})      # マーカーが 2 個以上（不定）
+    page = c.get("/ui").text
+    assert "Drive の方が新しい" in page and "(ambiguous)" in page
     t = time.time() + 5
     os.utime(ws.cases_dir / "CASE-123" / "worklog.md", (t, t))
     page = c.get("/ui").text
     assert "ローカル未 checkin（Drive も更新あり）" in page and "worklog.md" in page
     os.utime(ws.cases_dir / "CASE-123" / "worklog.md", None)
-    # 更新確認: Drive の manifest（偽物）を取得してキャッシュを更新 → 同期済みに戻る。案件の取り寄せはしない
-    drive_manifest.data = {"cases": {"CASE-123": {"rev": rev, "checked_in_at": "2026-09-02T00:00:00+09:00", "from": "host-b"}}}
+    # 更新確認: Drive の版（偽物）を 1 回読んでキャッシュを更新 → 同期済みに戻る。rev が一致する案件は取り寄せない
+    fetched = []
+    monkeypatch.setattr(sync, "checkout", lambda conf_, w, case=None, dry=False, progress=None: fetched.append(case) or "fake checkout")
+    fake_drive.set_rev("CASE-123", rev)
     r = c.post("/ui/refresh", data={"ws": "acme"}, follow_redirects=False)
-    assert r.status_code == 303 and r.headers["location"].startswith("/ui?ws=acme&refreshed=") and drive_manifest.fetches == 1
+    assert r.status_code == 303 and r.headers["location"].startswith("/ui?ws=acme&refreshed=") and fake_drive.listings == 1 and fetched == []
     page = c.get(r.headers["location"]).text
-    assert "acme: manifest 1 case(s)" in page and "同期済み" in page and "host-b" in page
+    assert "acme: drive: 1 case(s); fetched 0, up to date 1" in page and "同期済み" in page
+    # Drive の rev が違う → その案件だけ取り寄せる
+    fake_drive.set_rev("CASE-123", "from-another-host")
+    r = c.post("/ui/refresh", data={"ws": ""}, follow_redirects=False)
+    assert r.status_code == 303 and fetched == ["CASE-123"] and "fetched 1 (CASE-123)" in c.get(r.headers["location"]).text
     # 取得失敗（オフライン）: キャッシュはそのまま、メッセージだけ
-    drive_manifest.unavailable = True
+    fake_drive.unavailable = True
     r = c.post("/ui/refresh", data={"ws": ""}, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"].startswith("/ui?refreshed=")
     page = c.get(r.headers["location"]).text
-    assert "acme: manifest unavailable" in page and "同期済み" in page
+    assert "acme: drive unavailable" in page and "Drive の方が新しい" in page and fetched == ["CASE-123"]
     assert c.post("/ui/refresh", data={"ws": "nowhere"}, follow_redirects=False).status_code == 404
     assert c.post("/ui/refresh", data={"ws": "acme"}, headers={"Origin": "http://evil.example"}, follow_redirects=False).status_code == 403

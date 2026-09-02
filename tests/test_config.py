@@ -88,8 +88,8 @@ def test_assert_data_not_tracked_checks_data_root(tmp_path):
         cfg.assert_data_not_tracked(repo / "data" / "acme")          # 配下でも検出
 
 
-def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys, drive_manifest):
-    """L-5: kairn checkout --dry-run は索引（kairn.sqlite）を書き換えない。ワークスペース全体の checkout は manifest の rev が違う案件だけ。"""
+def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys, fake_drive):
+    """L-5: kairn checkout --dry-run は索引（kairn.sqlite）を書き換えない。ワークスペース全体の checkout は Drive の版マーカーが違う案件だけ。"""
     import subprocess
     from kairn import cli, sync
     from kairn.store import CaseStore
@@ -98,7 +98,7 @@ def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys, 
     monkeypatch.setattr(cfg, "load", lambda path=None: conf)
     monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
     monkeypatch.setattr(sync, "_run", lambda cmd, dry=False, progress=None: subprocess.CompletedProcess(cmd, 0, "fake", ""))
-    drive_manifest.data = {"cases": {"CASE-1": {"rev": "on-drive"}}}
+    fake_drive.set_rev("CASE-1", "on-drive")
     monkeypatch.setattr("sys.argv", ["kairn", "checkout", "acme", "--dry-run"])
     cli.main()
     out = capsys.readouterr().out
@@ -106,33 +106,6 @@ def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys, 
     monkeypatch.setattr("sys.argv", ["kairn", "checkout", "acme"])
     cli.main()
     assert (ws.index_dir / "kairn.sqlite").exists()
-
-
-def test_cli_manifest_rebuild(conf, monkeypatch, capsys):
-    """kairn manifest rebuild <ws> [--dry-run]: sync.manifest_rebuild の結果を 1 案件 1 行で表示。dry は何も書かない旨を出す。エラーは exit 1。"""
-    from kairn import cli, sync
-    monkeypatch.setattr(cfg, "load", lambda path=None: conf)
-    monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
-    seen = []
-    result = {"dry": True, "manifest": "my-drive:ws/acme/manifest.json", "errors": {}, "local_skipped": ["CASE-2"],
-              "cases": {"CASE-1": {"rev": "r1", "rev_assigned": True, "checked_in_at_assigned": True, "remote": "updated", "local": "updated"},
-                        "CASE-2": {"rev": "r2", "rev_assigned": False, "checked_in_at_assigned": False, "remote": "same", "local": "skipped", "local_reason": "never checked in"}}}
-    monkeypatch.setattr(sync, "manifest_rebuild", lambda c, ws, dry=False: seen.append((ws.name, dry)) or {**result, "dry": dry})
-    monkeypatch.setattr("sys.argv", ["kairn", "manifest", "rebuild", "acme", "--dry-run"])
-    cli.main()
-    out = capsys.readouterr().out
-    assert seen == [("acme", True)] and "[dry] CASE-1" in out and "rev assigned, last_checkin_at from drive mtime" in out and "local: updated" in out
-    assert "skipped (never checked in)" in out and "2 case(s), 0 error(s), local skipped: CASE-2 (dry-run: nothing written)" in out
-    monkeypatch.setattr("sys.argv", ["kairn", "manifest", "rebuild", "acme"])
-    cli.main()
-    assert seen[-1] == ("acme", False) and "dry" not in capsys.readouterr().out
-    result["errors"] = {"CASE-9": "case.json is not valid JSON"}
-    with pytest.raises(SystemExit) as ei:
-        cli.main()
-    assert ei.value.code == 1 and "ERROR CASE-9" in capsys.readouterr().err
-    monkeypatch.setattr(sync, "manifest_rebuild", lambda c, ws, dry=False: (_ for _ in ()).throw(sync.RcloneError("lsf failed")))
-    with pytest.raises(SystemExit, match="lsf failed"):
-        cli.main()
 
 
 def test_extract_timeout_setting(tmp_path):
@@ -239,7 +212,7 @@ def test_rules_edit_functions_validate_and_save(tmp_path):
     assert re_.rules["exclude"][:-1] == cfg.DEFAULT_RULES["exclude"]                             # 既存の項目はそのまま
     assert re_.extract_agent == "codex" and re_.extract_timeout == 42 and re_.serve_port == 9000     # 他のキーは壊さない
     assert list(re_.workspaces) == ["acme"] and re_.workspaces["acme"].description == "d"
-    assert sync._filters(re_)[-2:] == ["--max-size", "10M"] and "--exclude" in sync._filters(re_) and sync._bw(re_) == ["--bwlimit", "08:00,4M 20:00,off"]
+    assert sync._filters(re_)[-2:] == ["--max-size", "10M"] and "- logs/**" in sync._filters(re_) and sync._bw(re_) == ["--bwlimit", "08:00,4M 20:00,off"]
     cfg.remove_exclude(conf, "logs/**"); cfg.remove_raw_ext(conf, "mcap")
     assert cfg.set_rule(conf, "bwlimit", "off") is None                                             # off = 制限なし（キーを消す）
     assert cfg.set_rule(conf, "rclone_flags", "") == []                                              # 空 = 既定（キーを消す）

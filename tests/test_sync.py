@@ -26,7 +26,9 @@ def _touch(p: Path, size: int = 10, age_sec: float = 0) -> Path:
 
 
 class FakeRun:
-    """subprocess.run の代役。rclone: 引数を記録し、lsf はローカルを自前で列挙、move は対象ファイルを削除して成功を返す。"""
+    """subprocess.run の代役。rclone: 引数を記録し、lsf はローカルを自前で列挙、move は対象ファイルを削除して成功を返す。
+    Drive 側の版マーカー（cases/<case>/.rev/*）は remote_markers（{case: [rev, …]}）で真似る: lsf で読め、案件単位の sync と
+    .rev/ 限定の sync（sync_rev_markers / drive_markers）で置き換わり、ワークスペース全体の copy では足されるだけ（古いものは残る）。"""
 
     def __init__(self, rules, fail_move: bool = False, fail: set[str] | None = None, fail_move_nth: int | None = None,
                  remote_events: dict[str, list[str]] | None = None):
@@ -37,34 +39,52 @@ class FakeRun:
         self.fail_move_nth = fail_move_nth  # n 回目の move だけ失敗させる（1 始まり）
         self.moves = 0
         self.fail = fail or set()
-        self.manifest: dict | None = None            # Drive の manifest.json（cat / rcat）。None なら未作成（cat は 3 で失敗）
-        self.remote_cases: dict[str, dict] = {}      # Drive 上の cases/<case>/case.json（lsf --include /*/case.json / cat / rcat）
-        self.remote_case_mtime = "2026-08-15 09:30:00"
-        self.rcats: list[tuple[str, str]] = []       # (path, 本文)
+        self.remote_markers: dict[str, list[str]] = {}   # Drive 上の cases/<case>/.rev/ の中身（無い案件は .rev/ 自体が無い）
+        self.remote_cases: dict[str, dict] = {}          # Drive 上の cases/<case>/case.json（drive_markers の copy --include が取り寄せる）
+        self.deleted: list[str] = []                     # deletefile の対象
+
+    def _local_markers(self, case_dir: Path) -> list[str]:
+        d = case_dir / ".rev"
+        return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
 
     def __call__(self, cmd, **kw):
         self.calls.append(list(cmd))
         prog, sub = cmd[0], cmd[1]
         if prog == "rclone" and sub in self.fail:
             return subprocess.CompletedProcess(cmd, 1, "", f"fake rclone {sub} failed")
-        if prog == "rclone" and sub == "cat":
-            target = cmd[2]
-            if target.endswith("/manifest.json") and self.manifest is not None:
-                return subprocess.CompletedProcess(cmd, 0, json.dumps(self.manifest), "")
-            if target.endswith("/case.json") and target.rsplit("/", 2)[-2] in self.remote_cases:
-                return subprocess.CompletedProcess(cmd, 0, json.dumps(self.remote_cases[target.rsplit("/", 2)[-2]]), "")
-            return subprocess.CompletedProcess(cmd, 3, "", "fake rclone cat: object not found")
-        if prog == "rclone" and sub == "rcat":
-            target, text = cmd[2], kw.get("input", "")
-            self.rcats.append((target, text))
-            if target.endswith("/manifest.json"):
-                self.manifest = json.loads(text)
-            elif target.endswith("/case.json"):
-                self.remote_cases[target.rsplit("/", 2)[-2]] = json.loads(text)
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        if prog == "rclone" and sub == "lsf" and "/*/case.json" in cmd:   # manifest_rebuild の列挙（path \t mtime）
-            rows = [f"{cid}/case.json\t{self.remote_case_mtime}" for cid in sorted(self.remote_cases)]
+        if prog == "rclone" and sub == "lsf" and "--include" in cmd and cmd[cmd.index("--include") + 1] == "/cases/*/.rev/*":   # drive_revs
+            rows = [f"cases/{cid}/.rev/{m}" for cid in sorted(self.remote_markers) for m in self.remote_markers[cid]]
             return subprocess.CompletedProcess(cmd, 0, "\n".join(rows) + ("\n" if rows else ""), "")
+        if prog == "rclone" and sub == "lsf" and cmd[2].endswith("/.rev/"):                                              # drive_rev（1 案件）
+            case = cmd[2].rsplit("/", 2)[-2]
+            if case not in self.remote_markers:
+                return subprocess.CompletedProcess(cmd, 3, "", "fake rclone lsf: directory not found")
+            return subprocess.CompletedProcess(cmd, 0, "".join(m + "\n" for m in self.remote_markers[case]), "")
+        if prog == "rclone" and sub == "copy" and "--include" in cmd and cmd[cmd.index("--include") + 1] == "/cases/*/case.json":   # drive_markers
+            for cid, case in self.remote_cases.items():
+                f = Path(cmd[3]) / "cases" / cid / "case.json"
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(case if isinstance(case, str) else json.dumps(case), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, "", "fake rclone copy ok")
+        if prog == "rclone" and sub == "sync" and "--dry-run" not in cmd:
+            src = Path(cmd[2])
+            if "- **" in cmd:                                                                                          # .rev/ 限定の sync
+                for x in cmd:
+                    if x.startswith("+ /") and x.endswith("/.rev/**"):
+                        cid = x[3:-len("/.rev/**")]
+                        self.remote_markers[cid] = self._local_markers(src / cid)
+            else:                                                                                                       # 案件単位の sync
+                self.remote_markers[src.name] = self._local_markers(src)
+            return subprocess.CompletedProcess(cmd, 0, "", "fake rclone sync ok")
+        if prog == "rclone" and sub == "copy" and "--dry-run" not in cmd and not cmd[2].startswith("my-drive:"):        # ワークスペース全体の copy（local → Drive）
+            src = Path(cmd[2])
+            for d in src.iterdir():
+                if d.is_dir() and self._local_markers(d):
+                    self.remote_markers[d.name] = sorted(set(self.remote_markers.get(d.name, [])) | set(self._local_markers(d)))
+            return subprocess.CompletedProcess(cmd, 0, "", "fake rclone copy ok")
+        if prog == "rclone" and sub == "deletefile":
+            self.deleted.append(cmd[2])
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         if prog == "rclone" and sub == "copyto":
             case = cmd[2].rsplit("/", 2)[-2]
             if case not in self.remote_events:
@@ -79,7 +99,7 @@ class FakeRun:
             min_size = "--min-size" in cmd
             rows = []
             for p in sorted(src.rglob("*")):
-                if not p.is_file() or p.is_symlink():
+                if not p.is_file() or p.is_symlink() or ".rev" in p.relative_to(src).parts:
                     continue
                 if not sync.is_raw(p, {**self.rules, "min_size": self.rules["min_size"] if min_size else None,
                                        "extensions": self.rules["extensions"] if include else []}):
@@ -224,9 +244,9 @@ def test_checkout_uses_update_and_bwlimit(conf, fake):
     cmd = fake.calls[-1]
     assert cmd[:4] == ["rclone", "copy", "my-drive:ws/acme/cases/CASE-123", str(ws.cases_dir / "CASE-123")]
     assert "--update" in cmd and "--bwlimit" not in cmd and "--dry-run" not in cmd
-    assert cmd[cmd.index("--max-size") + 1] == "50M" and "*.bag" in cmd
+    assert cmd[cmd.index("--max-size") + 1] == "50M" and "- *.bag" in cmd and cmd[cmd.index("--filter") + 1] == "+ .rev/**"
     conf.rules["bwlimit"] = "08:00,4M 20:00,off"
-    fake.manifest = {"cases": {"CASE-123": {"rev": "r1"}}}   # ワークスペース全体は manifest の rev が違う案件（ローカルに無い）だけ
+    fake.remote_markers = {"CASE-123": ["r1"]}   # ワークスペース全体は Drive のマーカーの rev が違う案件（ローカルに無い）だけ
     sync.checkout(conf, ws, dry=True)
     cmd = fake.calls[-1]
     assert cmd[:2] == ["rclone", "copy"] and cmd[cmd.index("--bwlimit") + 1] == "08:00,4M 20:00,off" and cmd[-1] == "--dry-run"
@@ -240,14 +260,16 @@ def test_checkin_workspace_copies_but_case_syncs(conf, fake):
     ws = conf.workspaces["acme"]
     CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
     sync.checkin(conf, ws)
-    cmd = [c for c in fake.calls if c[1] in ("sync", "copy")][-1]
+    cmd = [c for c in fake.calls if c[1] in ("sync", "copy")][-2]
     assert cmd[:4] == ["rclone", "copy", str(ws.cases_dir), "my-drive:ws/acme/cases"]
     assert cmd[cmd.index("--backup-dir") + 1].startswith("my-drive:ws/acme/_deleted/")
+    cmd = fake.calls[-1]                                                     # 続いて .rev/ 限定の sync（振り直した案件だけ、--backup-dir 無し）
+    assert cmd[:4] == ["rclone", "sync", str(ws.cases_dir), "my-drive:ws/acme/cases"] and cmd[4:] == ["--filter", "+ /CASE-1/.rev/**", "--filter", "- **"]
     sync.checkin(conf, ws, "CASE-1")
     cmd = [c for c in fake.calls if c[1] in ("sync", "copy")][-1]
     assert cmd[:4] == ["rclone", "sync", str(ws.cases_dir / "CASE-1"), "my-drive:ws/acme/cases/CASE-1"] and "--backup-dir" in cmd
     sync.daily(conf, ws)
-    assert [c[1] for c in fake.calls if c[1] in ("sync", "copy")][-1] == "copy"
+    assert [c[1] for c in fake.calls if c[1] in ("sync", "copy")][-1] == "copy"   # 変更の無い案件は振り直さず、マーカーの sync も無い
 
 
 def test_raw_move_command_and_dry_run(conf, fake):
@@ -361,12 +383,13 @@ def test_daily_order_and_continue_on_failure(conf, fake, monkeypatch):
     CaseStore(ws.cases_dir).create_case("CASE-123", "t", "acme", actor="human")
     order = []
     monkeypatch.setattr(sync, "bag2zst", lambda *a, **k: order.append("bag2zst") or {"ok": 1})
+    monkeypatch.setattr(sync, "checkout_workspace", lambda *a, **k: order.append("checkout") or "fetched 0")
     monkeypatch.setattr(sync, "checkin", lambda *a, **k: order.append("checkin") or (_ for _ in ()).throw(sync.RcloneError("remote down")))
     monkeypatch.setattr(sync, "raw_move", lambda *a, **k: order.append("raw_move") or {"files": 0})
     monkeypatch.setattr(sync, "drive_index", lambda *a, **k: order.append("drive_index") or ws.index_dir / "drive-index.txt")
     r = sync.daily(conf, ws)
-    assert order == ["bag2zst", "checkin", "raw_move", "drive_index"]
-    assert list(r["steps"]) == ["bag2zst", "checkin", "raw_move", "drive_index", "index"]
+    assert order == ["bag2zst", "checkout", "checkin", "raw_move", "drive_index"]
+    assert list(r["steps"]) == ["bag2zst", "checkout", "checkin", "raw_move", "drive_index", "index"]
     assert r["ok"] is False and r["steps"]["checkin"] == {"ok": False, "error": "RcloneError: remote down"}
     assert r["steps"]["index"]["ok"] and r["steps"]["index"]["result"]["cases"] == 1
     log = (ws.index_dir / "daily.log").read_text(encoding="utf-8")
@@ -381,6 +404,21 @@ def test_daily_passes_dry_run(conf, fake):
     assert r["steps"]["bag2zst"]["result"]["dry"] and r["steps"]["raw_move"]["result"]["dry"]
     assert (ws.cases_dir / "CASE-123" / "run.bag").exists()
     assert [c for c in fake.calls if c[1] == "copy"][0][-1] == "--dry-run"  # ワークスペース全体は copy
+    assert r["steps"]["checkout"]["result"].startswith("drive: 0 case(s); would fetch 0") and not (ws.index_dir / "drive_revs.cache.json").exists()
+
+
+def test_daily_checks_out_only_differing_cases(conf, fake):
+    """daily の checkout 段: Drive の版を lsf 1 回で読み、rev が違う案件だけ取り寄せてから checkin する。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    for cid in ("CASE-1", "CASE-2"):
+        st.create_case(cid, cid, "acme", actor="human"); st.mark_checkin(cid)
+    fake.remote_markers = {"CASE-1": [st.load_case("CASE-1")["rev"]], "CASE-2": ["from-another-host"], "CASE-3": ["r3"]}
+    r = sync.daily(conf, ws)
+    assert r["ok"] is True and "fetched 2 (CASE-2, CASE-3)" in r["steps"]["checkout"]["result"] and "up to date 1" in r["steps"]["checkout"]["result"]
+    lsf = [c for c in fake.calls if c[1] == "lsf" and "/cases/*/.rev/*" in c]
+    assert len(lsf) == 1 and [c[2].rsplit("/", 1)[-1] for c in fake.calls if c[1] == "copy" and c[2].startswith("my-drive:")] == ["CASE-2", "CASE-3"]
+    assert json.loads((ws.index_dir / "drive_revs.cache.json").read_text(encoding="utf-8"))["revs"]["CASE-3"] == "r3"
 
 
 # ---------- rclone 除外パターン（項目 8）: 実 rclone でローカル間コピー（クラウド接続なし） ----------
@@ -508,8 +546,8 @@ def _events_of(ws, case):
 
 
 def _excludes(cmd) -> list[str]:
-    """rclone コマンドの --exclude の値（rules.exclude 由来の target/** 等も含む）。"""
-    return [cmd[i + 1] for i, x in enumerate(cmd) if x == "--exclude"]
+    """rclone コマンドの除外パターン（`--filter '- <pat>'` の <pat>。rules.exclude 由来の target/** 等も含む）。"""
+    return [cmd[i + 1][2:] for i, x in enumerate(cmd) if x == "--filter" and cmd[i + 1].startswith("- ")]
 
 
 def test_checkout_case_fetches_merges_then_copies(conf, monkeypatch):
@@ -565,32 +603,33 @@ def test_checkin_case_merges_then_syncs(conf, monkeypatch):
     f = FakeRun(sync.raw_rules(conf), remote_events={"CASE-123": remote})
     monkeypatch.setattr(subprocess, "run", f)
     msg = sync.checkin(conf, ws, "CASE-123")
-    assert [c[1] for c in f.calls] == ["copyto", "sync", "cat", "rcat"]   # マージ → 転送 → manifest（cat → rcat）
+    assert [c[1] for c in f.calls] == ["copyto", "sync"]   # マージ → 転送（集計ファイルの更新は無い）
     assert f.calls[1][:4] == ["rclone", "sync", str(ws.cases_dir / "CASE-123"), "my-drive:ws/acme/cases/CASE-123"]
     assert not any(x.endswith("events.jsonl") for x in _excludes(f.calls[1]))  # マージ済みの events.jsonl をそのまま Drive へ
     assert [e["note"] for e in _events_of(ws, "CASE-123")] == ["remote only", "remote only 2", "case created: t"]
-    assert st.load_case("CASE-123")["last_checkin_events"] == 3 and "[events merged: 1]" in msg and msg.endswith("[manifest: 1]")
+    assert st.load_case("CASE-123")["last_checkin_events"] == 3 and msg.endswith("[events merged: 1]") and "manifest" not in msg
     # 取得失敗 → マージなしで sync（従来どおり）
     f2 = FakeRun(sync.raw_rules(conf), fail={"copyto"})
     monkeypatch.setattr(subprocess, "run", f2)
     sync.checkin(conf, ws, "CASE-123")
-    assert [c[1] for c in f2.calls] == ["copyto", "sync", "cat", "rcat"] and len(_events_of(ws, "CASE-123")) == 3
+    assert [c[1] for c in f2.calls] == ["copyto", "sync"] and len(_events_of(ws, "CASE-123")) == 3
 
 
 def test_checkout_and_checkin_workspace_merge_per_case(conf, monkeypatch):
-    """ワークスペース全体: checkout は manifest（cat）を見て rev が違う案件（ローカルに無い案件を含む）だけを 1 案件ずつ
-    マージ → copy --update する（ワークスペース全体の copy はしない）。checkin は各案件をマージ → copy → manifest 更新。"""
+    """ワークスペース全体: checkout は Drive の版マーカー（lsf 1 回）を見て rev が違う案件（ローカルに無い案件を含む）だけを 1 案件ずつ
+    マージ → copy --update する（ワークスペース全体の copy はしない）。checkin は各案件をマージ → copy → 振り直した案件の .rev/ を sync。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "a", "acme", actor="human")
     st.create_case("CASE-2", "b", "acme", actor="human")
     remote = {"CASE-1": [_ev("2026-08-01T00:00:00+09:00", "r1")], "CASE-9": [_ev("2026-08-01T00:00:00+09:00", "r9")]}
     f = FakeRun(sync.raw_rules(conf), remote_events=remote)
-    f.manifest = {"cases": {"CASE-1": {"rev": "d1"}, "CASE-2": {"rev": "d2"}, "CASE-9": {"rev": "d9"}}}
+    f.remote_markers = {"CASE-1": ["d1"], "CASE-2": ["d2"], "CASE-9": ["d9"]}
     monkeypatch.setattr(subprocess, "run", f)
     msg = sync.checkout(conf, ws)
     assert [(c[1], c[2].rsplit("/", 2)[-2] if c[1] == "copyto" else c[2].rsplit("/", 1)[-1]) for c in f.calls] == \
-        [("cat", "manifest.json"), ("copyto", "CASE-1"), ("copy", "CASE-1"), ("copyto", "CASE-2"), ("copy", "CASE-2"), ("copyto", "CASE-9"), ("copy", "CASE-9")]
+        [("lsf", "-R"), ("copyto", "CASE-1"), ("copy", "CASE-1"), ("copyto", "CASE-2"), ("copy", "CASE-2"), ("copyto", "CASE-9"), ("copy", "CASE-9")]
+    assert f.calls[0][2:] == ["-R", "--files-only", "--include", "/cases/*/.rev/*", "my-drive:ws/acme"]
     assert all("--update" in c and "/events.jsonl" in _excludes(c) for c in f.calls if c[1] == "copy" and c[2].endswith(("CASE-1", "CASE-9")))
     assert "/events.jsonl" not in _excludes([c for c in f.calls if c[1] == "copy"][1])   # CASE-2 は Drive に events が無い → 除外しない
     assert [e["note"] for e in _events_of(ws, "CASE-1")] == ["r1", "case created: a"]
@@ -599,50 +638,51 @@ def test_checkout_and_checkin_workspace_merge_per_case(conf, monkeypatch):
     assert "fetched 3 (CASE-1, CASE-2, CASE-9)" in msg and "up to date 0" in msg
     f.calls.clear()
     sync.checkin(conf, ws)
-    assert [c[1] for c in f.calls] == ["copyto", "copyto", "copyto", "copy", "cat", "rcat"]
+    assert [c[1] for c in f.calls] == ["copyto", "copyto", "copyto", "copy", "sync"]
     assert not any(x.endswith("events.jsonl") for x in _excludes(f.calls[3]))
     assert st.load_case("CASE-1")["last_checkin_events"] == 2
-    assert set(f.manifest["cases"]) == {"CASE-1", "CASE-2", "CASE-9"} and f.manifest["cases"]["CASE-9"] == {"rev": "d9"}   # 案件なしのディレクトリは触らない
-    assert f.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"] != "d1"
+    assert f.calls[4][2:4] == [str(ws.cases_dir), "my-drive:ws/acme/cases"] and "+ /CASE-1/.rev/**" in f.calls[4] and "+ /CASE-2/.rev/**" in f.calls[4]
+    assert "+ /CASE-9/.rev/**" not in f.calls[4] and f.calls[4][-1] == "- **"
+    assert f.remote_markers["CASE-9"] == ["d9"]                                                        # 案件なしのディレクトリは触らない
+    assert f.remote_markers["CASE-1"] == [st.load_case("CASE-1")["rev"]] and st.load_case("CASE-1")["rev"] != "d1"
 
 
-# ---------- 版マーカー（rev）と manifest.json ----------
+# ---------- 版マーカー（rev と cases/<case>/.rev/<rev>） ----------
 
-def test_checkin_stamps_rev_and_updates_manifest(conf, fake):
-    """checkin(case): 転送前に case.json へ rev（uuid4）/ last_checkin_at / checked_in_from を書き、転送後に manifest を
-    cat → 当該案件を更新 → rcat の順で書き戻す（他案件のエントリは保つ）。キャッシュ index/manifest.cache.json も更新。"""
+def _markers(ws, case) -> list[str]:
+    d = ws.cases_dir / case / ".rev"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def test_checkin_stamps_rev_and_places_marker(conf, fake):
+    """checkin(case): 転送前に case.json へ rev（uuid4）/ last_checkin_at / checked_in_from を書き、案件フォルダの .rev/ を <rev> 1 個に
+    作り直してから rclone sync（Drive 側の古いマーカーは sync が消す）。集計ファイルは読み書きしない。キャッシュの当該案件も更新。"""
     from kairn import store as store_mod
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "t", "acme", actor="human")
-    fake.manifest = {"cases": {"CASE-0": {"rev": "keep", "checked_in_at": "2026-08-01T00:00:00+09:00", "from": "other-host"}}, "updated_at": "x"}
+    (ws.cases_dir / "CASE-1" / ".rev").mkdir(); (ws.cases_dir / "CASE-1" / ".rev" / "stale-local").touch()
+    fake.remote_markers = {"CASE-0": ["keep"], "CASE-1": ["stale-drive"]}
     msg = sync.checkin(conf, ws, "CASE-1")
     c = st.load_case("CASE-1")
     assert len(c["rev"]) == 36 and c["last_checkin_at"] and c["checked_in_from"] == store_mod.hostname()
-    assert [x[1] for x in fake.calls] == ["copyto", "sync", "cat", "rcat"]
-    assert fake.calls[2][2] == "my-drive:ws/acme/manifest.json" and fake.calls[3][2] == "my-drive:ws/acme/manifest.json"
-    path, text = fake.rcats[-1]
-    written = json.loads(text)
-    assert written["cases"]["CASE-1"] == {"rev": c["rev"], "checked_in_at": c["last_checkin_at"], "from": c["checked_in_from"]}
-    assert written["cases"]["CASE-0"]["rev"] == "keep" and written["updated_at"] != "x" and msg.endswith("[manifest: 1]")
-    cache = json.loads((ws.index_dir / "manifest.cache.json").read_text(encoding="utf-8"))
-    assert cache["cases"] == written["cases"] and cache["fetched_at"]
-    # 2 回目は rev が変わる
+    assert [x[1] for x in fake.calls] == ["copyto", "sync"] and "manifest" not in msg
+    assert _markers(ws, "CASE-1") == [c["rev"]] and fake.remote_markers == {"CASE-0": ["keep"], "CASE-1": [c["rev"]]}
+    assert "- **" not in fake.calls[1] and "+ .rev/**" in fake.calls[1]       # 案件単位の sync は .rev/ を含めて全体を揃える
+    cache = json.loads((ws.index_dir / "drive_revs.cache.json").read_text(encoding="utf-8"))
+    assert cache == {"revs": {"CASE-1": c["rev"]}, "fetched_at": None}
+    # 2 回目は rev が変わり、マーカーも入れ替わる
     rev1 = c["rev"]
     sync.checkin(conf, ws, "CASE-1")
-    assert st.load_case("CASE-1")["rev"] != rev1 and fake.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"]
-    # manifest が無ければ新規作成（cat 失敗 → rcat）
-    fake.manifest = None
-    sync.checkin(conf, ws, "CASE-1")
-    assert set(fake.manifest["cases"]) == {"CASE-1"}
+    assert st.load_case("CASE-1")["rev"] != rev1 and _markers(ws, "CASE-1") == [st.load_case("CASE-1")["rev"]] == fake.remote_markers["CASE-1"]
     # dry では何も書かない
     fake.calls.clear(); rev = st.load_case("CASE-1")["rev"]
     sync.checkin(conf, ws, "CASE-1", dry=True)
-    assert [x[1] for x in fake.calls] == ["sync"] and st.load_case("CASE-1")["rev"] == rev
+    assert [x[1] for x in fake.calls] == ["sync"] and st.load_case("CASE-1")["rev"] == rev and _markers(ws, "CASE-1") == [rev]
 
 
-def test_checkin_transfer_failure_restores_case_json(conf, monkeypatch):
-    """転送（rclone sync）が失敗したら版マーカーは書く前の内容・mtime に戻り、manifest は触らない。"""
+def test_checkin_transfer_failure_restores_case_json_and_marker(conf, monkeypatch):
+    """転送（rclone sync）が失敗したら版マーカーは書く前の内容・mtime に戻り、.rev/ もそれに合わせる（未付与なら消える）。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "t", "acme", actor="human")
@@ -653,370 +693,236 @@ def test_checkin_transfer_failure_restores_case_json(conf, monkeypatch):
     with pytest.raises(sync.RcloneError, match="sync failed"):
         sync.checkin(conf, ws, "CASE-1")
     assert (cj.read_text(encoding="utf-8"), cj.stat().st_mtime) == before and "rev" not in st.load_case("CASE-1")
-    assert [x[1] for x in f.calls] == ["copyto", "sync"] and f.rcats == []
-    # manifest の書き戻しだけが失敗: 転送は済んでいるので版マーカーは残し、理由を RcloneError で返す
-    f2 = FakeRun(sync.raw_rules(conf), fail={"rcat"})
-    monkeypatch.setattr(subprocess, "run", f2)
-    with pytest.raises(sync.RcloneError, match="transferred, but manifest update failed"):
+    assert [x[1] for x in f.calls] == ["copyto", "sync"] and not (ws.cases_dir / "CASE-1" / ".rev").exists()
+    # checkin 済みの案件: 失敗すると前の rev とそのマーカーに戻る
+    st.mark_checkin("CASE-1"); rev = st.load_case("CASE-1")["rev"]
+    with pytest.raises(sync.RcloneError, match="sync failed"):
         sync.checkin(conf, ws, "CASE-1")
-    assert st.load_case("CASE-1")["rev"] and st.load_case("CASE-1")["last_checkin_at"]
+    assert st.load_case("CASE-1")["rev"] == rev and _markers(ws, "CASE-1") == [rev]
 
 
 def test_checkin_workspace_stamps_only_changed_cases(conf, fake):
     """ワークスペース全体（daily）: 未 checkin の案件と last_checkin_at より新しい変更のある案件だけ rev を振り直す
-    （変更の無い案件の rev を毎日変えない）。案件が 1 つも対象でなければ manifest も触らない。"""
+    （変更の無い案件の rev を毎日変えない）。copy の後、振り直した案件の .rev/ だけを sync で揃える（古いマーカーを消す）。
+    変更の無い案件も転送前にマーカーを作り直す（欠けていれば補われ、copy で Drive に足される）。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "a", "acme", actor="human"); st.create_case("CASE-2", "b", "acme", actor="human")
     sync.checkin(conf, ws)
     r1, r2 = st.load_case("CASE-1")["rev"], st.load_case("CASE-2")["rev"]
-    assert r1 and r2 and set(fake.manifest["cases"]) == {"CASE-1", "CASE-2"}
+    assert r1 and r2 and fake.remote_markers == {"CASE-1": [r1], "CASE-2": [r2]}
+    assert [x[1] for x in fake.calls] == ["copyto", "copyto", "copy", "sync"] and fake.calls[3][-1] == "- **"
+    assert [x for x in fake.calls[3] if x.startswith("+ ")] == ["+ /CASE-1/.rev/**", "+ /CASE-2/.rev/**"]
     fake.calls.clear()
-    assert sync.checkin(conf, ws).count("[manifest") == 0
-    assert [x[1] for x in fake.calls] == ["copyto", "copyto", "copy"]                     # 変更なし: cat / rcat 無し
+    shutil.rmtree(ws.cases_dir / "CASE-2" / ".rev")                                         # マーカーが欠けた案件
+    fake.remote_markers["CASE-2"] = []
+    sync.checkin(conf, ws)
+    assert [x[1] for x in fake.calls] == ["copyto", "copyto", "copy"]                          # 変更なし: rev はそのまま、マーカー sync も無し
     assert (st.load_case("CASE-1")["rev"], st.load_case("CASE-2")["rev"]) == (r1, r2)
+    assert _markers(ws, "CASE-2") == [r2] and fake.remote_markers["CASE-2"] == [r2]           # 欠けたマーカーは補われ copy で Drive へ
     t = time.time() + 5
     os.utime(ws.cases_dir / "CASE-1" / "worklog.md", (t, t))
     fake.calls.clear()
     sync.checkin(conf, ws)
-    assert [x[1] for x in fake.calls] == ["copyto", "copyto", "copy", "cat", "rcat"]
-    assert st.load_case("CASE-1")["rev"] != r1 and st.load_case("CASE-2")["rev"] == r2
-    assert fake.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"] and fake.manifest["cases"]["CASE-2"]["rev"] == r2
+    assert [x[1] for x in fake.calls] == ["copyto", "copyto", "copy", "sync"]
+    assert [x for x in fake.calls[3] if x.startswith("+ ")] == ["+ /CASE-1/.rev/**"]       # 振り直した案件だけ
+    new1 = st.load_case("CASE-1")["rev"]
+    assert new1 != r1 and st.load_case("CASE-2")["rev"] == r2
+    assert fake.remote_markers == {"CASE-1": [new1], "CASE-2": [r2]} and _markers(ws, "CASE-1") == [new1]   # 古い r1 は Drive からも消える
     os.utime(ws.cases_dir / "CASE-1" / "worklog.md", None)
 
 
-def test_checkout_workspace_fetches_only_rev_mismatch(conf, fake):
-    """kairn checkout <ws>: manifest の rev と違う案件（ローカルに無い案件を含む）だけ取り寄せる。一致は省略、
-    未 checkin のローカル変更がある案件は skip。manifest が無ければ RcloneError（manifest rebuild を案内）。"""
+def test_checkout_writes_marker_from_case_json(conf, fake):
+    """checkout(case): copy --update の後に .rev/ を case.json の rev から作り直す（Drive から来た古いマーカーと並ばない）。
+    dry では触らない。rev の無い案件では .rev/ を消す。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
-    for cid in ("CASE-1", "CASE-2", "CASE-4"):
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    st.set_rev("CASE-1", "new-rev")
+    d = ws.cases_dir / "CASE-1" / ".rev"
+    (d / "old-from-drive").touch()                       # copy --update が持ち込んだ古いマーカーを模す
+    sync.checkout(conf, ws, "CASE-1", dry=True)
+    assert _markers(ws, "CASE-1") == ["new-rev", "old-from-drive"]
+    sync.checkout(conf, ws, "CASE-1")
+    assert _markers(ws, "CASE-1") == ["new-rev"]
+    c = st.load_case("CASE-1"); del c["rev"]; st.save_case(c)
+    sync.checkout(conf, ws, "CASE-1")
+    assert not d.exists()
+
+
+def test_checkout_workspace_fetches_only_rev_mismatch(conf, fake):
+    """kairn checkout <ws>: Drive のマーカーの rev と違う案件（ローカルに無い案件・マーカーが 2 個以上の不定な案件を含む）だけ取り寄せる。
+    一致は省略、未 checkin のローカル変更がある案件は skip。不正な案件 id の行は無視。版が読めなければ RcloneError。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    for cid in ("CASE-1", "CASE-2", "CASE-4", "CASE-5"):
         st.create_case(cid, "t", "acme", actor="human")
         st.mark_checkin(cid)
-    fake.manifest = {"cases": {"CASE-1": {"rev": st.load_case("CASE-1")["rev"]}, "CASE-2": {"rev": "other"}, "CASE-3": {"rev": "new"}, "../x": {"rev": "bad"}}}
-    with pytest.raises(sync.RcloneError, match="invalid case id") as ei:
-        sync.checkout(conf, ws)
-    assert "fetched 2 (CASE-2, CASE-3)" in str(ei.value) and "up to date 1" in str(ei.value)
-    assert [c[2].rsplit("/", 1)[-1] for c in fake.calls if c[1] == "copy"] == ["CASE-2", "CASE-3"]
-    assert json.loads((ws.index_dir / "manifest.cache.json").read_text(encoding="utf-8"))["cases"]["CASE-3"] == {"rev": "new"}
-    del fake.manifest["cases"]["../x"]
+    fake.remote_markers = {"CASE-1": [st.load_case("CASE-1")["rev"]], "CASE-2": ["other"], "CASE-3": ["new"],
+                           "CASE-5": [st.load_case("CASE-5")["rev"], "another"], "../x": ["bad"]}
+    msg = sync.checkout(conf, ws)
+    assert "fetched 3 (CASE-2, CASE-3, CASE-5)" in msg and "up to date 1" in msg and msg.startswith("drive: 4 case(s)")
+    assert [c[2].rsplit("/", 1)[-1] for c in fake.calls if c[1] == "copy"] == ["CASE-2", "CASE-3", "CASE-5"]
+    cache = json.loads((ws.index_dir / "drive_revs.cache.json").read_text(encoding="utf-8"))
+    assert cache["revs"] == {"CASE-1": st.load_case("CASE-1")["rev"], "CASE-2": "other", "CASE-3": "new", "CASE-5": None} and cache["fetched_at"]
+    assert _markers(ws, "CASE-5") == [st.load_case("CASE-5")["rev"]]                     # 取り寄せ後はローカルの rev のマーカー 1 個
     t = time.time() + 5
     os.utime(ws.cases_dir / "CASE-2" / "worklog.md", (t, t))
     fake.calls.clear()
     msg = sync.checkout(conf, ws)
-    assert [c[2].rsplit("/", 1)[-1] for c in fake.calls if c[1] == "copy"] == ["CASE-3"] and "skipped (local changes newer than last checkin) 1 (CASE-2)" in msg
+    assert [c[2].rsplit("/", 1)[-1] for c in fake.calls if c[1] == "copy"] == ["CASE-3", "CASE-5"] and "skipped (local changes newer than last checkin) 1 (CASE-2)" in msg
     os.utime(ws.cases_dir / "CASE-2" / "worklog.md", None)
     # dry: rclone に --dry-run、キャッシュは更新しない
-    (ws.index_dir / "manifest.cache.json").unlink()
+    (ws.index_dir / "drive_revs.cache.json").unlink()
     fake.calls.clear()
-    assert "would fetch 2" in sync.checkout(conf, ws, dry=True)
-    assert all(c[-1] == "--dry-run" for c in fake.calls if c[1] == "copy") and not (ws.index_dir / "manifest.cache.json").exists()
-    fake.manifest = None
-    with pytest.raises(sync.RcloneError, match="manifest unavailable.*kairn manifest rebuild acme"):
+    assert "would fetch 3" in sync.checkout(conf, ws, dry=True)
+    assert all(c[-1] == "--dry-run" for c in fake.calls if c[1] == "copy") and not (ws.index_dir / "drive_revs.cache.json").exists()
+    # 1 案件の失敗は残りを止めず、最後にまとめて RcloneError
+    fake.fail = {"copy"}
+    with pytest.raises(sync.RcloneError, match="errors: CASE-2: .*; CASE-3: .*; CASE-5:"):
+        sync.checkout(conf, ws)
+    fake.fail = {"lsf"}
+    with pytest.raises(sync.RcloneError, match="drive unavailable"):
         sync.checkout(conf, ws)
 
 
-def test_manifest_fetch_failures_are_none(conf, monkeypatch):
-    """rclone 不在・タイムアウト・非ゼロ・JSON でない → None。timeout を渡している。"""
+def test_parse_rev_listing_and_drive_revs(conf, monkeypatch):
+    """lsf -R の出力 → {case: rev}: マーカー 0 個の案件は載らない、1 個は rev、2 個以上は None（不定）。形の違う行・不正な id は無視。
+    drive_revs: rclone 不在・タイムアウト・非ゼロ → None。timeout を渡している。"""
+    lines = ["cases/CASE-1/.rev/r1", "cases/CASE-2/.rev/r2a", "cases/CASE-2/.rev/r2b", "cases/CASE-3/notes.md", "cases/CASE-3/.rev/",
+             "cases/CASE-4/sub/.rev/x", "cases/../x/.rev/bad", "other/CASE-5/.rev/r5", "", "cases/CASE-6/.rev/r6"]
+    assert sync.parse_rev_listing(lines) == {"CASE-1": "r1", "CASE-2": None, "CASE-6": "r6"}
     ws = conf.workspaces["acme"]
     seen = {}
 
     def run(cmd, **kw):
-        seen["kw"] = kw
-        return subprocess.CompletedProcess(cmd, 0, "not json", "")
+        seen["cmd"] = cmd; seen["kw"] = kw
+        return subprocess.CompletedProcess(cmd, 0, "cases/CASE-1/.rev/r1\n", "")
     monkeypatch.setattr(subprocess, "run", run)
-    assert sync.fetch_manifest(conf, ws) is None and seen["kw"]["timeout"] == sync.MANIFEST_TIMEOUT_SEC == 10
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, '{"cases": []}', ""))
-    assert sync.fetch_manifest(conf, ws) is None
+    assert sync.drive_revs(conf, ws) == {"CASE-1": "r1"} and seen["kw"]["timeout"] == sync.DRIVE_REVS_TIMEOUT_SEC
+    assert seen["cmd"] == ["rclone", "lsf", "-R", "--files-only", "--include", "/cases/*/.rev/*", "my-drive:ws/acme"]
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "offline"))
+    assert sync.drive_revs(conf, ws) is None
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 10)))
-    assert sync.fetch_manifest(conf, ws) is None
+    assert sync.drive_revs(conf, ws) is None
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError("rclone")))
-    assert sync.fetch_manifest(conf, ws) is None and sync.refresh_manifest(conf, ws) is None
-    assert not (ws.index_dir / "manifest.cache.json").exists() and sync.load_manifest_cache(ws) is None
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, '{"cases": {"CASE-1": {"rev": "a"}}}', ""))
-    assert sync.refresh_manifest(conf, ws)["cases"]["CASE-1"]["rev"] == "a" and sync.load_manifest_cache(ws)["fetched_at"]
+    assert sync.drive_revs(conf, ws) is None and sync.refresh_drive_revs(conf, ws) is None
+    assert not (ws.index_dir / "drive_revs.cache.json").exists() and sync.load_drive_revs_cache(ws) is None
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "cases/CASE-1/.rev/a\n", ""))
+    assert sync.refresh_drive_revs(conf, ws) == {"CASE-1": "a"} and sync.load_drive_revs_cache(ws)["fetched_at"]
+    # 一部だけの更新（open_case / checkin）は fetched_at を変えない。remove でエントリを消す
+    at = sync.load_drive_revs_cache(ws)["fetched_at"]
+    sync.update_drive_revs_cache(ws, {"CASE-2": "b", "CASE-3": None}, remove=["CASE-1"])
+    assert sync.load_drive_revs_cache(ws) == {"revs": {"CASE-2": "b", "CASE-3": None}, "fetched_at": at}
+    (ws.index_dir / "drive_revs.cache.json").write_text("not json", encoding="utf-8")
+    assert sync.load_drive_revs_cache(ws) is None
+
+
+def test_drive_rev_single_case(conf, monkeypatch):
+    """drive_rev: rclone lsf <case>/.rev/ の名前を読む。0 個 → rev None・markers []、1 個 → rev、2 個以上 → rev None（不定）。
+    ディレクトリ不在（終了 3）はマーカー無し（available）、それ以外の失敗・タイムアウト・rclone 不在は available=False。timeout 10 秒。"""
+    ws = conf.workspaces["acme"]
+    seen = {}
+
+    def run_with(rc, out, err=""):
+        def run(cmd, **kw):
+            seen["cmd"] = cmd; seen["kw"] = kw
+            return subprocess.CompletedProcess(cmd, rc, out, err)
+        return run
+    monkeypatch.setattr(subprocess, "run", run_with(0, "r1\n"))
+    assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": "r1", "markers": ["r1"]}
+    assert seen["cmd"] == ["rclone", "lsf", "my-drive:ws/acme/cases/CASE-1/.rev/"] and seen["kw"]["timeout"] == sync.REV_LSF_TIMEOUT_SEC == 10
+    monkeypatch.setattr(subprocess, "run", run_with(0, "r2\nr1\nsub/\n"))
+    assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": None, "markers": ["r1", "r2"]}
+    monkeypatch.setattr(subprocess, "run", run_with(0, ""))
+    assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": None, "markers": []}
+    monkeypatch.setattr(subprocess, "run", run_with(3, "", "directory not found"))
+    assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": None, "markers": []}
+    monkeypatch.setattr(subprocess, "run", run_with(1, "", "couldn't connect"))
+    r = sync.drive_rev(conf, ws, "CASE-1")
+    assert r["available"] is False and r["rev"] is None and "couldn't connect" in r["error"]
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 10)))
+    assert sync.drive_rev(conf, ws, "CASE-1")["available"] is False
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError("rclone")))
+    assert sync.drive_rev(conf, ws, "CASE-1")["available"] is False
 
 
 def test_drive_state(conf, fake):
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "t", "acme", actor="human")
-    assert sync.drive_state(st, None, "CASE-1")["state"] == "unknown"                                   # manifest なし・未 checkin
-    st.mark_checkin("CASE-1"); rev = st.load_case("CASE-1")["rev"]
-    m = {"cases": {"CASE-1": {"rev": rev, "checked_in_at": "2026-09-01T00:00:00+09:00", "from": "host-a"}}}
-    assert sync.drive_state(st, m, "CASE-1") == {"state": "synced", "rev": rev, "drive_rev": rev, "checked_in_at": "2026-09-01T00:00:00+09:00", "from": "host-a"}
-    assert sync.drive_state(st, {"cases": {}}, "CASE-1")["state"] == "unknown"                            # エントリなし
-    m["cases"]["CASE-1"]["rev"] = "newer"
-    assert sync.drive_state(st, m, "CASE-1")["state"] == "drive_newer"
+    assert sync.drive_state(st, None, "CASE-1")["state"] == "unknown"                                   # 版未取得・未 checkin
+    st.mark_checkin("CASE-1"); c = st.load_case("CASE-1"); rev = c["rev"]
+    assert sync.drive_state(st, {"CASE-1": rev}, "CASE-1") == {"state": "synced", "rev": rev, "drive_rev": rev,
+                                                                "checked_in_at": c["last_checkin_at"], "from": c["checked_in_from"]}
+    assert sync.drive_state(st, {}, "CASE-1")["state"] == "unknown"                                     # マーカー無し
+    assert sync.drive_state(st, {"CASE-1": "newer"}, "CASE-1")["state"] == "drive_newer"
+    d = sync.drive_state(st, {"CASE-1": None}, "CASE-1")                                                # 2 個以上（不定）
+    assert d["state"] == "drive_newer" and d["drive_rev"] is None and d["ambiguous"] is True
     t = time.time() + 5
     os.utime(ws.cases_dir / "CASE-1" / "worklog.md", (t, t))
-    d = sync.drive_state(st, m, "CASE-1")
+    d = sync.drive_state(st, {"CASE-1": "newer"}, "CASE-1")
     assert d["state"] == "local_changes" and d["files"] == ["worklog.md"] and d["drive_differs"] is True
-    m["cases"]["CASE-1"]["rev"] = rev
-    assert sync.drive_state(st, m, "CASE-1")["drive_differs"] is False
+    assert sync.drive_state(st, {"CASE-1": rev}, "CASE-1")["drive_differs"] is False
+    assert sync.drive_state(st, {}, "CASE-1")["drive_differs"] is False
     os.utime(ws.cases_dir / "CASE-1" / "worklog.md", None)
 
 
-# ---------- manifest の同時更新（ホスト内ロック） ----------
-
-class SlowCatRun(FakeRun):
-    """cat の応答を遅らせる FakeRun（read-modify-write の競合窓を広げる）。"""
-
-    def __init__(self, rules, delay: float = 0.05, **kw):
-        super().__init__(rules, **kw)
-        self.delay = delay
-
-    def __call__(self, cmd, **kw):
-        if cmd[:2] == ["rclone", "cat"]:
-            time.sleep(self.delay)
-        return super().__call__(cmd, **kw)
+def test_filters_keep_rev_markers(conf):
+    """_filters は先頭に `+ .rev/**`（rules.exclude / raw_data の除外より先）。除外は --filter の `- ` 規則、min_size は --max-size。
+    raw_move のフィルタは .rev/ を除外する（生データとして移動しない）。rules.exclude にマーカーに当たるパターンがあっても保護される。"""
+    conf.rules["exclude"] = [".*", "*"]
+    f = sync._filters(conf)
+    assert f[:2] == ["--filter", "+ .rev/**"] and f[2:6] == ["--filter", "- .*", "--filter", "- *"] and f[-2:] == ["--max-size", "50M"]
+    assert "--exclude" not in f and "--include" not in f
+    for filt in sync._raw_filter_sets(conf, sync.raw_rules(conf)):
+        assert filt[:2] == ["--filter", "- .rev/**"]
 
 
-def _entries(*ids: str) -> dict[str, dict]:
-    return {cid: {"rev": f"rev-{cid}", "checked_in_at": "2026-08-01T00:00:00+09:00", "from": "host-a"} for cid in ids}
+# ---------- 実 rclone（ローカル間。クラウド接続なし） ----------
 
-
-def test_update_manifest_parallel_keeps_every_entry(conf, monkeypatch):
-    """別案件の update_manifest を 4 スレッドで同時に呼んでも全エントリが残る（ロックで cat → rcat が直列化される）。
-    ロックファイルは $XDG_STATE_HOME/kairn/locks/<ws>.manifest.lock。"""
-    import threading
-    ws = conf.workspaces["acme"]
-    f = SlowCatRun(sync.raw_rules(conf)); f.manifest = {"cases": {"CASE-0": {"rev": "keep"}}, "updated_at": "x"}
-    monkeypatch.setattr(subprocess, "run", f)
-    ids = [f"CASE-{i}" for i in range(1, 5)]
-    errors: list[BaseException] = []
-
-    def go(cid):
-        try:
-            sync.update_manifest(conf, ws, _entries(cid))
-        except BaseException as e:
-            errors.append(e)
-    ts = [threading.Thread(target=go, args=(cid,)) for cid in ids]
-    for t in ts: t.start()
-    for t in ts: t.join(10)
-    assert errors == [] and set(f.manifest["cases"]) == {"CASE-0", *ids} and f.manifest["cases"]["CASE-0"] == {"rev": "keep"}
-    assert [c[1] for c in f.calls] == ["cat", "rcat"] * 4    # 交錯しない
-    assert sync.manifest_lock_path(ws) == Path(os.environ["XDG_STATE_HOME"]) / "kairn" / "locks" / "acme.manifest.lock"
-    assert sync.manifest_lock_path(ws).exists()
-
-
-def test_update_manifest_reads_only_after_lock(conf, fake):
-    """ロックが他に握られている間は cat しない（ロック取得後に読み直す）。解放後に cat → rcat。"""
-    import threading
-    ws = conf.workspaces["acme"]
-    fake.manifest = {"cases": {"CASE-0": {"rev": "keep"}}}
-    done = threading.Event()
-
-    def go():
-        sync.update_manifest(conf, ws, _entries("CASE-1"))
-        done.set()
-    with sync.manifest_lock(ws):
-        t = threading.Thread(target=go); t.start()
-        time.sleep(0.4)
-        assert fake.calls == [] and not done.is_set()
-        fake.manifest = {"cases": {"CASE-0": {"rev": "keep"}, "CASE-2": {"rev": "written while waiting"}}}
-    assert done.wait(5) and [c[1] for c in fake.calls] == ["cat", "rcat"]
-    assert set(fake.manifest["cases"]) == {"CASE-0", "CASE-1", "CASE-2"}    # ロック前の値ではなく待った後の値に足す
-
-
-def test_manifest_lock_timeout_is_recorded_in_checkin_result(conf, fake, monkeypatch):
-    """ロック待ちが上限を超えたら ManifestLockTimeout（RcloneError）。checkin は「転送は済んだが manifest 更新失敗」として返し、
-    版マーカーは残す。ジョブ経路（checkin_job。転送は Popen）では job.error に残る。"""
-    from kairn.jobs import JobTable
-    from tests.test_jobs import FakePopen
-    FakePopen.calls = []; FakePopen.rc = 0
-    monkeypatch.setattr(subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(sync, "MANIFEST_LOCK_TIMEOUT_SEC", 0.3)
-    ws = conf.workspaces["acme"]
-    st = CaseStore(ws.cases_dir)
-    st.create_case("CASE-1", "t", "acme", actor="human")
-    with sync.manifest_lock(ws):
-        t0 = time.monotonic()
-        with pytest.raises(sync.RcloneError, match=r"transferred, but manifest update failed \(manifest lock .*not acquired within 0.3s"):
-            sync.checkin(conf, ws, "CASE-1")
-        assert 0.3 <= time.monotonic() - t0 < 5
-        assert [c[1] for c in fake.calls] == ["copyto", "sync"] and fake.manifest is None    # cat / rcat は呼ばない
-        assert st.load_case("CASE-1")["rev"] and st.load_case("CASE-1")["last_checkin_at"]
-        table = JobTable()
-        job, _ = table.submit("checkin", ws.name, "CASE-1", lambda p: sync.checkin_job(conf, ws, "CASE-1", "test-agent", p))
-        assert job.wait(5) and job.status == "failed" and "manifest update failed" in job.error and "manifest lock" in job.error
-        with pytest.raises(sync.ManifestLockTimeout):
-            with sync.manifest_lock(ws, timeout=0.1):
-                pass
-    # 解放後は通る
-    fake.calls.clear()
-    sync.checkin(conf, ws, "CASE-1")
-    assert [c[1] for c in fake.calls] == ["copyto", "sync", "cat", "rcat"] and set(fake.manifest["cases"]) == {"CASE-1"}
-
-
-def test_merge_manifest_never_drops_entries(conf, fake, monkeypatch):
-    """update_manifest は読み込んだ manifest のエントリを減らさない: merge_manifest は自分の案件だけ置き換えて他を保ち、
-    書き戻す直前の refuse_entry_loss が（万一）減っていれば ManifestWriteRefused で rcat を止める。"""
-    read = {"cases": {"CASE-1": {"rev": "a"}, "CASE-2": {"rev": "b"}}, "updated_at": "x", "extra": 1}
-    m = sync.merge_manifest(read, {"CASE-2": {"rev": "b2"}, "CASE-3": {"rev": "c"}})
-    assert m["cases"] == {"CASE-1": {"rev": "a"}, "CASE-2": {"rev": "b2"}, "CASE-3": {"rev": "c"}} and m["extra"] == 1 and m["updated_at"] != "x"
-    assert read["cases"]["CASE-2"] == {"rev": "b"}                                     # 引数は変更しない
-    assert sync.merge_manifest(None, {"CASE-1": {"rev": "a"}}) ["cases"] == {"CASE-1": {"rev": "a"}}
-    assert sync.merge_manifest({"cases": {"CASE-1": {"rev": "a"}}}, {})["cases"] == {"CASE-1": {"rev": "a"}}
-    for base in ({"cases": {}}, None, read):
-        for ents in ({}, {"CASE-1": {"rev": "z"}}, {"CASE-9": {"rev": "n"}}):
-            assert set((base or {}).get("cases", {})) <= set(sync.merge_manifest(base, ents)["cases"])
-    sync.refuse_entry_loss(read, m); sync.refuse_entry_loss(None, m); sync.refuse_entry_loss(read, read)
-    with pytest.raises(sync.ManifestWriteRefused, match=r"1 existing entry would be dropped \(CASE-2\)"):
-        sync.refuse_entry_loss(read, {"cases": {"CASE-1": {"rev": "a"}, "CASE-3": {}}})
-    # update_manifest の経路: マージ結果が減っていたら rcat しない（RcloneError の一種なので checkin は「manifest 更新失敗」で返す）
-    ws = conf.workspaces["acme"]
-    fake.manifest = {"cases": {"CASE-1": {"rev": "a"}, "CASE-2": {"rev": "b"}}}
-    monkeypatch.setattr(sync, "merge_manifest", lambda base, entries: {"cases": dict(entries)})
-    with pytest.raises(sync.ManifestWriteRefused, match="CASE-1, CASE-2"):
-        sync.update_manifest(conf, ws, {"CASE-3": {"rev": "c"}})
-    assert [c[1] for c in fake.calls] == ["cat"] and set(fake.manifest["cases"]) == {"CASE-1", "CASE-2"}
-    assert not (ws.index_dir / "manifest.cache.json").exists()
-
-
-def test_update_manifest_repairs_missing_entries_when_drive_rev_matches(conf, fake, monkeypatch):
-    """自己修復: manifest にエントリの無いローカル案件（rev あり）は、Drive の case.json の rev がローカルと一致する場合に限り
-    ローカルの rev / last_checkin_at / checked_in_from で補う。不一致・読めない・rev 未付与の案件は補わない。
-    checkin の結果に [manifest repaired: N] が付く。上限秒を使い切ったら残りは次回。"""
-    ws = conf.workspaces["acme"]
-    st = CaseStore(ws.cases_dir)
-    for cid in ("CASE-1", "CASE-2", "CASE-3", "CASE-4", "CASE-5"):
-        st.create_case(cid, cid, "acme", actor="human")
-    sync.checkin(conf, ws)                                                            # 全件 checkin 済み（manifest に 5 件）
-    c1, c2, c3 = (st.load_case(c) for c in ("CASE-1", "CASE-2", "CASE-3"))
-    fake.remote_cases = {"CASE-1": dict(c1), "CASE-2": {**c2, "rev": "another-host-rev"}, "CASE-4": dict(st.load_case("CASE-4"))}   # CASE-3 は Drive に無い
-    c5 = st.load_case("CASE-5"); c5.pop("rev"); st.save_case(c5)                       # rev 未付与
-    fake.manifest = {"cases": {"CASE-0": {"rev": "keep"}}, "updated_at": "x"}         # 欠落した manifest（CASE-1〜5 が無い）
-    fake.calls.clear()
-    msg = sync.checkin(conf, ws, "CASE-4")
-    assert msg.endswith("[manifest: 1] [manifest repaired: 1]")
-    cats = [c[2] for c in fake.calls if c[1] == "cat"]
-    assert cats == ["my-drive:ws/acme/manifest.json", "my-drive:ws/acme/cases/CASE-1/case.json", "my-drive:ws/acme/cases/CASE-2/case.json",
-                    "my-drive:ws/acme/cases/CASE-3/case.json"]                        # CASE-4 は自分の分、CASE-5 は rev 無し: 確認しない
-    assert set(fake.manifest["cases"]) == {"CASE-0", "CASE-1", "CASE-4"}
-    assert fake.manifest["cases"]["CASE-1"] == {"rev": c1["rev"], "checked_in_at": c1["last_checkin_at"], "from": c1["checked_in_from"]}
-    assert fake.manifest["cases"]["CASE-4"]["rev"] == st.load_case("CASE-4")["rev"] != c1["rev"]
-    cache = json.loads((ws.index_dir / "manifest.cache.json").read_text(encoding="utf-8"))
-    assert set(cache["cases"]) == {"CASE-0", "CASE-1", "CASE-4"}
-    # 2 回目: CASE-2（不一致）と CASE-3（Drive に無い）だけ再確認し、補わない
-    fake.calls.clear()
-    assert sync.checkin(conf, ws, "CASE-4").endswith("[manifest: 1]")
-    assert [c[2].rsplit("/", 2)[-2] for c in fake.calls if c[1] == "cat" and c[2].endswith("case.json")] == ["CASE-2", "CASE-3"]
-    # 上限秒 0: 確認せず、残りは次回
-    monkeypatch.setattr(sync, "MANIFEST_REPAIR_BUDGET_SEC", 0.0)
-    fake.calls.clear(); fake.remote_cases["CASE-2"] = dict(c2)
-    sync.checkin(conf, ws, "CASE-4")
-    assert [c[1] for c in fake.calls] == ["copyto", "sync", "cat", "rcat"] and "CASE-2" not in fake.manifest["cases"]
-    monkeypatch.setattr(sync, "MANIFEST_REPAIR_BUDGET_SEC", 5.0)
-    # 1 件目の cat がタイムアウトしたら打ち切る（残りは次回）
-    timed_out: list[tuple[str, float]] = []
-
-    def slow_cat(cmd, **kw):
-        if cmd[1] == "cat" and cmd[2].endswith("/CASE-2/case.json"):
-            timed_out.append((cmd[2], kw["timeout"]))
-            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
-        return fake(cmd, **kw)
-    monkeypatch.setattr(subprocess, "run", slow_cat)
-    fake.calls.clear()
-    assert sync.checkin(conf, ws, "CASE-4").endswith("[manifest: 1]") and "CASE-2" not in fake.manifest["cases"]
-    assert [c[2] for c in fake.calls if c[1] == "cat" and c[2].endswith("case.json")] == [] and len(timed_out) == 1
-    assert timed_out[0][0].endswith("/CASE-2/case.json") and 0 < timed_out[0][1] <= 5.0     # cat の timeout は残り秒（≤ 上限）
-    monkeypatch.setattr(subprocess, "run", fake)
-    assert sync.checkin(conf, ws, "CASE-4").endswith("[manifest repaired: 1]") and fake.manifest["cases"]["CASE-2"]["rev"] == c2["rev"]
-    # repair_manifest 単体: 引数の manifest を直接書き換え、補った案件 id を返す。cat には rclone_flags が付く
-    m = {"cases": {}}
-    conf.rules["rclone_flags"] = ["--checkers", "4"]
-    fake.remote_cases["CASE-4"] = dict(st.load_case("CASE-4"))     # 偽 rclone の sync は Drive 側 case.json を更新しないので合わせる
-    fake.calls.clear()
-    assert sync.repair_manifest(conf, ws, m) == ["CASE-1", "CASE-2", "CASE-4"] and set(m["cases"]) == {"CASE-1", "CASE-2", "CASE-4"}
-    assert all(c[-2:] == ["--checkers", "4"] for c in fake.calls)
-
-
-def test_manifest_rebuild_holds_lock(conf, fake):
-    """manifest_rebuild（dry でない）は列挙〜書き戻しをロックの中で行う。dry はロックを取らない。"""
-    ws = conf.workspaces["acme"]
-    fake.remote_cases = {"CASE-1": {"id": "CASE-1", "title": "t", "rev": "r1", "last_checkin_at": "2026-08-01T00:00:00+09:00"}}
-    seen = {}
-    orig = sync.write_manifest
-
-    def probe(conf_, ws_, manifest):
-        try:
-            with sync.manifest_lock(ws_, timeout=0.1):
-                seen["locked_during_write"] = False
-        except sync.ManifestLockTimeout:
-            seen["locked_during_write"] = True
-        return orig(conf_, ws_, manifest)
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(sync, "write_manifest", probe)
-        sync.manifest_rebuild(conf, ws)
-    assert seen == {"locked_during_write": True} and set(fake.manifest["cases"]) == {"CASE-1"}
-    with sync.manifest_lock(ws):
-        assert sync.manifest_rebuild(conf, ws, dry=True)["cases"]["CASE-1"]["rev"] == "r1"     # dry は待たない
-
-
-# ---------- manifest rebuild（既存 Drive データの移行） ----------
-
-def test_manifest_rebuild_assigns_rev_and_aligns_local(conf, fake):
-    """Drive の cases/*/case.json を列挙して読み、rev が無ければ付与して rcat で書き戻し（last_checkin_at は既存値を維持、無ければ
-    Drive のファイル更新時刻）、manifest.json を作り直す。ローカルの同じ案件（checkin 済み・変更なし）にも同じ rev を書く。"""
+@pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
+def test_rev_markers_round_trip_with_real_rclone(conf, tmp_path, monkeypatch):
+    """実 rclone でローカルのディレクトリを Drive に見立てる: checkin(case) で Drive の古いマーカーが消えて新しいものだけ残り、
+    drive_rev / drive_revs がそれを読む。checkin(ws)（copy + .rev/ 限定 sync）でも同じ。checkout(case) は取り寄せたマーカーを
+    case.json の rev に合わせて 1 個にする。"""
+    monkeypatch.setenv("RCLONE_CONFIG", str(tmp_path / "rclone-empty.conf"))
+    drive = tmp_path / "drive"
+    monkeypatch.setattr(conf, "drive_path", lambda ws_name, *parts: str(drive / ws_name / "/".join(parts)))
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "one", "acme", actor="human"); st.create_case("CASE-2", "two", "acme", actor="human")
-    st.create_case("CASE-5", "local only", "acme", actor="human")
-    for cid in ("CASE-1", "CASE-2"):   # 旧方式で checkin 済み（rev 無し）: last_checkin_at より古い mtime にする
-        c = st.load_case(cid); c["last_checkin_at"] = "2026-08-20T10:00:00+09:00"; c["last_checkin_events"] = 1; st.save_case(c)
-        for name in ("case.json", "worklog.md", "events.jsonl"):
-            old = time.time() - 30 * DAY
-            os.utime(ws.cases_dir / cid / name, (old, old))
-    fake.remote_cases = {"CASE-1": {"id": "CASE-1", "title": "one", "status": "open"},                                            # rev / last_checkin_at 無し
-                         "CASE-2": {"id": "CASE-2", "title": "two", "status": "open", "rev": "r2", "last_checkin_at": "2026-08-21T00:00:00+09:00", "checked_in_from": "host-b"},
-                         "CASE-3": {"id": "CASE-3", "title": "drive only", "status": "closed"},
-                         "CASE-4": "not an object"}
+    for cid in ("CASE-1", "CASE-2"):
+        (drive / "acme" / "cases" / cid / ".rev").mkdir(parents=True); (drive / "acme" / "cases" / cid / ".rev" / f"stale-{cid}").touch()
+    (drive / "acme" / "cases" / "CASE-9" / ".rev").mkdir(parents=True); (drive / "acme" / "cases" / "CASE-9" / ".rev" / "r9").touch()
+    assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": "stale-CASE-1", "markers": ["stale-CASE-1"]}
+    assert sync.drive_rev(conf, ws, "CASE-7") == {"available": True, "rev": None, "markers": []}          # .rev/ 無し（終了 3）
+    # 案件単位: sync が古いマーカーを消す（--backup-dir に退避）
+    sync.checkin(conf, ws, "CASE-1")
+    rev1 = st.load_case("CASE-1")["rev"]
+    assert sorted(p.name for p in (drive / "acme" / "cases" / "CASE-1" / ".rev").iterdir()) == [rev1]
+    assert json.loads((drive / "acme" / "cases" / "CASE-1" / "case.json").read_text(encoding="utf-8"))["rev"] == rev1
+    assert sync.drive_rev(conf, ws, "CASE-1")["rev"] == rev1
+    assert sync.drive_revs(conf, ws) == {"CASE-1": rev1, "CASE-2": "stale-CASE-2", "CASE-9": "r9"}
+    # ワークスペース全体: copy は古いマーカーを残すが、続く .rev/ 限定の sync が振り直した案件の分だけ消す
+    sync.checkin(conf, ws)
+    rev2 = st.load_case("CASE-2")["rev"]
+    assert st.load_case("CASE-1")["rev"] == rev1                                                           # 変更なし: 振り直さない
+    assert sorted(p.name for p in (drive / "acme" / "cases" / "CASE-2" / ".rev").iterdir()) == [rev2]
+    assert sync.drive_revs(conf, ws) == {"CASE-1": rev1, "CASE-2": rev2, "CASE-9": "r9"}
+    # 別環境の checkin を模す: Drive の case.json の rev とマーカーを変える → checkout(case) で取り寄せ、ローカルのマーカーは 1 個
+    remote = json.loads((drive / "acme" / "cases" / "CASE-2" / "case.json").read_text(encoding="utf-8")); remote["rev"] = "from-another-host"
+    (drive / "acme" / "cases" / "CASE-2" / "case.json").write_text(json.dumps(remote), encoding="utf-8")
+    (drive / "acme" / "cases" / "CASE-2" / ".rev" / rev2).unlink(); (drive / "acme" / "cases" / "CASE-2" / ".rev" / "from-another-host").touch()
     t = time.time() + 5
-    os.utime(ws.cases_dir / "CASE-2" / "worklog.md", (t, t))     # 未 checkin のローカル変更 → ローカルは触らない
-    cj1 = ws.cases_dir / "CASE-1" / "case.json"; mtime1 = cj1.stat().st_mtime
-    # dry-run: 変更内容を返すだけで何も書かない
-    r = sync.manifest_rebuild(conf, ws, dry=True)
-    assert r["dry"] is True and fake.rcats == [] and fake.manifest is None and "rev" not in st.load_case("CASE-1")
-    assert r["cases"]["CASE-1"]["rev_assigned"] and r["cases"]["CASE-1"]["local"] == "updated" and r["cases"]["CASE-1"]["remote"] == "updated"
-    assert not r["cases"]["CASE-2"]["rev_assigned"] and r["cases"]["CASE-2"]["local"] == "skipped" and r["local_skipped"] == ["CASE-2"]
-    assert r["cases"]["CASE-3"]["local"] == "absent" and "CASE-4" in r["errors"] and "CASE-5" not in r["cases"]
-    assert not (ws.index_dir / "manifest.cache.json").exists()
-    # 実行
-    r = sync.manifest_rebuild(conf, ws)
-    lsf = [c for c in fake.calls if c[1] == "lsf"][0]
-    assert lsf[2:] == ["-R", "--files-only", "--format", "pt", "--separator", "\t", "--max-depth", "2", "--include", "/*/case.json", "my-drive:ws/acme/cases"]
-    assert [p.rsplit("/", 2)[-2] if p.endswith("case.json") else p for p, _ in fake.rcats] == ["CASE-1", "CASE-3", "my-drive:ws/acme/manifest.json"]
-    rev1 = fake.remote_cases["CASE-1"]["rev"]
-    assert len(rev1) == 36 and fake.remote_cases["CASE-1"]["last_checkin_at"] == sync._lsf_time_to_iso(fake.remote_case_mtime)
-    assert fake.remote_cases["CASE-2"] == {"id": "CASE-2", "title": "two", "status": "open", "rev": "r2", "last_checkin_at": "2026-08-21T00:00:00+09:00", "checked_in_from": "host-b"}
-    assert fake.manifest["cases"] == {"CASE-1": {"rev": rev1, "checked_in_at": fake.remote_cases["CASE-1"]["last_checkin_at"], "from": ""},
-                                      "CASE-2": {"rev": "r2", "checked_in_at": "2026-08-21T00:00:00+09:00", "from": "host-b"},
-                                      "CASE-3": {"rev": fake.remote_cases["CASE-3"]["rev"], "checked_in_at": fake.remote_cases["CASE-3"]["last_checkin_at"], "from": ""}}
-    assert fake.manifest["updated_at"] and r["cases"]["CASE-1"]["rev"] == rev1 == st.load_case("CASE-1")["rev"]
-    assert cj1.stat().st_mtime == mtime1 and st.local_changes_since_checkin("CASE-1") == []          # ローカルの mtime は動かさない
-    assert "rev" not in st.load_case("CASE-2") and "rev" not in st.load_case("CASE-5")
-    assert json.loads((ws.index_dir / "manifest.cache.json").read_text(encoding="utf-8"))["cases"] == fake.manifest["cases"]
-    # 2 回目: すべて既存の rev を保つ（Drive にもローカルにも書かない）
-    fake.rcats.clear()
-    r = sync.manifest_rebuild(conf, ws)
-    assert [p for p, _ in fake.rcats] == ["my-drive:ws/acme/manifest.json"] and r["cases"]["CASE-1"]["local"] == "same"
-    os.utime(ws.cases_dir / "CASE-2" / "worklog.md", None)
-    # 未 checkin（last_checkin_at 無し）のローカル案件は触らない（never checked in）
-    c5 = st.load_case("CASE-5"); fake.remote_cases["CASE-5"] = {"id": "CASE-5", "rev": "r5", "last_checkin_at": "2026-08-01T00:00:00+09:00"}
-    r = sync.manifest_rebuild(conf, ws)
-    assert r["cases"]["CASE-5"]["local"] == "skipped" and r["cases"]["CASE-5"]["local_reason"] == "never checked in" and "rev" not in st.load_case("CASE-5")
-    assert sync.manifest_rebuild(conf, ws)["cases"]["CASE-5"]["remote"] == "same"
-    # lsf の失敗は RcloneError
-    fake.fail = {"lsf"}
-    with pytest.raises(sync.RcloneError):
-        sync.manifest_rebuild(conf, ws)
-
-
-def test_lsf_time_to_iso():
-    iso = sync._lsf_time_to_iso("2026-08-15 09:30:00.123456789")
-    assert iso is not None and iso.startswith("2026-08-15T09:30:00") and ("+" in iso[19:] or "-" in iso[19:])
-    assert sync._lsf_time_to_iso("garbage") is None
+    for p in (drive / "acme" / "cases" / "CASE-2").rglob("*"):
+        os.utime(p, (t, t))
+    assert sync.drive_state(st, sync.drive_revs(conf, ws), "CASE-2")["state"] == "drive_newer"
+    sync.checkout(conf, ws, "CASE-2")
+    assert st.load_case("CASE-2")["rev"] == "from-another-host" and st.rev_markers("CASE-2") == ["from-another-host"]
+    msg = sync.checkout(conf, ws)                                                                            # CASE-9 はローカルに無い → 取り寄せ。CASE-2 は取り寄せた分が次の checkin までローカル変更
+    assert msg.startswith("drive: 3 case(s); fetched 1 (CASE-9), up to date 1, skipped (local changes newer than last checkin) 1 (CASE-2)")
+    assert (ws.cases_dir / "CASE-9" / ".rev" / "r9").exists() and not (ws.cases_dir / "CASE-9" / "case.json").exists()   # case.json の無いディレクトリは触らない（取り寄せたまま）
 
 
 # ---------- rules.rclone_flags: rclone を呼ぶすべての箇所で共通引数の後ろに付く ----------
@@ -1031,27 +937,25 @@ def _tail_flags(cmd: list[str]) -> list[str]:
 
 
 def test_rclone_flags_appended_to_every_rclone_command(conf, fake, monkeypatch):
-    """checkout（copyto + copy）/ checkin（copyto + sync|copy + manifest cat・rcat）/ raw_move（lsf + move）/ drive_index（lsf）/
-    manifest（fetch・write・rebuild の lsf・cat・rcat）/ ws（lsd・mkdir・lsf）の全 rclone 呼び出しの末尾に rules.rclone_flags が付く。
-    既定（未設定）では何も付かない。"""
+    """checkout（copyto + copy）/ checkin（copyto + sync|copy + .rev/ の sync）/ raw_move（lsf + move）/ drive_index（lsf）/
+    版マーカー（drive_rev・drive_revs の lsf）/ events の copyto / ws（lsd・mkdir・lsf）の
+    全 rclone 呼び出しの末尾に rules.rclone_flags が付く。既定（未設定）では何も付かない。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-123", "t", "acme", actor="human")
     _touch(ws.cases_dir / "CASE-123" / "run.bag", 10, 20 * DAY)
-    fake.manifest = {"cases": {}, "updated_at": "x"}
-    fake.remote_cases = {"CASE-9": {"id": "CASE-9", "title": "t"}}
     conf.rules["rclone_flags"] = list(FLAGS)
     sync.checkout(conf, ws, "CASE-123")
     sync.checkin(conf, ws, "CASE-123")
     sync.checkin(conf, ws)
+    fake.remote_cases = {"CASE-123": dict(st.load_case("CASE-123"))}
     sync.raw_move(conf, ws, "CASE-123")
     sync.drive_index(conf, ws)
-    sync.fetch_manifest(conf, ws); sync.write_manifest(conf, ws, {"cases": {}})
+    sync.drive_rev(conf, ws, "CASE-123"); sync.drive_revs(conf, ws); sync.checkout(conf, ws)
     sync.fetch_remote_events(conf, ws, "CASE-123")
-    sync.manifest_rebuild(conf, ws)
     sync.ws_exists_on_drive(conf, "acme"); sync.create_ws_on_drive(conf, "acme"); sync.list_ws_on_drive(conf)
     subs = {c[1] for c in fake.calls}
-    assert {"copyto", "copy", "sync", "cat", "rcat", "lsf", "move", "lsd", "mkdir"} <= subs
+    assert {"copyto", "copy", "sync", "lsf", "move", "lsd", "mkdir"} <= subs and "cat" not in subs and "rcat" not in subs
     for c in fake.calls:
         assert c[0] == "rclone" and _tail_flags(c) == FLAGS, c
     # --dry-run は flags の後ろ（_run が最後に足す）

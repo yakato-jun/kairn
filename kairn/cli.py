@@ -9,11 +9,10 @@
   kairn new <case id> "<title>" [--ws <ws>]
   kairn checkout <ws> [<case>] [--dry-run] | checkin <ws> [<case>] [--dry-run] | index <ws> [--full] | drive-index <ws>
                                          # checkout / checkin は同期実行（終わるまで待つ。タイムアウト無し）。大きな初回投入は MCP ではなくここで行う
-                                         # checkout <ws>（案件指定なし）は Drive の manifest.json と比べて rev が違う案件だけ取り寄せる
+                                         # checkout <ws>（案件指定なし）は Drive の版マーカー（cases/*/.rev/）を 1 回読み、rev が違う案件だけ取り寄せる
   kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮（30 分以上更新のないもの）
   kairn raw-move <ws> [<case>] [--dry-run]  # 生データ（rules.raw_data）を Drive へ移動し、所在を案件に記録
-  kairn daily <ws> [--dry-run]              # bag2zst -> checkin -> raw-move -> drive-index -> index（systemd timer 用）
-  kairn manifest rebuild <ws> [--dry-run]   # 既存 Drive データの移行: cases/*/case.json に rev を付与し manifest.json を作り直す（新方式導入時に一度）
+  kairn daily <ws> [--dry-run]              # bag2zst -> checkout -> checkin -> raw-move -> drive-index -> index（systemd timer 用）
   kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]
                                          # 子エージェントで case.json の下書きを作る（書き込まない。適用は UI）
   kairn rules show                       # 同期・退避規則（rules）の現在値
@@ -212,28 +211,6 @@ def cmd_sync(a):
             sys.exit(1)
 
 
-def cmd_manifest(a):
-    conf = cfg.load(); ws = _ws(conf, a.ws)
-    from . import sync
-    try:
-        r = sync.manifest_rebuild(conf, ws, dry=a.dry_run)
-    except sync.RcloneError as e:
-        raise SystemExit(f"kairn: {e}") from None
-    tag = "[dry] " if a.dry_run else ""
-    for cid, c in r["cases"].items():
-        remote = "rev assigned" if c["rev_assigned"] else "rev kept"
-        if c["checked_in_at_assigned"]:
-            remote += ", last_checkin_at from drive mtime"
-        local = c["local"] + (f" ({c['local_reason']})" if c.get("local_reason") else "")
-        print(f"{tag}{cid:<40} drive: {remote:<45} local: {local}")
-    for cid, err in r["errors"].items():
-        print(f"ERROR {cid}: {err}", file=sys.stderr)
-    print(f"{tag}manifest {r['manifest']}: {len(r['cases'])} case(s), {len(r['errors'])} error(s)"
-          + (f", local skipped: {', '.join(r['local_skipped'])}" if r["local_skipped"] else "") + (" (dry-run: nothing written)" if a.dry_run else ""))
-    if r["errors"]:
-        sys.exit(1)
-
-
 def cmd_extract(a):
     conf = cfg.load(); ws = _ws(conf, a.ws)
     import json
@@ -387,9 +364,7 @@ def main() -> None:
         s = sub.add_parser(name); s.add_argument("ws", nargs="?"); s.add_argument("case", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("index", help="rebuild the local search index (changed files only; --full for everything)"); s.add_argument("ws", nargs="?"); s.add_argument("--full", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("drive-index", help="list all files on the drive into index/drive-index.txt"); s.add_argument("ws", nargs="?"); s.set_defaults(f=cmd_sync)
-    s = sub.add_parser("daily", help="bag2zst -> checkin -> raw-move -> drive-index -> index"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
-    s = sub.add_parser("manifest", help="rebuild the drive's manifest.json from cases/*/case.json (assign rev where missing; run once when adopting the manifest)"); ss = s.add_subparsers(dest="sub", required=True)
-    c = ss.add_parser("rebuild"); c.add_argument("ws", nargs="?"); c.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_manifest)
+    s = sub.add_parser("daily", help="bag2zst -> checkout -> checkin -> raw-move -> drive-index -> index"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("extract", help="draft case.json with an isolated child agent (read-only; apply in the UI)"); s.add_argument("case"); s.add_argument("--ws"); s.add_argument("--agent", choices=["claude", "codex", "opencode", "antigravity"]); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_extract)
     s = sub.add_parser("rules", help="show / edit the sync rules (rules: in the config; never edit the file by hand)"); ss = s.add_subparsers(dest="sub", required=True)
     ss.add_parser("show")

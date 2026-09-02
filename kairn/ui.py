@@ -25,7 +25,7 @@ from .store import JST, TASK_OWNERS, CaseStore
 STALE_DAYS = 7  # これを超えて動きの無い open タスクを目立たせる（自動では消さない）
 LIVE = ("open", "doing", "blocked")
 LIST_STATUSES = ("open", "closed", "suspended", "all")
-# 一覧の Drive 列（sync.drive_state。直近に取得した manifest のキャッシュとの比較）: state → (表示, CSS クラス)
+# 一覧の Drive 列（sync.drive_state。直近に読んだ Drive の版マーカーのキャッシュとの比較）: state → (表示, CSS クラス)
 DRIVE_MARKS = {"synced": ("同期済み", "ok"), "drive_newer": ("Drive の方が新しい", "stale"),
                "local_changes": ("ローカル未 checkin", "warn"), "unknown": ("不明", "muted")}
 
@@ -111,12 +111,13 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
         if status not in LIST_STATUSES:
             status = "open"
         rows = []
-        checked: dict[str, str | None] = {}   # ws → manifest キャッシュの取得時刻（無ければ None）
+        checked: dict[str, str | None] = {}   # ws → 版マーカーのキャッシュで全案件を読んだ時刻（無ければ None）
         for ws in conf.workspaces.values():
             if want_ws and ws.name != want_ws:
                 continue
             st = CaseStore(ws.cases_dir)
-            cache = sync.load_manifest_cache(ws)
+            cache = sync.load_drive_revs_cache(ws)
+            revs = cache["revs"] if cache else None
             checked[ws.name] = (cache or {}).get("fetched_at")
             for cid in st.list_case_ids():
                 c = st.load_case(cid)
@@ -132,7 +133,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
                 rows.append(
                     f"<tr><td>{_esc(ws.name)}</td><td><a href='{_url(ws, cid)}'>{_esc(cid)}</a><br><small>{_esc(c.get('title', ''))}</small> {tags}</td>"
                     f"<td>{_esc(c.get('status'))}</td><td><span class='bar'><i style='width:{pct}%'></i></span> {p['done']}/{p['total']} (v{p['plan']})</td>"
-                    f"<td>{_age(fr)}</td><td>{_drive_mark(sync.drive_state(st, cache, cid))}</td>"
+                    f"<td>{_age(fr)}</td><td>{_drive_mark(sync.drive_state(st, revs, cid))}</td>"
                     f"<td><small>{_esc((le or {}).get('t', '')[:16])} {_esc((le or {}).get('actor', ''))} {_esc((le or {}).get('action', ''))}</small></td>"
                     f"<td><small>{_esc((ai_last or {}).get('t', '')[:16])} {_esc((ai_last or {}).get('agent', ''))} {_esc((ai_last or {}).get('action', ''))}</small></td></tr>")
             legacy = st.list_dirs_without_case()
@@ -141,16 +142,17 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
         filt = (f"<p><small>status: " + " ".join(f"<a href='{P}?status={s}{'&element=' + quote(element, safe='') if element else ''}'>{s}</a>" for s in LIST_STATUSES)
                 + (f" · element: <b>{_esc(element)}</b> <a href='{P}?status={status}'>✕</a>" if element else "") + "</small></p>")
         refreshed = req.query_params.get("refreshed") or ""
-        drive = (f"<p><small>Drive: " + " · ".join(f"{_esc(w)}: manifest {_esc(t[:16]) + ' 取得' if t else '未取得'}" for w, t in checked.items())
+        drive = (f"<p><small>Drive: " + " · ".join(f"{_esc(w)}: 版 {_esc(t[:16]) + ' 取得' if t else '未取得'}" for w, t in checked.items())
                  + f" <form class='inline' method=post action='{P}/refresh' accept-charset='utf-8'><input type=hidden name=ws value='{_esc(want_ws)}'>"
                  f"<button>更新確認</button></form>"
                  + (f" <span class='ok'>{_esc(refreshed)}</span>" if refreshed else "")
-                 + "<br><span class='muted'>Drive 列は直近に取得した manifest との比較（同期済み = rev 一致 / Drive の方が新しい = rev が違う / ローカル未 checkin / 不明 = manifest 未取得・エントリ無し・未 checkin）。"
-                   "取得は open_case・checkin・kairn checkout・このボタンで行う</span></small></p>")
+                 + "<br><span class='muted'>Drive 列は直近に読んだ Drive の版マーカー（cases/&lt;case&gt;/.rev/）との比較（同期済み = rev 一致 / Drive の方が新しい = rev が違う・マーカーが不定 / ローカル未 checkin / 不明 = 未取得・マーカー無し・未 checkin）。"
+                   "更新確認は全案件の版を 1 回で読み、違う案件だけ取り寄せる（未 checkin のローカル変更がある案件は取り寄せない）</span></small></p>")
         return _page("cases", filt + drive + f"<table><tr><th>ws</th><th>case</th><th>status</th><th>progress</th><th>鮮度</th><th>Drive</th><th>last event</th><th>AI last</th></tr>{''.join(rows)}</table>")
 
     async def refresh(req: Request) -> Response:
-        """一覧の「更新確認」: Drive の manifest.json を取得してキャッシュを更新する（案件は取り寄せない）。ws が空なら全ワークスペース。
+        """一覧の「更新確認」: Drive の版マーカーを rclone lsf 1 回で読んでキャッシュを更新し、rev が違う案件だけ取り寄せる
+        （sync.checkout_workspace。未 checkin のローカル変更がある案件は取り寄せない）。ws が空なら全ワークスペース。
         rclone は threadpool で実行し、同じプロセスの MCP を止めない。"""
         if not same_origin(req):
             return PlainTextResponse("forbidden: cross-site request", status_code=403)
@@ -161,8 +163,10 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
             return PlainTextResponse("not found", status_code=404)
         results = []
         for w in targets:
-            m = await run_in_threadpool(sync.refresh_manifest, conf, w)
-            results.append(f"{w.name}: {'manifest ' + str(len(m['cases'])) + ' case(s)' if m is not None else 'manifest unavailable'}")
+            try:
+                results.append(f"{w.name}: {await run_in_threadpool(sync.checkout_workspace, conf, w)}")
+            except (sync.RcloneError, OSError) as e:
+                results.append(f"{w.name}: {str(e)[:300]}")
         return RedirectResponse(f"{P}?{'ws=' + quote(want, safe='') + '&' if want else ''}refreshed={quote(', '.join(results), safe='')}", status_code=303)
 
     async def case_page(req: Request) -> Response:
@@ -382,11 +386,12 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
 
 
 def _drive_mark(d: dict) -> str:
-    """一覧の Drive 列: sync.drive_state の結果を印にする（title に rev / Drive 側の rev・checkin 元）。"""
+    """一覧の Drive 列: sync.drive_state の結果を印にする（title に rev / Drive 側の rev・ローカル case.json の checkin 元と時刻）。"""
     label, cls = DRIVE_MARKS.get(d.get("state", "unknown"), DRIVE_MARKS["unknown"])
     if d.get("state") == "local_changes" and d.get("drive_differs"):
         label += "（Drive も更新あり）"
-    title = f"rev: {d.get('rev') or '-'} / drive: {d.get('drive_rev') or '-'}" + (f" ({d['from']}, {d.get('checked_in_at') or ''})" if d.get("from") else "")
+    title = (f"rev: {d.get('rev') or '-'} / drive: {'(ambiguous)' if d.get('ambiguous') else d.get('drive_rev') or '-'}"
+             + (f" (checked in from {d['from']}, {d.get('checked_in_at') or ''})" if d.get("from") else ""))
     files = f"<br><small class='muted'>{_esc(', '.join(d['files']))}</small>" if d.get("files") else ""
     return f"<span class='drive {cls}' title='{_esc(title)}'>{_esc(label)}</span>{files}"
 

@@ -200,15 +200,6 @@ class CaseStore:
         os.utime(f, (mtime, mtime))
         self.write_rev_marker(case_id)
 
-    def manifest_entry(self, case_id: str) -> dict | None:
-        """当該案件の {rev, checked_in_at, from}（case.json の rev / last_checkin_at / checked_in_from）。case.json が無い、または rev 未付与なら None。"""
-        if not self._case_file(case_id).exists():
-            return None
-        case = self.load_case(case_id)
-        if not case.get("rev"):
-            return None
-        return {"rev": case["rev"], "checked_in_at": case.get("last_checkin_at"), "from": case.get("checked_in_from", "")}
-
     def rev_dir(self, case_id: str) -> Path:
         return self.case_dir(case_id) / REV_DIR
 
