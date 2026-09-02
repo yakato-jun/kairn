@@ -26,6 +26,12 @@
 - raw_move(ws[, case]):  生データ（rules.raw_data）を rclone move で Drive へ移動し、所在を case.json / worklog に記録
 - daily(ws):             bag2zst -> checkout(ws) -> checkin -> raw_move -> drive_index -> index rebuild（失敗しても次段へ。index/daily.log）
 
+作業領域（案件フォルダ内の git worktree 等）: ディレクトリ直下に .git ファイル（worktree）または .kairn-nosync（空ファイル）が
+あるディレクトリは配下ごと同期（checkout / checkin）・退避（raw_move）・bag2zst の対象外（WORKAREA_MARKERS / is_workarea）。
+rclone にはローカル側の転送ルートを走査して（workarea_dirs）`--filter '- /<dir>/**'` を _filters / _raw_filter_sets の先頭に付ける
+（--exclude-if-present は rclone 1.70 で同名ディレクトリがあると転送全体が失敗するため使わない）。通常の clone の .git ディレクトリは
+rules.exclude の既定 `.git/**` で除く（ソース本体は同期される）。
+
 生データ判定は既存の _filters（テキスト層の除外）と同じ規則: (拡張子が raw_data.extensions に含まれる OR
 サイズが min_size 超) AND 更新から min_age 超。rclone には include パスとサイズパスの 2 回に分けて渡す
 （1 回の呼び出しでは --include と --min-size が AND になるため）。
@@ -62,12 +68,57 @@ class RcloneError(RuntimeError):
 
 REV_KEEP_FILTER = f"+ {REV_DIR}/**"   # 版マーカー（<case>/.rev/<rev>）は rules.exclude / raw_data の除外より先に必ず含める
 
+# 作業領域の目印。ディレクトリ直下にこの名前の「ファイル」があれば、そのディレクトリは配下ごと同期・退避・索引の対象外
+# （git worktree の .git はファイル。.kairn-nosync は git 以外の作業領域用の空ファイル）。通常の clone（.git がディレクトリ）は
+# 当たらず、rules.exclude の既定 `.git/**` で .git だけが除かれる
+WORKAREA_MARKERS = (".git", ".kairn-nosync")
 
-def _filters(conf: Config) -> list[str]:
-    """テキスト層の転送（checkout / checkin）のフィルタ: 先頭に版マーカーの保護（REV_KEEP_FILTER）、続いて rules.exclude と
-    raw_data.extensions の除外を rclone の `--filter` 規則（順序が確定する）で渡し、min_size は --max-size。
-    最後の規則が除外なので、どの規則にも当たらないファイルは含まれる（rclone の既定）。"""
-    args: list[str] = ["--filter", REV_KEEP_FILTER]
+
+def is_workarea(d: Path) -> bool:
+    """d の直下に WORKAREA_MARKERS のいずれかがファイルとしてあるか（ディレクトリの .git は当たらない）。"""
+    return any((d / m).is_file() for m in WORKAREA_MARKERS)
+
+
+def workarea_dirs(root: Path, exclude: list[str] = ()) -> list[str]:
+    """root 配下の作業領域ディレクトリの相対パス（'/' 区切り。root 自身が作業領域なら ['']）。見つけた作業領域の配下・
+    シンボリックリンク・rules.exclude のディレクトリ（target/** 等）は辿らない。root が無ければ []。"""
+    if not root.is_dir():
+        return []
+    if is_workarea(root):
+        return [""]
+    out: list[str] = []
+    for r, dirs, _files in os.walk(root):
+        keep = []
+        for d in sorted(dirs):
+            p = Path(r) / d
+            if p.is_symlink() or excluded_dir(d, exclude):
+                continue
+            if is_workarea(p):
+                out.append(p.relative_to(root).as_posix())
+                continue
+            keep.append(d)
+        dirs[:] = keep
+    return sorted(out)
+
+
+def _workarea_filters(conf: Config, root: Path | None) -> list[str]:
+    """rclone に渡す作業領域の除外: 転送元／先のローカル root を走査し（workarea_dirs）、見つけた各ディレクトリを
+    `--filter '- /<rel>/**'`（root からの絶対パターン）で配下ごと除く。root が None なら []。
+    rclone の --exclude-if-present は使わない: rclone 1.70 では目印と同名のディレクトリ（通常の clone の .git/）が
+    ツリー内に 1 つでもあると「is a directory not a file」で転送全体が失敗する。"""
+    if root is None:
+        return []
+    out: list[str] = []
+    for rel in workarea_dirs(root, [str(x) for x in conf.rules.get("exclude", [])]):
+        out += ["--filter", f"- /{rel}/**" if rel else "- /**"]
+    return out
+
+
+def _filters(conf: Config, root: Path | None = None) -> list[str]:
+    """テキスト層の転送（checkout / checkin）のフィルタ: 先頭に作業領域の除外（_workarea_filters。root = ローカル側の転送ルート）、
+    版マーカーの保護（REV_KEEP_FILTER）、続いて rules.exclude と raw_data.extensions の除外を rclone の `--filter` 規則
+    （順序が確定する）で渡し、min_size は --max-size。最後の規則が除外なので、どの規則にも当たらないファイルは含まれる（rclone の既定）。"""
+    args: list[str] = _workarea_filters(conf, root) + ["--filter", REV_KEEP_FILTER]
     for pat in conf.rules.get("exclude", []):
         args += ["--filter", f"- {pat}"]
     raw = conf.rules.get("raw_data", {})
@@ -414,7 +465,7 @@ def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
         merged = True
         exclude = ["--filter", "- /events.jsonl"]
     r = _run(["rclone", "copy", src, str(dst), "--update", "--fast-list", "--transfers", "8", *STATS_ARGS, "-v",
-              *exclude, *_filters(conf), *_bw(conf), *_flags(conf)], dry, progress)
+              *exclude, *_filters(conf, dst), *_bw(conf), *_flags(conf)], dry, progress)
     if not dry:
         CaseStore(ws.cases_dir).write_rev_marker(case)
     msg = (r.stderr or r.stdout).strip()[-400:]
@@ -485,7 +536,7 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
                 stamped[cid] = before
     try:
         r = _run(["rclone", verb, str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
-                  *STATS_ARGS, "-v", *_filters(conf), *_bw(conf), *_flags(conf)], dry, progress)
+                  *STATS_ARGS, "-v", *_filters(conf, src), *_bw(conf), *_flags(conf)], dry, progress)
         if not case:
             sync_rev_markers(conf, ws, list(stamped), dry)
     except BaseException:
@@ -645,9 +696,13 @@ def excluded_file(name: str, exclude: list[str]) -> bool:
 
 
 def _walk_files(root: Path, exclude: list[str] = ()):
-    """root 配下の通常ファイル（シンボリックリンクのディレクトリ・ファイルは辿らない。rules.exclude のディレクトリ・ファイルも除く）。"""
+    """root 配下の通常ファイル（シンボリックリンクのディレクトリ・ファイルは辿らない。rules.exclude のディレクトリ・ファイル、
+    作業領域（is_workarea: 直下に .git ファイル / .kairn-nosync）の配下も除く）。"""
+    if is_workarea(root):
+        return
     for r, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(r, d)) and not excluded_dir(d, exclude)]
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(r, d)) and not excluded_dir(d, exclude)
+                   and not is_workarea(Path(r) / d)]
         for fn in files:
             p = Path(r) / fn
             if not p.is_symlink() and p.is_file() and not excluded_file(fn, exclude):
@@ -716,11 +771,12 @@ def bag2zst(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     return out
 
 
-def _raw_filter_sets(conf: Config, rr: dict) -> list[list[str]]:
-    """rclone に渡すフィルタ（OR を 2 回の呼び出しで表現）。両方に .rev/ の除外・rules.exclude と --min-age を付ける。
+def _raw_filter_sets(conf: Config, rr: dict, root: Path | None = None) -> list[list[str]]:
+    """rclone に渡すフィルタ（OR を 2 回の呼び出しで表現）。両方に作業領域の除外（_workarea_filters。root = 案件ディレクトリ）・
+    .rev/ の除外・rules.exclude と --min-age を付ける。
     --include と --exclude の併用は rclone が「順序不定」と警告する（実測で除外が効かない）ため、
     順序が確定する --filter 規則（'- <exclude>' → '+ *.{ext}' → '- **'）で組む。"""
-    excl: list[str] = ["--filter", f"- {REV_DIR}/**"]   # 版マーカーは生データとして移動しない
+    excl: list[str] = [*_workarea_filters(conf, root), "--filter", f"- {REV_DIR}/**"]   # 作業領域と版マーカーは生データとして移動しない
     for pat in conf.rules.get("exclude", []):
         excl += ["--filter", f"- {pat}"]
     age = ["--min-age", rr["min_age_str"]] if rr["min_age_str"] else []
@@ -804,9 +860,8 @@ def raw_move(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
     2 回目の move が失敗しても 1 回目で移動済みのファイルは記録してから error を付ける（記録漏れで所在不明にしない）。
     返り値: {dry, cases: {case: {planned: [...], moved: [...], bytes, drive, error?}}, files, bytes}"""
     rr = raw_rules(conf)
-    sets = _raw_filter_sets(conf, rr)
     out: dict = {"dry": dry, "cases": {}, "files": 0, "bytes": 0}
-    if not sets:
+    if not _raw_filter_sets(conf, rr):
         return out
     today = _dt.date.today().strftime("%Y%m%d")
     list_rel = f"index/raw-moved-{today}.txt"
@@ -815,6 +870,7 @@ def raw_move(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
         summary: dict = {"planned": [], "moved": [], "bytes": 0, "drive": drive}
         out["cases"][d.name] = summary
         try:
+            sets = _raw_filter_sets(conf, rr, d)
             planned: dict[str, int] = {}
             for filt in sets:
                 for rel, size in _lsf_local(d, filt, _flags(conf)).items():

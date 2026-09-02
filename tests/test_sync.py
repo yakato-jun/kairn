@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from kairn import config as cfg
 from kairn import sync
 from kairn.store import CaseStore
 
@@ -877,6 +878,124 @@ def test_filters_keep_rev_markers(conf):
     assert "--exclude" not in f and "--include" not in f
     for filt in sync._raw_filter_sets(conf, sync.raw_rules(conf)):
         assert filt[:2] == ["--filter", "- .rev/**"]
+
+
+# ---------- 作業領域（案件フォルダ内の git worktree 等）の除外 ----------
+
+def test_workarea_filters_come_first_and_before_rclone_flags(conf, fake):
+    """checkin / checkout / raw_move の rclone 呼び出しで、作業領域の `- /<dir>/**` が _filters の先頭（+ .rev/** より前）にあり、
+    rules.rclone_flags はその後ろ。ワークスペース全体の checkin は cases/ からの相対パス（/CASE-1/wt/**）。"""
+    conf.rules["rclone_flags"] = ["--transfers", "3"]
+    ws = conf.workspaces["acme"]
+    _workarea_case(ws.cases_dir)
+    sync.checkin(conf, ws, "CASE-1"); sync.checkout(conf, ws, "CASE-1"); sync.raw_move(conf, ws, "CASE-1")
+    moving = [c for c in fake.calls if c[1] in ("sync", "move") or (c[1] == "copy" and c[2].endswith("CASE-1")) or (c[1] == "lsf" and "-R" in c)]
+    assert [c[1] for c in moving] == ["sync", "copy", "lsf", "lsf"]   # checkin / checkout / raw_move の列挙 2 回（対象なし → move は呼ばない）
+    for c in moving:
+        i = c.index("--filter")
+        assert c[i:i + 4] == ["--filter", "- /scratch/**", "--filter", "- /wt/**"], c
+        assert c[i + 4:i + 6] in (["--filter", "+ .rev/**"], ["--filter", "- .rev/**"])
+        assert c.index("--transfers", i) > i and c[c.index("--transfers", i) + 1] == "3"
+    sync.checkin(conf, ws)
+    ws_copy = [c for c in fake.calls if c[1] == "copy" and c[2] == str(ws.cases_dir)][-1]
+    assert _excludes(ws_copy)[:2] == ["/CASE-1/scratch/**", "/CASE-1/wt/**"]
+
+
+def test_workarea_dirs(conf, tmp_path):
+    """root 配下の作業領域の相対パス。配下・シンボリックリンク・rules.exclude のディレクトリは辿らない。root 自身なら ['']。"""
+    case = _workarea_case(tmp_path / "cases")
+    _touch(case / "wt" / "nested" / ".kairn-nosync"); _touch(case / "target" / "x" / ".kairn-nosync"); _touch(case / "deep" / "a" / "b" / ".kairn-nosync")
+    (case / "link").symlink_to(case / "wt")
+    assert sync.workarea_dirs(case, conf.rules["exclude"]) == ["deep/a/b", "scratch", "wt"]
+    assert sync.workarea_dirs(case, []) == ["deep/a/b", "scratch", "target/x", "wt"]
+    assert sync.workarea_dirs(case / "wt") == [""] and sync.workarea_dirs(case / "none") == []
+    assert sync._filters(conf, case)[:6] == ["--filter", "- /deep/a/b/**", "--filter", "- /scratch/**", "--filter", "- /wt/**"]
+    assert sync._filters(conf, case / "wt")[:2] == ["--filter", "- /**"]
+    assert sync._filters(conf, None)[:2] == ["--filter", "+ .rev/**"]
+
+
+def test_is_workarea(tmp_path):
+    wt = tmp_path / "wt"; (wt / "src").mkdir(parents=True); (wt / ".git").write_text("gitdir: /elsewhere\n")
+    scratch = tmp_path / "scratch"; scratch.mkdir(); (scratch / ".kairn-nosync").touch()
+    clone = tmp_path / "clone"; (clone / ".git").mkdir(parents=True); (clone / ".git" / "HEAD").write_text("ref: x\n")
+    plain = tmp_path / "plain"; plain.mkdir()
+    assert sync.is_workarea(wt) and sync.is_workarea(scratch)
+    assert not sync.is_workarea(clone) and not sync.is_workarea(plain) and not sync.is_workarea(wt / "src")
+
+
+def _workarea_case(cases_dir: Path, cid: str = "CASE-1") -> Path:
+    """案件フォルダ: 直下 worklog.md、wt/（.git ファイル = worktree）、scratch/（.kairn-nosync）、clone/（.git ディレクトリ）。"""
+    st = CaseStore(cases_dir); st.create_case(cid, "workarea", "acme", actor="human")
+    case = cases_dir / cid
+    (case / "worklog.md").write_text("# t\n## Notes\nkeep me\n", encoding="utf-8")
+    _touch(case / "wt" / "src" / "a.py"); (case / "wt" / ".git").write_text("gitdir: /elsewhere/.git/worktrees/wt\n")
+    _touch(case / "scratch" / "b.txt"); (case / "scratch" / ".kairn-nosync").touch()
+    _touch(case / "clone" / "c.py"); _touch(case / "clone" / ".git" / "HEAD")
+    return case
+
+
+def _local_remote_conf(conf, tmp_path, monkeypatch) -> Path:
+    """実 rclone をローカル間で使う: RCLONE_CONFIG に local 型の remote my-drive だけを書き、cwd を tmp に向ける
+    （drive_path の my-drive:ws/acme/… が <tmp>/ws/acme/… になる。クラウドには接続しない）。Drive 側の cases/ を返す。"""
+    rc = tmp_path / "rclone-local.conf"; rc.write_text("[my-drive]\ntype = local\n")
+    monkeypatch.setenv("RCLONE_CONFIG", str(rc)); monkeypatch.chdir(tmp_path)
+    return tmp_path / "ws" / "acme" / "cases"
+
+
+def _files(root: Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and ".rev" not in p.parts)
+
+
+@pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
+def test_checkin_and_checkout_skip_workareas_with_real_rclone(conf, tmp_path, monkeypatch):
+    """checkin: Drive 側に worklog.md と clone/c.py（と case.json / events.jsonl）だけ。wt/・scratch/・clone/.git/ は無い。
+    ワークスペース全体の checkin（rclone copy）でも同じ。checkout は Drive 側に作業領域の写しがあっても（旧版の転送）ローカルの
+    作業領域には触れない。"""
+    drive_cases = _local_remote_conf(conf, tmp_path, monkeypatch)
+    ws = conf.workspaces["acme"]
+    case = _workarea_case(ws.cases_dir)
+    kept = ["case.json", "clone/c.py", "events.jsonl", "worklog.md"]
+    sync.checkin(conf, ws, "CASE-1")
+    assert _files(drive_cases / "CASE-1") == kept
+    (case / "worklog.md").write_text("# t\n## Notes\nkeep me v2\n", encoding="utf-8")
+    sync.checkin(conf, ws)
+    assert _files(drive_cases / "CASE-1") == kept and (drive_cases / "CASE-1" / "worklog.md").read_text().endswith("v2\n")
+    # Drive 側に作業領域の写しがあっても、ローカルの作業領域（wt/ scratch/）は上書きしない（clone/.git/ は rules.exclude）
+    for rel in ("wt/src/a.py", "wt/src/new.py", "scratch/b.txt", "clone/.git/HEAD", "clone/c.py"):
+        f = drive_cases / "CASE-1" / rel; f.parent.mkdir(parents=True, exist_ok=True); f.write_text("from drive\n")
+    (drive_cases / "CASE-1" / "wt" / ".git").write_text("gitdir: x\n"); (drive_cases / "CASE-1" / "scratch" / ".kairn-nosync").touch()
+    t = time.time() + 60
+    for f in (drive_cases / "CASE-1").rglob("*"):
+        if f.is_file():
+            os.utime(f, (t, t))
+    sync.checkout(conf, ws, "CASE-1")
+    assert (case / "wt" / "src" / "a.py").read_bytes() == b"x" * 10 and not (case / "wt" / "src" / "new.py").exists()
+    assert (case / "scratch" / "b.txt").read_bytes() == b"x" * 10 and not (case / "clone" / ".git" / "HEAD").read_text().startswith("from drive")
+    assert (case / "clone" / "c.py").read_text() == "from drive\n"
+
+
+@pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
+def test_raw_move_skips_workareas_with_real_rclone(conf, tmp_path, monkeypatch):
+    """作業領域内の大きなファイル・生データ拡張子は raw_move の対象にならない（案件直下の同じものは対象）。"""
+    _local_remote_conf(conf, tmp_path, monkeypatch)
+    ws = conf.workspaces["acme"]
+    case = _workarea_case(ws.cases_dir)
+    old = 20 * DAY
+    for rel in ("big.bin", "wt/big.bin", "scratch/big.bin", "clone/big.bin"):
+        f = case / rel; f.parent.mkdir(parents=True, exist_ok=True); f.write_bytes(b""); os.truncate(f, 50 * 1024 ** 2 + 1)
+        os.utime(f, (time.time() - old, time.time() - old))
+    _touch(case / "run.bag", 10, old); _touch(case / "wt" / "run.bag", 10, old); _touch(case / "scratch" / "run.bag", 10, old)
+    r = sync.raw_move(conf, ws, "CASE-1", dry=True)
+    assert r["cases"]["CASE-1"]["planned"] == ["big.bin", "clone/big.bin", "run.bag"], r
+
+
+def test_bag2zst_skips_workareas(conf, fake):
+    ws = conf.workspaces["acme"]
+    case = _workarea_case(ws.cases_dir)
+    _touch(case / "run.bag", 10, 3600); _touch(case / "wt" / "run.bag", 10, 3600); _touch(case / "scratch" / "x" / "run.bag", 10, 3600)
+    _touch(case / "clone" / "run.bag", 10, 3600)
+    r = sync.bag2zst(conf, ws, dry=True)
+    assert [x["src"] for x in r["done"]] == ["CASE-1/clone/run.bag", "CASE-1/run.bag"]
 
 
 # ---------- 移行（kairn drive-markers） ----------
