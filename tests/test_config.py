@@ -108,6 +108,35 @@ def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys, 
     assert (ws.index_dir / "kairn.sqlite").exists()
 
 
+def test_cli_drive_markers(conf, monkeypatch, capsys):
+    """kairn drive-markers <ws> [--dry-run] [--remove-manifest]: sync.drive_markers の結果を 1 案件 1 行で表示。dry は何も書かない旨を出す。エラーは exit 1。"""
+    from kairn import cli, sync
+    monkeypatch.setattr(cfg, "load", lambda path=None: conf)
+    monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
+    seen = []
+    result = {"marked": {"CASE-1": "r1"}, "mismatch": {"CASE-2": {"drive": "d2", "local": "l2"}}, "drive_no_rev": ["CASE-3"],
+              "local_absent": ["CASE-4"], "errors": {}, "manifest_removed": None}
+    monkeypatch.setattr(sync, "drive_markers", lambda c, ws, dry=False, remove_manifest=False: seen.append((ws.name, dry, remove_manifest))
+                        or {**result, "dry": dry, "manifest_removed": (False if dry else True) if remove_manifest else None})
+    monkeypatch.setattr("sys.argv", ["kairn", "drive-markers", "acme", "--dry-run"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert seen == [("acme", True, False)] and "[dry] CASE-1" in out and "marked r1" in out and "mismatch (drive d2, local l2): not touched" in out
+    assert "CASE-3" in out and "has no rev" in out and "CASE-4" in out and "not on this host" in out
+    assert "1 marked, 1 mismatch, 1 without rev on drive, 1 not local, 0 error(s) (dry-run: nothing written)" in out and "manifest" not in out
+    monkeypatch.setattr("sys.argv", ["kairn", "drive-markers", "acme", "--remove-manifest"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert seen[-1] == ("acme", False, True) and "dry" not in out and out.rstrip().endswith("0 error(s), manifest.json removed")
+    result["errors"] = {"CASE-9": "case.json is not an object"}
+    with pytest.raises(SystemExit) as ei:
+        cli.main()
+    assert ei.value.code == 1 and "ERROR CASE-9" in capsys.readouterr().err
+    monkeypatch.setattr(sync, "drive_markers", lambda c, ws, dry=False, remove_manifest=False: (_ for _ in ()).throw(sync.RcloneError("copy failed")))
+    with pytest.raises(SystemExit, match="copy failed"):
+        cli.main()
+
+
 def test_extract_timeout_setting(tmp_path):
     p = tmp_path / "config.yaml"
     p.write_text("drive: {remote: my-drive}\nworkspaces: {}\n", encoding="utf-8")

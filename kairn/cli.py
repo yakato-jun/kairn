@@ -13,6 +13,9 @@
   kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮（30 分以上更新のないもの）
   kairn raw-move <ws> [<case>] [--dry-run]  # 生データ（rules.raw_data）を Drive へ移動し、所在を案件に記録
   kairn daily <ws> [--dry-run]              # bag2zst -> checkout -> checkin -> raw-move -> drive-index -> index（systemd timer 用）
+  kairn drive-markers <ws> [--dry-run] [--remove-manifest]
+                                         # 既存 Drive データの移行: Drive の case.json の rev がローカルと一致する案件に版マーカー cases/<case>/.rev/<rev> を置く。
+                                         # --remove-manifest で旧方式の manifest.json を消す
   kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]
                                          # 子エージェントで case.json の下書きを作る（書き込まない。適用は UI）
   kairn rules show                       # 同期・退避規則（rules）の現在値
@@ -211,6 +214,32 @@ def cmd_sync(a):
             sys.exit(1)
 
 
+def cmd_drive_markers(a):
+    conf = cfg.load(); ws = _ws(conf, a.ws)
+    from . import sync
+    try:
+        r = sync.drive_markers(conf, ws, dry=a.dry_run, remove_manifest=a.remove_manifest)
+    except sync.RcloneError as e:
+        raise SystemExit(f"kairn: {e}") from None
+    tag = "[dry] " if a.dry_run else ""
+    for cid, rev in r["marked"].items():
+        print(f"{tag}{cid:<40} marked {rev}")
+    for cid, d in r["mismatch"].items():
+        print(f"{tag}{cid:<40} mismatch (drive {d['drive']}, local {d['local'] or '-'}): not touched")
+    for cid in r["drive_no_rev"]:
+        print(f"{tag}{cid:<40} drive case.json has no rev: not touched")
+    for cid in r["local_absent"]:
+        print(f"{tag}{cid:<40} not on this host: not touched")
+    for cid, err in r["errors"].items():
+        print(f"ERROR {cid}: {err}", file=sys.stderr)
+    print(f"{tag}markers: {len(r['marked'])} marked, {len(r['mismatch'])} mismatch, {len(r['drive_no_rev'])} without rev on drive, "
+          f"{len(r['local_absent'])} not local, {len(r['errors'])} error(s)"
+          + ("" if r["manifest_removed"] is None else (", manifest.json removed" if r["manifest_removed"] else ", manifest.json not removed"))
+          + (" (dry-run: nothing written)" if a.dry_run else ""))
+    if r["errors"]:
+        sys.exit(1)
+
+
 def cmd_extract(a):
     conf = cfg.load(); ws = _ws(conf, a.ws)
     import json
@@ -365,6 +394,7 @@ def main() -> None:
     s = sub.add_parser("index", help="rebuild the local search index (changed files only; --full for everything)"); s.add_argument("ws", nargs="?"); s.add_argument("--full", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("drive-index", help="list all files on the drive into index/drive-index.txt"); s.add_argument("ws", nargs="?"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("daily", help="bag2zst -> checkout -> checkin -> raw-move -> drive-index -> index"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
+    s = sub.add_parser("drive-markers", help="put the rev marker cases/<case>/.rev/<rev> on the drive for cases whose drive case.json rev matches the local one (migration; --remove-manifest deletes the old manifest.json)"); s.add_argument("ws", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.add_argument("--remove-manifest", action="store_true"); s.set_defaults(f=cmd_drive_markers)
     s = sub.add_parser("extract", help="draft case.json with an isolated child agent (read-only; apply in the UI)"); s.add_argument("case"); s.add_argument("--ws"); s.add_argument("--agent", choices=["claude", "codex", "opencode", "antigravity"]); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_extract)
     s = sub.add_parser("rules", help="show / edit the sync rules (rules: in the config; never edit the file by hand)"); ss = s.add_subparsers(dest="sub", required=True)
     ss.add_parser("show")

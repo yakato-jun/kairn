@@ -879,13 +879,49 @@ def test_filters_keep_rev_markers(conf):
         assert filt[:2] == ["--filter", "- .rev/**"]
 
 
+# ---------- 移行（kairn drive-markers） ----------
+
+def test_drive_markers_marks_only_matching_cases(conf, fake):
+    """Drive の cases/*/case.json を copy --include 1 回で取り寄せ、rev がローカルと一致する案件だけ .rev/<rev> を sync 1 回で置く。
+    不一致・Drive 側 rev 無し・ローカル無し・読めないものは報告して触らない。--remove-manifest で manifest.json を deletefile。dry は何も書かない。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    for cid in ("CASE-1", "CASE-2", "CASE-5"):
+        st.create_case(cid, cid, "acme", actor="human"); st.mark_checkin(cid)
+    c1, c2 = st.load_case("CASE-1"), st.load_case("CASE-2")
+    st.create_case("CASE-6", "never checked in", "acme", actor="human")
+    fake.remote_cases = {"CASE-1": c1, "CASE-2": {**c2, "rev": "from-another-host"}, "CASE-3": {"id": "CASE-3", "title": "no rev"},
+                         "CASE-4": {"id": "CASE-4", "rev": "r4"}, "CASE-6": {"id": "CASE-6", "rev": "r6"}, "CASE-7": "not json"}
+    fake.remote_markers = {"CASE-1": ["stale"]}
+    r = sync.drive_markers(conf, ws, dry=True)
+    assert r == {"dry": True, "marked": {"CASE-1": c1["rev"]}, "mismatch": {"CASE-2": {"drive": "from-another-host", "local": c2["rev"]},
+                 "CASE-6": {"drive": "r6", "local": None}}, "drive_no_rev": ["CASE-3"], "local_absent": ["CASE-4"],
+                 "errors": {"CASE-7": "Expecting value: line 1 column 1 (char 0)"}, "manifest_removed": None}
+    assert [c[1] for c in fake.calls] == ["copy"] and fake.remote_markers == {"CASE-1": ["stale"]} and fake.deleted == []
+    assert fake.calls[0][2:6] == ["my-drive:ws/acme", fake.calls[0][3], "--include", "/cases/*/case.json"] and fake.calls[0][3].startswith("/")
+    fake.calls.clear()
+    r = sync.drive_markers(conf, ws, remove_manifest=True)
+    assert r["dry"] is False and r["marked"] == {"CASE-1": c1["rev"]} and r["manifest_removed"] is True
+    assert [c[1] for c in fake.calls] == ["copy", "sync", "deletefile"]
+    s_ = fake.calls[1]
+    assert s_[3] == "my-drive:ws/acme/cases" and s_[2].endswith("/stage/cases") and s_[4:] == ["--filter", "+ /CASE-1/.rev/**", "--filter", "- **"]
+    assert fake.remote_markers == {"CASE-1": [c1["rev"]]} and fake.deleted == ["my-drive:ws/acme/manifest.json"]   # 古いマーカーは消え、他案件は触らない
+    assert not Path(s_[2]).exists()                                                                                   # 一時ディレクトリは消えている
+    # copy の失敗は RcloneError。remove_manifest 無しなら deletefile しない
+    fake.calls.clear()
+    assert sync.drive_markers(conf, ws)["manifest_removed"] is None and [c[1] for c in fake.calls] == ["copy", "sync"]
+    fake.fail = {"copy"}
+    with pytest.raises(sync.RcloneError):
+        sync.drive_markers(conf, ws)
+
+
 # ---------- 実 rclone（ローカル間。クラウド接続なし） ----------
 
 @pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
 def test_rev_markers_round_trip_with_real_rclone(conf, tmp_path, monkeypatch):
     """実 rclone でローカルのディレクトリを Drive に見立てる: checkin(case) で Drive の古いマーカーが消えて新しいものだけ残り、
     drive_rev / drive_revs がそれを読む。checkin(ws)（copy + .rev/ 限定 sync）でも同じ。checkout(case) は取り寄せたマーカーを
-    case.json の rev に合わせて 1 個にする。"""
+    case.json の rev に合わせて 1 個にする。drive_markers も一時ディレクトリから sync で置く。"""
     monkeypatch.setenv("RCLONE_CONFIG", str(tmp_path / "rclone-empty.conf"))
     drive = tmp_path / "drive"
     monkeypatch.setattr(conf, "drive_path", lambda ws_name, *parts: str(drive / ws_name / "/".join(parts)))
@@ -923,6 +959,13 @@ def test_rev_markers_round_trip_with_real_rclone(conf, tmp_path, monkeypatch):
     msg = sync.checkout(conf, ws)                                                                            # CASE-9 はローカルに無い → 取り寄せ。CASE-2 は取り寄せた分が次の checkin までローカル変更
     assert msg.startswith("drive: 3 case(s); fetched 1 (CASE-9), up to date 1, skipped (local changes newer than last checkin) 1 (CASE-2)")
     assert (ws.cases_dir / "CASE-9" / ".rev" / "r9").exists() and not (ws.cases_dir / "CASE-9" / "case.json").exists()   # case.json の無いディレクトリは触らない（取り寄せたまま）
+    # drive_markers: 一致する案件（CASE-1）だけ。Drive の古いマーカーがあっても sync で 1 個になる
+    (drive / "acme" / "cases" / "CASE-1" / ".rev" / "extra").touch()
+    (drive / "acme" / "manifest.json").write_text("{}", encoding="utf-8")
+    r = sync.drive_markers(conf, ws, remove_manifest=True)
+    assert r["marked"] == {"CASE-1": rev1, "CASE-2": "from-another-host"} and r["manifest_removed"] is True and r["errors"] == {}
+    assert sorted(p.name for p in (drive / "acme" / "cases" / "CASE-1" / ".rev").iterdir()) == [rev1] and not (drive / "acme" / "manifest.json").exists()
+    assert sync.drive_revs(conf, ws) == {"CASE-1": rev1, "CASE-2": "from-another-host", "CASE-9": "r9"}
 
 
 # ---------- rules.rclone_flags: rclone を呼ぶすべての箇所で共通引数の後ろに付く ----------
@@ -938,7 +981,7 @@ def _tail_flags(cmd: list[str]) -> list[str]:
 
 def test_rclone_flags_appended_to_every_rclone_command(conf, fake, monkeypatch):
     """checkout（copyto + copy）/ checkin（copyto + sync|copy + .rev/ の sync）/ raw_move（lsf + move）/ drive_index（lsf）/
-    版マーカー（drive_rev・drive_revs の lsf）/ events の copyto / ws（lsd・mkdir・lsf）の
+    版マーカー（drive_rev・drive_revs の lsf、drive_markers の copy・sync・deletefile）/ events の copyto / ws（lsd・mkdir・lsf）の
     全 rclone 呼び出しの末尾に rules.rclone_flags が付く。既定（未設定）では何も付かない。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
@@ -953,9 +996,10 @@ def test_rclone_flags_appended_to_every_rclone_command(conf, fake, monkeypatch):
     sync.drive_index(conf, ws)
     sync.drive_rev(conf, ws, "CASE-123"); sync.drive_revs(conf, ws); sync.checkout(conf, ws)
     sync.fetch_remote_events(conf, ws, "CASE-123")
+    sync.drive_markers(conf, ws, remove_manifest=True)
     sync.ws_exists_on_drive(conf, "acme"); sync.create_ws_on_drive(conf, "acme"); sync.list_ws_on_drive(conf)
     subs = {c[1] for c in fake.calls}
-    assert {"copyto", "copy", "sync", "lsf", "move", "lsd", "mkdir"} <= subs and "cat" not in subs and "rcat" not in subs
+    assert {"copyto", "copy", "sync", "lsf", "move", "lsd", "mkdir", "deletefile"} <= subs and "cat" not in subs and "rcat" not in subs
     for c in fake.calls:
         assert c[0] == "rclone" and _tail_flags(c) == FLAGS, c
     # --dry-run は flags の後ろ（_run が最後に足す）

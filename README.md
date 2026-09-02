@@ -95,8 +95,8 @@ kairn index <ws> [--full]                 # 索引（SQLite FTS5）の差分再�
 kairn drive-index <ws>                    # Drive 上の全ファイル一覧を index/drive-index.txt に
 kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮
 kairn raw-move <ws> [<case>] [--dry-run]  # 生データを Drive へ移動し所在を記録
-kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move → drive-index → index
-kairn manifest rebuild <ws> [--dry-run]   # 既存 Drive データの移行: Drive の cases/*/case.json に rev を付与し manifest.json を作り直す（新方式導入時に一度）
+kairn daily <ws> [--dry-run]              # bag2zst → checkout → checkin → raw-move → drive-index → index
+kairn drive-markers <ws> [--dry-run] [--remove-manifest]   # 既存 Drive データの移行: Drive の case.json の rev がローカルと一致する案件に版マーカー cases/<case>/.rev/<rev> を置く（--remove-manifest で旧方式の manifest.json を消す）
 kairn extract <case> [--ws <ws>] [--agent …] [--json]   # 子エージェントで case.json の下書き（書き込まない）
 kairn rules show                          # 同期・退避規則（rules）の現在値
 kairn rules set <key> <value>             # raw_data.min_size | raw_data.min_age | bag_to_zst | bwlimit | rclone_flags（値を検証し、不正なら拒否）

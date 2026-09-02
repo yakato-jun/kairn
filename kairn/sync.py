@@ -18,7 +18,7 @@
                          --include '/cases/*/.rev/*' 1 プロセス）で名前だけを読む。マーカーが 2 個以上ある案件は「不定」（rev 不一致と同じ＝
                          取り寄せ対象）。open_case（kairn/server.py）は drive_rev で当該案件の rev を見て、ローカルの case.json.rev と
                          同じなら取り寄せを省略する。直近に得た版は index/drive_revs.cache.json に置き、list_cases / UI 一覧の印
-                         （drive_state）に使う
+                         （drive_state）に使う。既存の Drive 案件にマーカーを付けるのは kairn drive-markers <ws>（drive_markers）
 - checkin_job(ws, case, agent): MCP の checkin ジョブ本体（checkin → checkin event）。kairn/jobs.py のスレッドで走る
 - merge_events(local_path, remote_lines): 行の文字列一致で重複除去した和集合を `t` で安定ソートし、内容が変わる時だけ書き戻す
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
@@ -31,7 +31,7 @@
 （1 回の呼び出しでは --include と --min-size が AND になるため）。
 
 rules.rclone_flags（既定は空。`kairn rules set rclone_flags "--transfers 8 …"`）は rclone を呼ぶすべての箇所（checkout / checkin /
-raw_move / drive_index / 版マーカーの lsf・sync / events の copyto / ws の lsd・mkdir・lsf）で
+raw_move / drive_index / 版マーカーの lsf・sync / drive-markers の copy・sync・deletefile / events の copyto / ws の lsd・mkdir・lsf）で
 共通引数の後ろに付ける（_flags）。
 
 checkout / checkin は progress コールバック（1 行ずつ）を受け取れる。渡すと _run は subprocess.Popen で rclone の出力を
@@ -329,6 +329,65 @@ def sync_rev_markers(conf: Config, ws: Workspace, case_ids: list[str], dry: bool
     if not case_ids:
         return
     _run(["rclone", "sync", str(ws.cases_dir), conf.drive_path(ws.name, "cases"), *_rev_sync_filters(sorted(case_ids)), *_bw(conf), *_flags(conf)], dry)
+
+
+MANIFEST_NAME = "manifest.json"   # 旧方式の集計ファイル（もう読み書きしない。kairn drive-markers --remove-manifest が消すだけ）
+
+
+def drive_markers(conf: Config, ws: Workspace, dry: bool = False, remove_manifest: bool = False) -> dict:
+    """既存の Drive 案件に版マーカーを付ける移行（kairn drive-markers <ws>）:
+    1. Drive の cases/*/case.json を rclone copy --include（1 プロセス）で一時ディレクトリへ取り寄せる
+    2. 各案件の Drive 側 rev をローカル case.json の rev と比べ、一致した案件だけ一時ディレクトリに cases/<case>/.rev/<rev> を作る
+    3. それらを rclone sync（1 プロセス。当該案件の .rev/ だけに限定したフィルタ）で Drive へ置く（古いマーカーがあれば消える）
+    不一致（mismatch）・Drive 側 rev 無し（drive_no_rev）・ローカル無し（local_absent）・読めない（errors）は報告するだけで触らない。
+    remove_manifest なら旧方式の <ws>/manifest.json を rclone deletefile で消す（無ければ無視）。dry では 1 だけ行い何も書かない。
+    返り値: {dry, marked: {case: rev}, mismatch: {case: {drive, local}}, drive_no_rev: [case], local_absent: [case], errors: {case: reason},
+             manifest_removed: bool | None}"""
+    st = CaseStore(ws.cases_dir)
+    out: dict = {"dry": dry, "marked": {}, "mismatch": {}, "drive_no_rev": [], "local_absent": [], "errors": {}, "manifest_removed": None}
+    with tempfile.TemporaryDirectory(prefix="kairn-markers-") as td:
+        tmp = Path(td)
+        r = subprocess.run(["rclone", "copy", conf.drive_path(ws.name), str(tmp / "drive"), "--include", "/cases/*/case.json", *_flags(conf)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RcloneError((r.stderr or r.stdout).strip()[-800:])
+        cases_dir = tmp / "drive" / "cases"
+        stage = tmp / "stage" / "cases"
+        for f in sorted(cases_dir.glob("*/case.json")) if cases_dir.is_dir() else []:
+            cid = f.parent.name
+            try:
+                validate_case_id(cid)
+                remote = json.loads(f.read_text(encoding="utf-8"))
+                if not isinstance(remote, dict):
+                    raise ValueError("case.json is not an object")
+            except ValueError as e:
+                out["errors"][cid] = str(e)
+                continue
+            drive = remote.get("rev")
+            if not drive:
+                out["drive_no_rev"].append(cid)
+                continue
+            if not (ws.cases_dir / cid / "case.json").exists():
+                out["local_absent"].append(cid)
+                continue
+            local = st.load_case(cid).get("rev")
+            if local != drive:
+                out["mismatch"][cid] = {"drive": drive, "local": local}
+                continue
+            out["marked"][cid] = drive
+            if not dry:
+                (stage / cid / REV_DIR).mkdir(parents=True, exist_ok=True)
+                (stage / cid / REV_DIR / drive).touch()
+        if not dry and out["marked"]:
+            _run(["rclone", "sync", str(stage), conf.drive_path(ws.name, "cases"), *_rev_sync_filters(sorted(out["marked"])), *_flags(conf)])
+    if remove_manifest:
+        out["manifest_removed"] = False
+        if not dry:
+            r = subprocess.run(["rclone", "deletefile", conf.drive_path(ws.name, MANIFEST_NAME), *_flags(conf)], capture_output=True, text=True)
+            out["manifest_removed"] = r.returncode == 0
+            if r.returncode not in (0, 3, 4):
+                raise RcloneError(f"rclone deletefile {conf.drive_path(ws.name, MANIFEST_NAME)} failed: {(r.stderr or r.stdout).strip()[-400:]}")
+    return out
 
 
 def _local_case_dirs(ws: Workspace) -> list[str]:
