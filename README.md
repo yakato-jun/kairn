@@ -78,6 +78,7 @@ kairn extract <case> [--ws <ws>] [--agent …] [--json]   # 子エージェン�
 kairn serve [--host 127.0.0.1] [--port 8765]            # MCP（/mcp）＋ UI（/ui）
 kairn install-skill [--home <dir>]        # skills/kairn を ~/.agents/skills と ~/.claude/skills からリンク
 kairn install-service [--yes] [--print]   # systemd user unit（常駐 kairn-serve.service ＋ 日次 kairn-daily@<ws>.timer）を生成して登録（対話式）
+kairn ensure [--timeout 15]               # /mcp が応答しなければ kairn serve を切り離して起動し応答まで待つ（service が止まっていた時の保険）
 ```
 
 ## 各エージェントへの適用

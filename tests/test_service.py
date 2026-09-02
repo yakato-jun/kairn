@@ -1,7 +1,8 @@
-"""kairn install-service。unit は一時ディレクトリ（XDG_CONFIG_HOME / XDG_STATE_HOME）に書き、
-systemctl / loginctl / はすべてモック。実 HOME・実サービスには触れない。"""
+"""kairn install-service / kairn ensure。unit は一時ディレクトリ（XDG_CONFIG_HOME / XDG_STATE_HOME）に書き、
+systemctl / loginctl / Popen / HTTP 応答はすべてモック。実 HOME・実サービスには触れない。"""
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,66 @@ def test_interview_defaults_without_workspaces(conf, monkeypatch):
     conf.workspaces = {}
     opts = service.interview(conf, yes=True)
     assert opts.workspaces == [] and opts.host == "127.0.0.1" and opts.port == 8765 and opts.enable_now and not opts.linger
+
+
+# ---- ensure ------------------------------------------------------------------------------------
+
+class _Proc:
+    pid = 4242
+
+    def __init__(self, exit_after: int | None = None):
+        self.polls = 0; self.exit_after = exit_after
+
+    def poll(self):
+        self.polls += 1
+        return 0 if self.exit_after is not None and self.polls >= self.exit_after else None
+
+
+def test_ensure_does_nothing_when_alive(env, capsys):
+    started = []
+    rc = service.ensure(env["conf"], alive=lambda h, p: True, popen=lambda *a, **k: started.append(a) or _Proc(), cmd=[KAIRN])
+    assert rc == 0 and started == [] and "is running" in capsys.readouterr().out
+
+
+def test_ensure_starts_detached_and_waits(env, capsys):
+    conf = env["conf"]; conf.serve_host, conf.serve_port = "127.0.0.1", 9100
+    probes = iter([False, False, False, True])
+    started = []
+
+    def fake_popen(argv, **kw):
+        started.append((argv, kw)); return _Proc()
+    rc = service.ensure(conf, alive=lambda h, p: next(probes), popen=fake_popen, sleep=lambda s: None, cmd=[KAIRN])
+    out = capsys.readouterr().out
+    assert rc == 0 and "is up: http://127.0.0.1:9100/mcp" in out
+    (argv, kw), = started
+    assert argv == [KAIRN, "serve", "--host", "127.0.0.1", "--port", "9100"]
+    assert kw["start_new_session"] is True and kw["stdin"] is subprocess.DEVNULL and kw["stderr"] is subprocess.STDOUT
+    log = env["state"] / "serve.log"
+    assert kw["stdout"].name == str(log) and log.exists() and "kairn ensure" in log.read_text()
+
+
+def test_ensure_times_out_and_reports_early_exit(env, capsys):
+    rc = service.ensure(env["conf"], alive=lambda h, p: False, popen=lambda *a, **k: _Proc(), sleep=lambda s: None, timeout=0.05, cmd=[KAIRN])
+    assert rc == 1 and "no answer" in capsys.readouterr().out
+    rc = service.ensure(env["conf"], alive=lambda h, p: False, popen=lambda *a, **k: _Proc(exit_after=2), sleep=lambda s: None, timeout=5, cmd=[KAIRN])
+    assert rc == 1 and "exited with 0" in capsys.readouterr().out
+
+
+def test_ensure_cli(env, monkeypatch, capsys):
+    monkeypatch.setattr(service, "is_alive", lambda h, p, timeout=1.0: True)
+    assert _main(monkeypatch, "ensure") == 0 and "is running" in capsys.readouterr().out
+
+
+def test_is_alive_treats_http_error_as_alive(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def raise_http(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 406, "Not Acceptable", {}, None)
+    monkeypatch.setattr(urllib.request, "urlopen", raise_http)
+    assert service.is_alive("127.0.0.1", 1)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=0: (_ for _ in ()).throw(urllib.error.URLError("refused")))
+    assert not service.is_alive("127.0.0.1", 1)
 
 
 def test_config_serve_section_roundtrip(tmp_path: Path):

@@ -9,6 +9,9 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 ツールの引数・返り値の詳細は kairn リポジトリの `docs/mcp-tools.md`。
 
 ## 案件を開く
+0. 最初に 1 回、シェルで `kairn ensure` を実行してからツールを呼ぶ（MCP `/mcp` が応答しなければ `kairn serve` を
+   切り離して起動し、応答するまで待つ。service が止まっていた時の保険。動いていれば何もしない。終了コード 0 以外なら
+   ログ `~/.local/state/kairn/serve.log` の内容を人に伝える）。
 1. 案件名が分かっていれば `open_case(case)`。分からなければ `find_cases(query)`（理由付きの候補）か
    `list_cases()`（`status`: open|closed|suspended|all、`query` で id/title 絞り込み）で候補を出し、**人に選んでもらう**。
 2. `open_case` の返り値は **`human_feedback`（人からの差し戻し sendback・コメント comment）を最初に読む**。

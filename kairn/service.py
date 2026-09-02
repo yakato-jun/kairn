@@ -1,4 +1,4 @@
-"""常駐の登録（kairn install-service）。
+"""常駐の登録（kairn install-service）と保険起動（kairn ensure）。
 
 install-service: systemd user unit をコード内テンプレートから生成し、~/.config/systemd/user/ に書いて登録する。
   kairn-serve.service         MCP + UI の常駐（kairn serve --host <h> --port <p>）。Restart=on-failure
@@ -6,6 +6,9 @@ install-service: systemd user unit をコード内テンプレートから生成
   kairn-daily@<ws>.timer      ワークスペースごとの timer（Persistent=true、RandomizedDelaySec=10m）
   ExecStart には install-service を実行した kairn 自身の実行パス（sys.argv[0] を resolve）を埋める
   （uv tool install なら ~/.local/bin/kairn、venv 実行なら <repo>/.venv/bin/kairn）。
+
+ensure: 設定（serve.host / serve.port）の /mcp に応答が無ければ `kairn serve` を切り離して起動し（start_new_session、
+  出力は ~/.local/state/kairn/serve.log）、応答が出るまで待つ。service が止まっていた時の保険。
 
 unit の生成先（XDG_CONFIG_HOME）・ログ先（XDG_STATE_HOME）・外部コマンド（run_cmd）・対話（input）は
 関数単位で差し替えられるようにしてある（tests/test_service.py はすべて一時ディレクトリとモックで動かす）。
@@ -18,6 +21,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -318,3 +324,49 @@ def _run_report(argv: list[str], out) -> int:
     if rc != 0:
         out(f"kairn: {argv[0]} が失敗しました (exit {rc})")
     return rc
+
+
+# ---- ensure -------------------------------------------------------------------------------------
+
+def is_alive(host: str, port: int, timeout: float = 1.0) -> bool:
+    """/mcp が HTTP で応答するか。ステータスは問わない（MCP の GET は 4xx を返すが、それでも動いている）。"""
+    url = f"http://{host}:{port}/mcp"
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=timeout).close()
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def ensure(conf: cfg.Config, *, timeout: float = 15.0, cmd: list[str] | None = None, log_path: Path | None = None,
+           popen=subprocess.Popen, alive=None, sleep=time.sleep, out=print) -> int:
+    """設定の serve.host / serve.port で /mcp が応答しなければ `kairn serve` を切り離して起動し、応答まで最大 timeout 秒待つ。
+    既に動いていれば何もしない。戻り値は終了コード（0 = 応答あり、1 = 起動できない / タイムアウト）。"""
+    alive = alive or is_alive
+    host, port = conf.serve_host, conf.serve_port
+    if alive(host, port):
+        out(f"kairn serve is running: http://{host}:{port}/mcp")
+        return 0
+    log_path = log_path or (state_dir() / "serve.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    argv = [*(cmd or self_command()), "serve", "--host", host, "--port", str(port)]
+    with open(log_path, "ab") as log:
+        log.write(f"\n--- kairn ensure {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(argv)}\n".encode())
+        log.flush()
+        proc = popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    out(f"started: {' '.join(argv)} (pid {proc.pid}, log {log_path})")
+    deadline = time.monotonic() + timeout
+    while True:
+        if alive(host, port):
+            out(f"kairn serve is up: http://{host}:{port}/mcp")
+            return 0
+        rc = proc.poll()
+        if rc is not None:
+            out(f"kairn: serve exited with {rc} before answering. see {log_path}")
+            return 1
+        if time.monotonic() >= deadline:
+            out(f"kairn: no answer from http://{host}:{port}/mcp after {timeout:g}s (pid {proc.pid} still running). see {log_path}")
+            return 1
+        sleep(0.25)
