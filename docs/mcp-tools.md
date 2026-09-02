@@ -1,6 +1,6 @@
 # MCP ツール（説明文は短く）
 
-実装: `kairn/server.py`（mcp 2.x `mcp.server.mcpserver.MCPServer`、streamable HTTP を `/mcp` に提供。UI と同一プロセス）。ツールは 12 個。
+実装: `kairn/server.py`（mcp 2.x `mcp.server.mcpserver.MCPServer`、streamable HTTP を `/mcp` に提供。UI と同一プロセス）。ツールは 13 個。
 判断の規則の実体は `kairn/store.py`（証拠必須・superseded 自動化）。server は引数を検証して委譲する。
 rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（`kairn/jobs.py`）として走らせ、`checkin` は待たずに `job_id` を返す（後述）。
 `open_case` は先に Drive の案件フォルダの版マーカー（`cases/<case>/.rev/<rev>`）で `rev` を比べ、同じなら取り寄せを省略する（「open_case の drive」）。
@@ -15,7 +15,7 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
   `index/access.log` に `<時刻>\t<案件>\t<agent>\tcross_from=<ws>/<case>\ttool=<tool>` を 1 行、(b) from 側の案件の `events.jsonl` に
   `{actor: ai, agent, action: xref, workspace: <対象 ws>, case: <対象案件>, tool}` を 1 行（同じ対象は同じ日に 1 回。ツールの違いは数えない）追記する。
   `search` / `find_cases` は他 ws の**ヒット案件ごと**に記録する。`from_case` が無ければ記録しない（跨いでも記録が残らないので、案件の文脈があるときは必ず渡す。
-  SKILL.md）。他 ws から得た内容の扱い（一般化して書く・出典は `related` に `<ws>/<case>`）は skills/kairn/SKILL.md で規定する。
+  SKILL.md）。他 ws から得た内容の扱い（一般化して書く・出典は `link_case` で `related` に `<ws>/<case>`）は skills/kairn/SKILL.md で規定する。
 - **actor / agent**: 書き込み系ツールは `actor="ai"` を自動付与。`agent` 引数（例 `claude-code`）を渡せばイベントに記録、
   省略時は `create_server(conf, default_agent)` の既定値（`serve` では `unknown`）。
 - **失敗の返し方**: 規則違反・未知の案件／タスク・rclone 失敗は `ToolError` → `CallToolResult(is_error=True)` で理由の文章を返す
@@ -53,6 +53,7 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
 | `update_task(case, task, status, evidence[]?, note?, workspace?, agent?)` | `status`: open\|doing\|blocked\|done\|dropped | 更新後の task | `done` は `evidence` 必須。各要素は `{type: commit\|pr\|file\|test\|url, ...}` で型ごとの必須キー（commit/pr→`id`、file→`path`、test→`cmd`、url→`url`）を検証、`note` 型（必須キー `text`）は human のみ（docs/data-model.md）。存在しない task・計画未作成は拒否。event（started/done/dropped/progress）を追記 |
 | `log_event(case, action, note, evidence[]?, workspace?, agent?)` | `action`: progress\|decision\|comment | 追記した event | actor/agent 自動付与。他の action は拒否。`evidence` は update_task と同じ検証 |
 | `set_case_status(case, status, instruction, workspace?, agent?)` | `status`: closed\|suspended\|open。`instruction`: 人がそう指示した発言そのもの（必須。空・空白のみは拒否） | `{case, status, previous_status, changed, event, open_tasks}` | **案件を閉じる・保留する・再開するのは人の判断。人が明示した時だけ、その発言を `instruction` に入れて呼ぶ。AI の判断で呼ばない**（docs/decisions.md 19）。`set_case_status(actor="ai", agent, note=instruction)` を呼び、event `{action: status, from, to, note}` を追記。同じステータスへの変更は `changed: false` で何も書かない（`event: null`）。open タスクが残ったまま `closed` にしても拒否せず、`open_tasks`（open/doing/blocked の件数）で知らせる（閉じるかは人の判断）。不正な `status`・未知の案件／ワークスペースは `ToolError` |
+| `link_case(case, related, note="", workspace?, agent?)` | `related`: `"<case>"`（同 ws）\| `"<ws>/<case>"`（他 ws）の文字列またはそのリスト | `{case, related, added, changed}`（`related` は追記後の `case.json.related` 全体） | `case.json.related` に**重複なく追記**する（既存は保持、順序維持。`related` 内の重複も 1 回）。追記があれば event `{actor: ai, agent, action: related, added: [...], note}` を 1 行。すべて既に含まれていれば `changed: false` で case.json も events も書かない。他 ws の案件を足したときは、この案件の events に `xref`（`tool: link_case`。同じ対象は同じ日に 1 回、`CaseStore.append_xref`）も記録する（access.log には書かない: 閲覧ではない）。形は `validate_related`（不正なら `ToolError`）、実在も検証する（同 ws は自 ws の `cases/`、他 ws は登録済み ws の `cases/`。ローカルに無い案件・未知の ws は `ToolError`。1 つでも不正なら何も書かない）。**削除のツールは無い**（related から外すのは人の操作: UI の関連欄の削除ボタン）。他 ws の案件から得た内容を成果物に一般化して書いたときの出典はこれで残す（SKILL.md） |
 | `search(query, cases[]?, workspace?, limit=10, scope="auto", from_case?, agent?)` | `scope`: auto\|workspace\|all | `{workspace: <自 ws \| null>, scope, searched: [<ws>, …], results: [{case, file, heading, snippet, score, workspace, cross_workspace}]}` | worklog 等の `## ` 節単位の全文検索。語は AND。3 文字未満の語は本文・案件 ID の部分一致（LIKE）で絞る。**自 ws** は `workspace=` → `from_case` の ws → 登録が 1 つならそれ（決まらなければ `scope=all` 以外は `ToolError`）。`scope=auto`（既定）: 自 ws を先に検索し、**ヒットが 0 件なら残りの全 ws** を検索。`workspace`: 自 ws のみ。`all`: 全 ws（自 ws が決まらなければ全 ws を対等に。`workspace: null`）。結果は `score` の降順に `limit` 件。他 ws のヒットは `cross_workspace: true`。`searched` は実際に検索した ws の順。`from_case` があれば他 ws のヒット案件ごとに跨ぎ参照を記録（「共通」）。不正な `scope` は `ToolError` |
 | `find_cases(query, workspace?, k=5, scope="auto", from_case?, agent?)` | `scope`: auto\|workspace\|all | `{workspace, scope, searched, results: [{case, score, reasons[], workspace, cross_workspace}]}` | 案件カード（title/tickets/related/elements）×3 ＋ 本文節の bm25 を合算。語は OR（問いの一部にでも当たる案件を拾う）。3 文字未満の語だけなら `case_id` / `title` の LIKE で補う。案件を選ぶのは人。`scope` / 自 ws / `from_case` / 記録の規則は `search` と同じ（上位 `k` 件） |
 | `checkin(case, workspace?, agent?)` | | `{job_id, status: "queued"\|"running", note}` | ローカル → Drive（`sync.checkin_job`、設定済み remote のみ）を**ジョブ**として起動し即座に返す。未知の案件はジョブを作らず `ToolError`。同じ案件の checkin が走っていればその `job_id`（新しく作らない）。完了時に**ジョブ側で** `case.json.last_checkin_at` / `last_checkin_events` の更新と `checkin` event の追記を行う（失敗時はどちらも書かない）。`job_status(job_id)` が `done` なら `result={ok, rclone, last_checkin_at}`（従来の返り値）、`failed` なら `error` に rclone の末尾。先に `events.jsonl` を Drive 版とマージするので他環境の event は消えない。**それ以外のファイルは Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする**（案件単位は rclone sync。ワークスペース全体の `kairn checkin <ws>` / `daily` は rclone copy で、ローカルに無い案件を Drive から消さない）。他環境で作業した後は先に `checkout` する運用 |
@@ -81,7 +82,7 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
 作業したら log_event / update_task（done は証拠必須）。方針が変わったら plan で計画を出し直す（載せなかった open タスクは superseded になる）。
 終わったら checkin（ジョブとして走る。job_status で done を確認する）。自ワークスペースに無ければ他ワークスペースも検索してよい（find_cases / search の
 scope=auto が既定）。開いている案件の文脈は from_case="<ws>/<case>" に入れる（跨ぎ参照は記録される）。他ワークスペースの案件から得た内容を
-worklog・タスク・成果物に書くときは、相手の案件 ID や顧客固有の情報（機体名・拠点名・図面等）を書かず一般化した表現にし、出典は related に
+worklog・タスク・成果物に書くときは、相手の案件 ID や顧客固有の情報（機体名・拠点名・図面等）を書かず一般化した表現にし、出典は link_case で related に
 "<ws>/<case>" として残す。」（原文は `kairn/server.py` `INSTRUCTIONS`。tests/test_server.py が一致を確かめる）
 
 ## 起動と登録

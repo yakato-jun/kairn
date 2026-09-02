@@ -10,6 +10,7 @@
 ワークスペースをまたぐ参照（docs/mcp-tools.md「跨ぎ参照」）: find_cases / search は scope（auto | workspace | all）で他ワークスペースも検索し、
 open_case / find_cases / search は呼び出し元の案件文脈 from_case="<ws>/<case>" を受ける。from の ws と対象の ws が違えば、対象 ws の
 index/access.log に cross_from を添えて記録し、from 側の案件の events.jsonl に xref を 1 行追記する（_record_xref。同じ対象は同じ日に 1 回）。
+他 ws から得た内容の出典は link_case で case.json.related に "<ws>/<case>" として残す（store.link_related。他 ws を足したときは xref も記録）。削除は UI（人）のみ。
 rclone の転送（checkin、open_case の取り寄せ）はジョブ（kairn/jobs.py、デーモンスレッド）にして job_id を返す
 （大きな案件で MCP クライアントの呼び出しタイムアウトに当たらないため）。状態は job_status で見る。
 open_case の取り寄せは、先に Drive の案件フォルダの版マーカー（cases/<case>/.rev/<rev>。rclone lsf 1 回、10 秒）を見て、ローカルの
@@ -40,7 +41,7 @@ from starlette.routing import Mount, Route
 from . import config as cfg
 from .index import Index
 from .jobs import JobTable
-from .store import CaseNotFound, CaseStore, append_access_log, now_iso, parse_related, validate_case_id
+from .store import CaseNotFound, CaseStore, append_access_log, now_iso, parse_related, validate_case_id, validate_related
 
 INSTRUCTIONS = (
     "kairn: 案件（case）単位の作業ログ。案件を開くときは open_case（無ければ find_cases / list_cases で選ぶ。選ぶのは人）。"
@@ -48,7 +49,7 @@ INSTRUCTIONS = (
     "終わったら checkin（ジョブとして走る。job_status で done を確認する）。"
     "自ワークスペースに無ければ他ワークスペースも検索してよい（find_cases / search の scope=auto が既定）。開いている案件の文脈は "
     "from_case=\"<ws>/<case>\" に入れる（跨ぎ参照は記録される）。他ワークスペースの案件から得た内容を worklog・タスク・成果物に書くときは、"
-    "相手の案件 ID や顧客固有の情報（機体名・拠点名・図面等）を書かず一般化した表現にし、出典は related に \"<ws>/<case>\" として残す。"
+    "相手の案件 ID や顧客固有の情報（機体名・拠点名・図面等）を書かず一般化した表現にし、出典は link_case で related に \"<ws>/<case>\" として残す。"
 )
 SCOPES = ("auto", "workspace", "all")   # find_cases / search の scope
 MCP_PATH = "/mcp"
@@ -309,6 +310,34 @@ def create_server(conf: cfg.Config | cfg.ConfigHolder, default_agent: str = "unk
                     "event": r["event"], "open_tasks": len(st.open_tasks(case))}
         except Exception as e:
             raise _fail(e) from e
+
+    @mcp.tool()
+    def link_case(case: str, related: str | list[str], note: str = "", workspace: str | None = None, agent: str = "") -> dict[str, Any]:
+        """案件の related に関係する案件を足す（出典の記録）。related: "<case>"（同 ws）か "<ws>/<case>"（他 ws）の文字列またはそのリスト。他 ws の案件から得た内容を worklog・成果物に一般化して書いたときは、出典として必ずこれで "<ws>/<case>" を残す。重複なく追記（既存は保持）し、event {action: related, added} を 1 行。全部含まれていれば changed=false（何も書かない）。他 ws の案件を足したときは xref も記録する。不正な形・存在しない案件は ToolError。削除は人が UI で行う（ツールは無い）。返り値 {case, related, added, changed}。"""
+        conf = holder.current(); ws = _ws(conf, workspace, case); st = _store(ws)
+        refs = [related] if isinstance(related, str) else list(related)
+        if not refs:
+            raise ToolError("related is required: \"<case>\" or \"<ws>/<case>\" (a string or a list of them)")
+        try:
+            validate_related(refs)
+        except ValueError as e:
+            raise ToolError(str(e)) from None
+        for ref in refs:   # 実在の検証（形は上で済み）: 同 ws は自分の cases_dir、他 ws は登録済みの ws の cases_dir
+            ws_name, target_case = parse_related(ref)
+            if ws_name is not None and ws_name not in conf.workspaces:
+                raise ToolError(f"related {ref!r}: unknown workspace {ws_name!r} (known: {list(conf.workspaces)})")
+            target = conf.workspaces[ws_name] if ws_name else ws
+            if not (target.cases_dir / target_case / "case.json").exists():
+                raise ToolError(f"related {ref!r}: unknown case {target_case!r} in workspace {target.name!r} (the case must exist locally)")
+        try:
+            r = st.link_related(case, refs, actor="ai", agent=_agent(agent), note=note)
+        except Exception as e:
+            raise _fail(e) from e
+        for ref in r["added"]:   # 他 ws の案件を足した＝跨ぎ参照。参照元（この案件）の events に xref（同じ対象は同じ日に 1 回）
+            ws_name, target_case = parse_related(ref)
+            if ws_name and ws_name != ws.name:
+                st.append_xref(case, ws_name, target_case, "link_case", _agent(agent))
+        return {"case": case, "related": r["related"], "added": r["added"], "changed": r["changed"]}
 
     @mcp.tool()
     def search(query: str, cases: list[str] | None = None, workspace: str | None = None, limit: int = 10,

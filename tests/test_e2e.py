@@ -103,7 +103,7 @@ def test_end_to_end(tmp_path, env, fake_rclone):
         async def mcp_flow():
             async with Client(base + "/mcp") as c:
                 names = {t.name for t in (await c.list_tools()).tools}
-                assert names == {"open_case", "list_cases", "plan", "update_task", "log_event", "set_case_status", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status"}
+                assert names == {"open_case", "list_cases", "plan", "update_task", "log_event", "set_case_status", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status", "link_case"}
                 r = await c.call_tool("plan", {"case": "CASE-123", "objective": "boot works", "reason": "initial", "tasks": [{"title": "調査"}, {"title": "修正"}]})
                 assert not r.is_error and r.structured_content["version"] == 1
                 r = await c.call_tool("update_task", {"case": "CASE-123", "task": "T001", "status": "done", "note": "x"})

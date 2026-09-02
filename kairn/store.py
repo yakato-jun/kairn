@@ -9,7 +9,9 @@ MCP が呼ぶ規則の実体はここ（エージェントの文章には頼ら�
   閲覧だけで events.jsonl に差分を作らないため（複数環境の events をマージする前提）
 - ワークスペースをまたぐ参照（docs/data-model.md「跨ぎ参照」）: 対象側の access.log には cross_from=<ws>/<case> を添え、参照元の案件の
   events.jsonl には {action: "xref", workspace, case, tool} を 1 行追記する（append_xref。同じ対象は同一日に 1 回だけ）。
-  case.json.related は同じワークスペースの案件 ID に加え "<ws>/<case>" を許す（parse_related / validate_related）
+  case.json.related は同じワークスペースの案件 ID に加え "<ws>/<case>" を許す（parse_related / validate_related）。
+  related への追記は link_related（MCP link_case / UI。event {action: "related", added}）、削除は unlink_related（UI＝人の操作のみ。
+  event {action: "related", removed}）。形の検証だけを行い、案件の実在は呼び出し側（server は ToolError、UI は形だけ）が決める
 - last_checkin_at / last_checkin_events: 案件単位の最終 checkin 時刻とその時点の events.jsonl 行数（case.json）。
   open_case はこれより新しいローカル変更（kairn 自身の checkin event は除く）があれば checkout を skip する
 - rev / checked_in_from: checkin のたびに振り直す版マーカー（uuid4）と checkin したホスト名（case.json）。同じ rev を名前にした
@@ -31,7 +33,7 @@ JST = timezone(timedelta(hours=9))
 TASK_STATUSES = {"open", "doing", "blocked", "done", "dropped", "superseded"}
 CASE_STATUSES = {"open", "closed", "suspended"}
 EVENT_ACTIONS = {"opened", "plan", "started", "progress", "done", "dropped", "sendback", "comment", "decision",
-                 "checkin", "status", "extract", "xref"}  # 旧版が書いた "checkout" 行は読めるが、もう書かない（open_case は access.log へ）
+                 "checkin", "status", "extract", "xref", "related"}  # 旧版が書いた "checkout" 行は読めるが、もう書かない（open_case は access.log へ）
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 WORKSPACE_NAME_RE = CASE_ID_RE   # "<ws>/<case>" 参照で使えるワークスペース名（ディレクトリ名と同じ制約）
 TASK_OWNERS = {"ai", "human"}
@@ -317,6 +319,39 @@ class CaseStore:
         self.save_case(case)
         ev = self.append_event(case_id, {"actor": actor, "agent": agent, "action": "status", "from": prev, "to": status, "note": note})
         return {"case": case, "changed": True, "previous_status": prev, "event": ev}
+
+    # ---------- related ----------
+    def link_related(self, case_id: str, refs: list[str], actor: str, agent: str = "", note: str = "") -> dict:
+        """case.json.related に refs（"<case>" | "<ws>/<case>"）を重複なく追記する（既存は保持、順序維持。refs 内の重複も 1 回）。
+        形は validate_related で検証（不正なら ValueError。1 つでも不正なら何も書かない）。実在は検証しない（呼び出し側の責任）。
+        追記があれば event {actor, agent, action: "related", added: [...], note} を 1 行。すべて既に含まれていれば case.json も events も触らず changed=False。
+        返り値: {case, related, added, changed, event（無ければ None）}。"""
+        refs = validate_related(list(refs))
+        case = self.load_case(case_id)
+        related = list(case.get("related") or [])
+        added: list[str] = []
+        for r in refs:
+            if r not in related and r not in added:
+                added.append(r)
+        if not added:
+            return {"case": case, "related": related, "added": [], "changed": False, "event": None}
+        case["related"] = related + added
+        self.save_case(case)
+        ev = self.append_event(case_id, {"actor": actor, "agent": agent, "action": "related", "added": added, "note": note})
+        return {"case": case, "related": case["related"], "added": added, "changed": True, "event": ev}
+
+    def unlink_related(self, case_id: str, ref: str, actor: str, agent: str = "", note: str = "") -> dict:
+        """case.json.related から ref を外す（人の操作＝UI からのみ呼ぶ。MCP には削除ツールを置かない）。文字列一致で全部外す。
+        無ければ何も書かず changed=False。外したら event {actor, agent, action: "related", removed: [ref], note}。
+        返り値: {case, related, removed, changed, event}。"""
+        case = self.load_case(case_id)
+        related = list(case.get("related") or [])
+        if ref not in related:
+            return {"case": case, "related": related, "removed": [], "changed": False, "event": None}
+        case["related"] = [r for r in related if r != ref]
+        self.save_case(case)
+        ev = self.append_event(case_id, {"actor": actor, "agent": agent, "action": "related", "removed": [ref], "note": note})
+        return {"case": case, "related": case["related"], "removed": [ref], "changed": True, "event": ev}
 
     # ---------- plans ----------
     def _plan_file(self, case_id: str, version: int) -> Path:

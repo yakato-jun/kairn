@@ -1,4 +1,4 @@
-"""MCP サーバー（mcp 2.x）: in-process の Client で 12 ツールを呼ぶ。rclone は monkeypatch、Drive の版マーカー（cases/<case>/.rev/）はメモリ内の偽物（fake_drive）。
+"""MCP サーバー（mcp 2.x）: in-process の Client で 13 ツールを呼ぶ。rclone は monkeypatch、Drive の版マーカー（cases/<case>/.rev/）はメモリ内の偽物（fake_drive）。
 checkin と open_case の取り寄せはジョブ（スレッド）なので、結果を見る前に job.wait() で完了を待つ（_checkin / _open）。
 open_case は Drive のマーカーの rev がローカルと違うときだけ取り寄せる: 取り寄せを起こしたいテストは fake_drive.set_rev(case, "…") で rev をずらす。"""
 from __future__ import annotations
@@ -16,7 +16,7 @@ from kairn.jobs import JobTable
 from kairn.store import CaseStore
 from tests.conftest import bump_mtime
 
-TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "set_case_status", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status"}
+TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "set_case_status", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status", "link_case"}
 
 
 @pytest.fixture
@@ -1130,3 +1130,59 @@ def test_open_case_expands_related_across_workspaces(conf2, fake_drive):
     run(main)
     with pytest.raises(ValueError):
         a.create_case("CASE-3", "t", "acme", actor="human", related=["a/b/c"])
+
+
+def test_link_case_appends_related_and_records_xref(conf2, fake_drive):
+    """link_case: 同 ws / 他 ws の案件を related に重複なく追記し、event {action: related, added} を 1 行。他 ws を足したときは xref（tool=link_case）も 1 行。
+    全部含まれていれば changed=false で何も書かない。不正な形・存在しない案件・未知の ws は ToolError（1 つでも不正なら何も書かない）。
+    open_case の related の展開に反映される。access.log には書かない。"""
+    a, b = _seed_two_workspaces(conf2)
+    acme, beta = conf2.workspaces["acme"], conf2.workspaces["beta"]
+    a.create_case("CASE-2", "second", "acme", actor="human")
+    mcp = srv.create_server(conf2, default_agent="test-agent")
+
+    def by_action(st, case, action):
+        return [e for e in st.events(case) if e["action"] == action]
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            # 同 ws（文字列 1 つ）
+            r = await c.call_tool("link_case", {"case": "CASE-1", "related": "CASE-2", "note": "同種の症状", "agent": "claude"})
+            assert not r.is_error, r.content
+            assert r.structured_content == {"case": "CASE-1", "related": ["CASE-2"], "added": ["CASE-2"], "changed": True}
+            assert a.load_case("CASE-1")["related"] == ["CASE-2"]
+            ev = by_action(a, "CASE-1", "related")
+            assert len(ev) == 1 and ev[0]["actor"] == "ai" and ev[0]["agent"] == "claude" and ev[0]["added"] == ["CASE-2"] and ev[0]["note"] == "同種の症状"
+            assert by_action(a, "CASE-1", "xref") == []                       # 同 ws は xref 無し
+            # 他 ws（リスト。既存の CASE-2 は保持、リスト内の重複は 1 回）→ xref（tool=link_case）
+            r = await c.call_tool("link_case", {"case": "CASE-1", "related": ["beta/CASE-9", "CASE-2", "beta/CASE-9"]})
+            assert not r.is_error, r.content
+            assert r.structured_content == {"case": "CASE-1", "related": ["CASE-2", "beta/CASE-9"], "added": ["beta/CASE-9"], "changed": True}
+            assert a.load_case("CASE-1")["related"] == ["CASE-2", "beta/CASE-9"]
+            x = by_action(a, "CASE-1", "xref")
+            assert len(x) == 1 and x[0]["workspace"] == "beta" and x[0]["case"] == "CASE-9" and x[0]["tool"] == "link_case" and x[0]["agent"] == "test-agent"
+            assert not (beta.index_dir / "access.log").exists() and not (acme.index_dir / "access.log").exists()   # 閲覧ではない
+            assert by_action(b, "CASE-9", "related") == [] and by_action(b, "CASE-9", "xref") == []               # 相手側には書かない
+            # 全部含まれている → changed=false、event 無し
+            n = len(a.events("CASE-1"))
+            r = await c.call_tool("link_case", {"case": "CASE-1", "related": ["CASE-2", "beta/CASE-9"]})
+            assert not r.is_error and r.structured_content == {"case": "CASE-1", "related": ["CASE-2", "beta/CASE-9"], "added": [], "changed": False}
+            assert len(a.events("CASE-1")) == n
+            # open_case の related の展開に反映される
+            fake_drive.unavailable = True
+            r = await c.call_tool("open_case", {"case": "CASE-1", "workspace": "acme"})
+            assert not r.is_error, r.content
+            rel = r.structured_content["related"]
+            assert [(x["ref"], x["cross_workspace"], x["exists"], x["title"]) for x in rel] == [("CASE-2", False, True, "second"), ("beta/CASE-9", True, True, "beta の案件 beta")]
+            # 不正な形・存在しない案件・未知の ws・空 → ToolError、何も書かない
+            n = len(a.events("CASE-1"))
+            for bad, msg in [("a/b/c", "invalid related reference"), ("../x", "invalid related reference"), ("CASE-404", "unknown case 'CASE-404'"),
+                             ("beta/CASE-404", "unknown case 'CASE-404'"), ("gamma/CASE-9", "unknown workspace 'gamma'"),
+                             (["CASE-2", "beta/CASE-404"], "unknown case 'CASE-404'"), ([], "related is required")]:
+                r = await c.call_tool("link_case", {"case": "CASE-1", "related": bad})
+                assert r.is_error and msg in r.content[0].text, (bad, r.content)
+            assert a.load_case("CASE-1")["related"] == ["CASE-2", "beta/CASE-9"] and len(a.events("CASE-1")) == n
+            # 未知の案件（対象側）
+            r = await c.call_tool("link_case", {"case": "CASE-404", "workspace": "acme", "related": "CASE-2"})
+            assert r.is_error and "unknown case" in r.content[0].text
+    run(main)
