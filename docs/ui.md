@@ -14,6 +14,8 @@
   ワークスペース内の案件: status、進捗バー（done/全、計画の版）、鮮度、最終イベント、担当 AI の最終動作（actor=ai の最終イベントの agent/action）。
   elements の値をタグ表示し、クリックで絞り込み（横断）。case.json の無いディレクトリは件数だけ表示。
 - **案件** `GET /ui/<ws>/<case>`
+  - 進行中のジョブ（MCP の `checkin` / `open_case` の取り寄せ。`kairn/jobs.py` の表を MCP と共有）: 種類・状態・経過秒・job_id・
+    rclone の最新の進捗行。走っているものがある時だけ、見出しの直下に出す（自動更新はしない。再読み込み）。ジョブ一覧のページは無い
   - かんばん（open / doing / blocked / done）。カードに owner・最終動作時刻・証拠・差し戻しフォーム
   - 計画の版履歴（各版の reason / objective / タスクと状態、`carried_from` と、どの版で何が superseded になったか）
   - データ所在（case.json の `data[]`: Drive パスと復元コマンド `rclone copy <remote>:<path> <case_dir>/`）

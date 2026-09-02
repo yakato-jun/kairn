@@ -37,6 +37,7 @@ form.inline{display:inline}input,textarea,select{font:inherit}button{font:inheri
 .stale{color:#b00;font-weight:bold}.card.stale{border-left:4px solid #c33}.age{font-size:.85em}
 details{margin:.4em 0}pre{background:#fff;padding:.6em;overflow-x:auto;font-size:.85em;white-space:pre-wrap}
 .tag{display:inline-block;background:#e3e8f0;border-radius:3px;padding:0 .4em;margin:0 .2em;font-size:.85em}
+.jobs{background:#fff7e0;border-left:4px solid #e9a825;padding:.4em .8em;margin:.5em 0;font-size:.9em}.jobs ul{margin:.3em 0}.job code{font-size:.85em}
 """
 
 
@@ -177,6 +178,12 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
                        f"<small>復元: <code>rclone copy {_esc(conf.remote)}:{_esc(d.get('drive', ''))} {_esc(ws.cases_dir / cid)}/</code></small></li>"
                        for d in c.get("data", []))
         summary = f"<p><small>summary: {_esc(c['summary'])}</small></p>" if c.get("summary") else ""
+        active = jobs.active(ws.name, cid) if jobs is not None else []
+        running = ("<div class='jobs'><b>進行中のジョブ</b><ul>" + "".join(
+            f"<li class='job'><b>{_esc(j.kind)}</b> <span class='muted'>{_esc(j.status)} · {_esc(j.elapsed_sec())}s · {_esc(j.id)}</span>"
+            f"<br><code>{_esc(j.progress or '(no output yet)')}</code></li>" for j in active)
+            + "</ul><small class='muted'>checkin / open_case の取り寄せ（MCP のジョブ）。完了すると時系列に checkin event が出る（取り寄せは出ない）。再読み込みで更新</small></div>"
+            if active else "")
         causal = "".join(f"<li>{_esc(x.get('symptom', ''))} → {_esc(x.get('component', ''))} → {_esc(x.get('cause', ''))}"
                          f" <small class='muted'>({_esc(x.get('evidence', ''))})</small></li>" for x in c.get("causal", []) if isinstance(x, dict))
         wl = ws.cases_dir / cid / "worklog.md"
@@ -190,7 +197,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
                  + f"</select><input name=note placeholder='理由' size=30><button>案件の状態を変更</button></form>"
                  f"<form method=post action='{_url(ws, cid, 'extract')}'><button>下書きを取得</button> "
                  f"<small>extract.agent={_esc(conf.extract_agent)} の子エージェントが案件ディレクトリを読んで case.json の下書きを返す（書き込まない。適用は次の画面で）</small></form>")
-        body = (f"<h2>{_esc(cid)} <small>{_esc(c.get('title', ''))}</small></h2><p><small>{meta}</small></p>"
+        body = (f"<h2>{_esc(cid)} <small>{_esc(c.get('title', ''))}</small></h2><p><small>{meta}</small></p>{running}"
                 f"<p><small>objective: {_esc((plan or {}).get('objective', ''))}</small></p>{summary}"
                 f"<div class='kanban'>{kanban}</div>{forms}"
                 f"<h3>計画の版履歴</h3>{plans or '<small>(no plan)</small>'}"

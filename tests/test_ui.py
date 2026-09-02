@@ -5,6 +5,7 @@ from datetime import timedelta
 
 from starlette.testclient import TestClient
 
+from kairn.jobs import JobTable
 from kairn.store import CaseStore
 from kairn.ui import STALE_DAYS, build_ui, case_freshness, task_freshness
 
@@ -133,3 +134,31 @@ def test_task_form_rejects_unknown_owner(conf):
     c = TestClient(build_ui(conf))
     assert c.post("/ui/acme/CASE-123/task", data={"title": "x", "owner": "robot"}).status_code == 400
     assert st.current_plan("CASE-123")["version"] == 1
+
+
+def test_case_page_shows_running_jobs(conf):
+    """進行中の checkin / 取り寄せジョブ（種類・進捗行・経過時間）を案件ページに出す。終われば消える。他案件のジョブは出ない。"""
+    import threading
+    _seed(conf)
+    st = CaseStore(conf.workspaces["acme"].cases_dir)
+    st.create_case("CASE-100", "other", "acme", actor="human")
+    jobs = JobTable()
+    c = TestClient(build_ui(conf, jobs=jobs))
+    assert "進行中のジョブ" not in c.get("/ui/acme/CASE-123").text
+    started = threading.Event(); release = threading.Event()
+
+    def fn(progress):
+        progress("Transferred:   \t  1.234 MiB / 700 MiB, 0%, 1.2 MiB/s, ETA 10m")
+        started.set()
+        release.wait(5)
+    job, _ = jobs.submit("checkin", "acme", "CASE-123", fn)
+    other, _ = jobs.submit("checkout", "acme", "CASE-100", lambda p: release.wait(5))
+    assert started.wait(5)
+    page = c.get("/ui/acme/CASE-123").text
+    assert "進行中のジョブ" in page and "<b>checkin</b>" in page and "running" in page and job.id in page
+    assert "1.234 MiB / 700 MiB" in page and "ETA 10m" in page and "s · " in page
+    assert "<b>checkout</b>" not in page and other.id not in page
+    assert "<b>checkout</b>" in c.get("/ui/acme/CASE-100").text
+    release.set(); job.wait(5); other.wait(5)
+    assert "進行中のジョブ" not in c.get("/ui/acme/CASE-123").text
+    assert "進行中のジョブ" not in TestClient(build_ui(conf)).get("/ui/acme/CASE-123").text  # jobs 無し（UI 単体）でも動く
