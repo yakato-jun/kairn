@@ -2,7 +2,8 @@
 
 実装: `kairn/server.py`（mcp 2.x `mcp.server.mcpserver.MCPServer`、streamable HTTP を `/mcp` に提供。UI と同一プロセス）。ツールは 11 個。
 判断の規則の実体は `kairn/store.py`（証拠必須・superseded 自動化）。server は引数を検証して委譲する。
-rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（`kairn/jobs.py`）として走らせ、ツールは待たずに `job_id` を返す（後述）。
+rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（`kairn/jobs.py`）として走らせ、`checkin` は待たずに `job_id` を返す（後述）。
+`open_case` は先に Drive の `manifest.json` で案件の `rev` を比べ、同じなら取り寄せを省略する（「open_case の drive」）。
 
 ## 共通
 
@@ -14,7 +15,7 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
   （エージェントが読める。JSON-RPC エラーにはしない）。
 - **ジョブ**（`kairn/jobs.py`）: rclone の転送は数百 MB・数百ファイルの案件で数分かかり、MCP クライアント側の呼び出しタイムアウト（300 秒程度）に
   当たる（サーバー側は最後まで走るがクライアントは失敗扱い）。そのため `checkin` と `open_case` の取り寄せはデーモンスレッドのジョブにし、
-  ツールは即座に `job_id` を返す。状態は `job_status(job_id)` で見る（queued → running → done | failed。`progress` は rclone の
+  `checkin` は即座に `job_id` を返す（`open_case` は最大 20 秒だけ待ち、間に合わなければ `job_id` を返す）。状態は `job_status(job_id)` で見る（queued → running → done | failed。`progress` は rclone の
   `--stats 5s --stats-one-line` の最新行、`elapsed_sec` は開始からの秒数）。**同じ案件に対する同種のジョブが queued / running なら新しく作らず
   既存の `job_id` を返す**（`note` に "already running"）。**同じ案件（workspace, case）のジョブは種類を問わず 1 つずつ実行する**
   （(workspace, case) ごとの FIFO キュー。checkin 実行中に `open_case` の取り寄せが来れば `status: queued` で待ち、先行が done / failed になってから
@@ -34,8 +35,8 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
 
 | ツール | 引数 | 返り値 | 実装で強制する規則 |
 |---|---|---|---|
-| `open_case(case, workspace?, agent?)` | | ローカルにある: `{available: true, case, plan, open_tasks, recent_events(直近20), human_feedback(人の sendback/comment 直近5), related, worklog_tail(末尾3000字), drive, paths}`。ローカルに無く取り寄せ中: `{available: false, status: "fetching", job_id, case: null, note}`。取り寄せが失敗: `{available: false, status: "failed", error, job_id, case: null, note}` | 順序: ワークスペース解決 → Drive からの取り寄せ**ジョブ**を起動（`sync.checkout`: `events.jsonl` は Drive 版と行の和集合にマージ、他は `rclone copy --update` でローカルの方が新しいファイルは上書きしない）→ **待たずに**今のローカル内容を読んで返す。`drive={fetched:false, job_id, status:"queued"|"running", note}`（同じ案件の取り寄せが走っていればその `job_id`）。取り寄せ完了（`job_status` が `done`）後にもう一度 `open_case` すると最新になる。**Drive にしか無い案件はエラーにしない**: 1 回目は `{available: false, status: "fetching", job_id, case: null, note}`（同じ案件の取り寄せが既に走っていればその `job_id`）。`job_status(job_id)` が `done` になってから再実行すると開ける（`available: true`）。取り寄せジョブが `failed` なら `{available: false, status: "failed", error, job_id}`（`error` は失敗したジョブのもの。`job_id` は再試行として起動した新しいジョブ。失敗が続くなら `error` を人に伝える）。ジョブが `done` でも案件が無い（Drive にも無い）場合だけ `unknown case …` の `ToolError`。`case.json.last_checkin_at` より新しいローカル変更（人／AI の実質的な変更。`events.jsonl` が kairn 自身の `checkin` event で伸びただけなら数えない）があれば取り寄せをジョブにせず skip し `drive={fetched:false, skipped:"local changes newer than last checkin", files:[…]}`（従来どおり）。rclone の失敗はジョブの `failed` / `error` に残り、`open_case` はローカル写しを返す。**events.jsonl には書かない**（閲覧記録は `index/access.log` にローカルで 1 行追記） |
-| `list_cases(workspace?, status="open", query="")` | `status`: open\|closed\|suspended\|all。`query` は id/title 部分一致 | `[{case, title, status, progress{total,done,open,plan}, last_event}]` | |
+| `open_case(case, workspace?, agent?)` | | ローカルにある: `{available: true, case, plan, open_tasks, recent_events(直近20), human_feedback(人の sendback/comment 直近5), related, worklog_tail(末尾3000字), drive, paths}`。ローカルに無く取り寄せ中: `{available: false, status: "fetching", job_id, case: null, note}`。取り寄せが失敗: `{available: false, status: "failed", error, job_id, case: null, note}` | 順序: ワークスペース解決 → **Drive の `manifest.json` を `rclone cat` で 1 回読む**（10 秒でタイムアウト。キャッシュ `index/manifest.cache.json` も更新）→ 案件の `rev` を比較 → 必要なときだけ取り寄せ**ジョブ**（`sync.checkout`: `events.jsonl` は Drive 版と行の和集合にマージ、他は `rclone copy --update` でローカルの方が新しいファイルは上書きしない）を起動し最大 **20 秒**待つ → ローカル内容を読んで返す。`drive` のパターン（「open_case の drive」）: (a) `case.json.last_checkin_at` より新しいローカル変更（人／AI の実質的な変更。`events.jsonl` が kairn 自身の `checkin` event で伸びただけなら数えない）があれば manifest を見ずに skip: `{fetched: false, skipped: "local changes newer than last checkin", files: […]}`。(b) manifest の `rev` がローカルの `case.json.rev` と同じ: `{fetched: false, up_to_date: true, checked, rev}`（取り寄せなし）。(c) `rev` が違う／manifest にエントリが無い（未知＝安全側で取り寄せ）: ジョブが 20 秒以内に done なら `{fetched: true, up_to_date: true, checked, job_id, rev, drive_rev, note}`（返り値は取り寄せ後の内容）、failed なら `{fetched: false, up_to_date: false, status: "failed", error, job_id, …}`（ローカル写し）、間に合わなければ `{fetched: false, up_to_date: false, job_id, status: "queued"\|"running", note}`（ローカル写し。`job_status` が `done` になってから再度 `open_case`。同じ案件の取り寄せが走っていればその `job_id`）。(d) manifest が取れない（オフライン・未作成）: 取り寄せず `{fetched: false, up_to_date: null, checked, note: "manifest unavailable …"}`（ローカル写し）。**Drive にしか無い案件はエラーにしない**: ローカルに無ければ manifest の有無・エントリの有無に関わらず取り寄せジョブを起動し（待たない）、1 回目は `{available: false, status: "fetching", job_id, case: null, note}`（同じ案件の取り寄せが既に走っていればその `job_id`）。`job_status(job_id)` が `done` になってから再実行すると開ける（`available: true`）。取り寄せジョブが `failed` なら `{available: false, status: "failed", error, job_id}`（`error` は失敗したジョブのもの。`job_id` は再試行として起動した新しいジョブ。失敗が続くなら `error` を人に伝える）。ジョブが `done` でも案件が無い（Drive にも無い）場合だけ `unknown case …` の `ToolError`。rclone の失敗はジョブの `failed` / `error` に残り、`open_case` はローカル写しを返す。**events.jsonl には書かない**（閲覧記録は `index/access.log` にローカルで 1 行追記） |
+| `list_cases(workspace?, status="open", query="")` | `status`: open\|closed\|suspended\|all。`query` は id/title 部分一致 | `[{case, title, status, progress{total,done,open,plan}, last_event, drive{state, rev, drive_rev, checked_in_at, from, checked, files?, drive_differs?}}]` | `drive.state` は `index/manifest.cache.json`（直近に取得した manifest。`checked` はその取得時刻、無ければ null）との比較: `synced`（rev 一致）\| `drive_newer`（rev が違う）\| `local_changes`（未 checkin のローカル変更。`files`、`drive_differs`）\| `unknown`（キャッシュ無し・エントリ無し・未 checkin）。Drive には接続しない（取得は open_case / checkin / `kairn checkout <ws>` / UI の「更新確認」） |
 | `plan(case, objective, tasks[], reason, workspace?, agent?)` | `tasks: [{title, owner?: ai\|human, carried_from?: "T012"}]` | 新版の plan（`superseded: [...]` を含む） | 版番号は自動。`carried_from` で引き継がれなかった open/doing/blocked は前版で `superseded`。未知の `carried_from`・同じタスクの二重 `carried_from`・`title` も `carried_from` も無い要素・`owner` が ai/human 以外は拒否。**`done` を `carried_from` しないと旧版にだけ残る**（UI のタスク追加は done も引き継ぐ） |
 | `update_task(case, task, status, evidence[]?, note?, workspace?, agent?)` | `status`: open\|doing\|blocked\|done\|dropped | 更新後の task | `done` は `evidence` 必須。各要素は `{type: commit\|pr\|file\|test\|url, ...}` で型ごとの必須キー（commit/pr→`id`、file→`path`、test→`cmd`、url→`url`）を検証、`note` 型（必須キー `text`）は human のみ（docs/data-model.md）。存在しない task・計画未作成は拒否。event（started/done/dropped/progress）を追記 |
 | `log_event(case, action, note, evidence[]?, workspace?, agent?)` | `action`: progress\|decision\|comment | 追記した event | actor/agent 自動付与。他の action は拒否。`evidence` は update_task と同じ検証 |
@@ -45,6 +46,21 @@ rclone の転送（`checkin`、`open_case` の取り寄せ）は**ジョブ**（
 | `job_status(job_id)` | | `{job_id, kind: checkin\|checkout, workspace, case, status: queued\|running\|done\|failed, created_at, started_at, finished_at, elapsed_sec, progress, result, error}` | `checkin` / `open_case` が返した `job_id` の状態。`queued` は同じ案件の先行ジョブが終わるのを待っている（同一案件のジョブは 1 つずつ）。`progress` は rclone の出力の最新行（`Transferred: … ETA …`）、`elapsed_sec` は開始からの秒数。`done` なら `result`（checkin: `{ok, rclone, last_checkin_at}`、checkout: rclone の末尾）、`failed` なら `error`（`RcloneError: …` 等）。未知の `job_id`（捨てられた／サーバー再起動で消えた）は `ToolError` |
 | `drive_index(pattern, workspace?, limit=50)` | 正規表現 | `[{path, size, mtime}]` | `index/drive-index.txt`（`kairn drive-index` で生成）を検索。無ければ空 |
 | `extract_card(case, workspace?)` | | `{ok, card, agent, elapsed_sec, error, raw_excerpt}` | 設定 `extract.agent` の子エージェント（`kairn/extract/adapters.py`）を案件ディレクトリの写し（一時ディレクトリ: 自案件＋兄弟案件の `case.json` のみ）を cwd に、最小限の環境変数で起動し、出力を `kairn/extract/schema.json` で検証した下書きを `card` に返す（docs/extract-agents.md）。`card.related` のうち実在しない案件 ID は `card.related_unknown` に分ける。**case.json には書かない**（適用は UI の人の操作のみ）。タイムアウト・非ゼロ終了・JSON 無し・スキーマ不一致は `ok=false, error` で返す（`is_error` にしない。未知の案件だけ `ToolError`）。毎回 `{actor: kairn, agent: "extract:<name>", action: extract, note, elapsed_sec, exit_code, timeout_sec}` を events に追記 |
+
+## open_case の drive（取り寄せの判定。`kairn/server.py` `_fetch_from_drive`）
+
+| 状況 | `drive` | 取り寄せ | 返り値の内容 |
+|---|---|---|---|
+| 未 checkin のローカル変更がある（skip 判定が最優先。manifest は見ない） | `{fetched: false, skipped: "local changes newer than last checkin", files}` | しない | ローカル写し |
+| manifest の rev がローカルの `case.json.rev` と同じ | `{fetched: false, up_to_date: true, checked, rev}` | しない | ローカル（＝最新） |
+| rev が違う／manifest にエントリが無い、20 秒以内に取り寄せ完了 | `{fetched: true, up_to_date: true, checked, job_id, rev, drive_rev, note}` | した | 取り寄せ後 |
+| 同上、取り寄せが失敗 | `{fetched: false, up_to_date: false, status: "failed", error, job_id, checked, drive_rev, note}` | 失敗 | ローカル写し |
+| 同上、20 秒以内に終わらない | `{fetched: false, up_to_date: false, status: "queued"\|"running", job_id, checked, drive_rev, note}` | 実行中 | ローカル写し（`job_status` が done になったら再度 `open_case`） |
+| manifest が取れない（オフライン・未作成・タイムアウト 10 秒・JSON でない） | `{fetched: false, up_to_date: null, checked, note: "manifest unavailable …"}` | しない | ローカル写し（Drive の状態は不明） |
+| ローカルに案件が無い | 返り値は `{available: false, status: "fetching"\|"failed", job_id, …}` | する（待たない） | なし |
+
+`checked` は manifest を読んだ時刻（ISO 8601）。manifest の形と競合（後勝ち）は docs/data-model.md。既存 Drive データには一度 `kairn manifest rebuild <ws>` を
+実行して `rev` と manifest を作る（それまで `open_case` は「manifest unavailable」でローカル写しを返し続ける）。
 
 ## server instructions（各エージェントに表示される要約）
 

@@ -68,7 +68,10 @@ workspaces/<ws>/
   **同時 checkin の競合は「後勝ち」**: 案件ごとの独立エントリなので影響は当該案件のみ（別案件の同時 checkin では、後の書き戻しが先の
   エントリを取り込んでいる。同じ案件を同時に checkin した場合だけ先の rev が消え、その環境は次の `open_case` で取り寄せることになる）。
 - `open_case` は `rclone cat` を 1 回（10 秒でタイムアウト）だけ行い、案件の `rev` がローカルの `case.json.rev` と同じなら取り寄せを省略する。
-  エントリが無い案件は「未知」として取り寄せる（安全側）。manifest が取れない（オフライン・未作成）ときは取り寄せをせずローカル写しを返す（docs/mcp-tools.md）。
+  エントリが無い案件は「未知」として取り寄せる（安全側）。manifest が取れない（オフライン・未作成）ときは取り寄せをせずローカル写しを返す。
+- 既存の Drive データ（`rev` の無い case.json）は `kairn manifest rebuild <ws>` で一度だけ `rev` を付与して manifest を作る（README「同期」）。
+- 印（`list_cases` の `drive.state` / UI 一覧）: `synced`（rev 一致）/ `drive_newer`（rev が違う）/ `local_changes`（未 checkin のローカル変更。
+  `drive_differs` で Drive 側も違うか）/ `unknown`（キャッシュ無し・エントリ無し・未 checkin）。判定はキャッシュ時点のもの。
 
 ### summary / elements / related / causal（抽出の下書きの適用先）
 - `kairn/extract`（MCP `extract_card` / `kairn extract` / UI「下書きを取得」）は下書きを返すだけで case.json には書かない。

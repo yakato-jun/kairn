@@ -11,8 +11,13 @@
 ## 画面
 
 - **一覧** `GET /ui[?status=open|closed|suspended|all][&element=<値>][&ws=<名>]`
-  ワークスペース内の案件: status、進捗バー（done/全、計画の版）、鮮度、最終イベント、担当 AI の最終動作（actor=ai の最終イベントの agent/action）。
+  ワークスペース内の案件: status、進捗バー（done/全、計画の版）、鮮度、Drive 列、最終イベント、担当 AI の最終動作（actor=ai の最終イベントの agent/action）。
   elements の値をタグ表示し、クリックで絞り込み（横断）。case.json の無いディレクトリは件数だけ表示。
+  - **Drive 列**（`sync.drive_state`。直近に取得した manifest のキャッシュ `index/manifest.cache.json` との比較。取得時刻を表の上に出す）:
+    同期済み（rev 一致）/ Drive の方が新しい（rev が違う）/ ローカル未 checkin（`last_checkin_at` より新しいローカル変更。ファイル名と、Drive 側も
+    違えば「Drive も更新あり」）/ 不明（manifest 未取得・エントリ無し・未 checkin）。title に rev / Drive 側の rev・checkin 元ホストと時刻。
+  - **「更新確認」ボタン**（`POST /ui/refresh`、`ws` = 表示中のワークスペース。空なら全部）: Drive の manifest.json を取得してキャッシュを更新し
+    一覧に戻る（`?refreshed=<結果>`）。案件は取り寄せない（取り寄せは `open_case` / `kairn checkout`）。rclone は threadpool で実行。
 - **案件** `GET /ui/<ws>/<case>`
   - 進行中のジョブ（MCP の `checkin` / `open_case` の取り寄せ。`kairn/jobs.py` の表を MCP と共有）: 種類・状態（running / queued。
     queued は同じ案件の先行ジョブ待ち）・経過秒・job_id・rclone の最新の進捗行。走っているものがある時だけ、見出しの直下に出す（自動更新はしない。再読み込み）。ジョブ一覧のページは無い
@@ -40,6 +45,7 @@
 | 下書きを取得 | `/ui/<ws>/<case>/extract` | `extract.extract_card` を threadpool で実行し（子プロセス待ちの間も同じプロセスの MCP を止めない）、結果画面（agent・所要時間・ok/失敗理由、現在の case.json と下書きの対比、症状→部品→原因、下書き JSON）を返す（200、リダイレクトしない）。下書きの `related` にワークスペースに実在しない案件 ID があれば `related_unknown` として ⚠ 印を付ける（適用しても related に入らない）。case.json は書かない。`{actor: kairn, agent: extract:<name>, action: extract}` |
 | この下書きを case.json に適用 | `/ui/<ws>/<case>/apply` `card`（下書き JSON。結果画面の hidden） | `related_unknown` を捨てて schema.json で再検証し、title / summary / elements / related / causal を置き換え＋ `{actor: human, action: decision, note: "applied extract draft"}`。不正な JSON・スキーマ不一致は 400 |
 
+| 更新確認（一覧） | `/ui/refresh` `ws`（空なら全ワークスペース） | `sync.refresh_manifest`（rclone cat 1 回、10 秒）でキャッシュを更新し 303 で `/ui?ws=…&refreshed=<ws: manifest N case(s) \| manifest unavailable>` へ。未知の ws は 404。event は書かない |
 | 設定: 単一値 | `/ui/settings/set` `key, value` | `config.set_rule`（`raw_data.min_size` は `sync.parse_size`、`raw_data.min_age` は `parse_age`、`bag_to_zst` は true/false、`bwlimit` は `parse_bwlimit` で検証。`off` はキーを消す）→ `Config.save()`。不正な値・未知の key は 400 で保存しない。event は書かない |
 | 設定: exclude の追加／削除 | `/ui/settings/add-exclude` / `remove-exclude` `pattern` | `rules.exclude` に足す（重複は no-op）／外す（無ければ 400）→ 保存 |
 | 設定: 生データ拡張子の追加／削除 | `/ui/settings/add-raw-ext` / `remove-raw-ext` `ext` | `rules.raw_data.extensions` に足す（先頭の `.` は外し小文字。重複は no-op）／外す（無ければ 400）→ 保存 |
