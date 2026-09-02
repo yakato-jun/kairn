@@ -18,13 +18,22 @@ def _state_home(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture
-def conf(tmp_path: Path) -> cfg.Config:
-    """一時ディレクトリに閉じた設定: ワークスペース acme、remote my-drive（架空）。"""
+def conf(tmp_path: Path, monkeypatch) -> cfg.Config:
+    """一時ディレクトリに閉じた設定: ワークスペース acme、remote my-drive（架空）。
+    DATA_ROOT も同じ一時ディレクトリに向ける: ConfigHolder が conf.path から読み直した Config の Workspace は data_root を持たず
+    DATA_ROOT を見るので、読み直し後も実データ（workspaces/）に触れない。"""
     data_root = tmp_path / "data"
+    monkeypatch.setattr(cfg, "DATA_ROOT", data_root)
     ws = cfg.Workspace(name="acme", description="fixture", data_root=data_root)
     ws.cases_dir.mkdir(parents=True)
     return cfg.Config(remote="my-drive", drive_root="ws", extract_agent="claude", rules=dict(cfg.DEFAULT_RULES),
                       workspaces={"acme": ws}, path=tmp_path / "config.yaml")
+
+
+def bump_mtime(path: Path) -> None:
+    """ファイルの mtime を +1 秒進める（ConfigHolder の更新検知をテストで決定的にする: 連続した書き込みが同じ mtime 粒度に収まっても変更と分かる）。"""
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
 
 
 class FakeDrive:

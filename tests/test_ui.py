@@ -8,6 +8,7 @@ from starlette.testclient import TestClient
 from kairn.jobs import JobTable
 from kairn.store import CaseStore
 from kairn.ui import STALE_DAYS, build_ui, case_freshness, task_freshness
+from tests.conftest import bump_mtime
 
 
 def _seed(conf):
@@ -175,9 +176,11 @@ def test_case_page_shows_running_jobs(conf):
 
 
 def test_settings_page_shows_and_edits_rules(conf):
-    """/ui/settings: rules の現在値を表示し、フォームの POST で検証・保存する（CLI の kairn rules と同じ操作）。一覧のヘッダにリンク。"""
+    """/ui/settings: rules の現在値を表示し、フォームの POST で検証・保存する（CLI の kairn rules と同じ操作）。一覧のヘッダにリンク。
+    保存後の値は holder.current()（次のリクエストで読み直された Config）にも入る。"""
     from kairn import config as cfg
-    c = TestClient(build_ui(conf))
+    holder = cfg.ConfigHolder(conf)
+    c = TestClient(build_ui(holder))
     assert "href='/ui/settings'" in c.get("/ui").text
     page = c.get("/ui/settings").text
     assert "raw_data.min_size" in page and "50M" in page and "14d" in page and "target/**" in page and "<code>bag</code>" in page and str(conf.path) in page
@@ -197,12 +200,12 @@ def test_settings_page_shows_and_edits_rules(conf):
     assert "mcap" in cfg.load(conf.path).rules["raw_data"]["extensions"]
     assert c.post("/ui/settings/remove-raw-ext", data={"ext": "mcap"}, follow_redirects=False).status_code == 303
     assert c.post("/ui/settings/set", data={"key": "bwlimit", "value": "4M"}, follow_redirects=False).status_code == 303
-    assert cfg.load(conf.path).rules["bwlimit"] == "4M" and conf.rules["bwlimit"] == "4M"     # 実行中のプロセスの conf にも反映
+    assert cfg.load(conf.path).rules["bwlimit"] == "4M" and holder.current().rules["bwlimit"] == "4M"     # 実行中のプロセスの設定にも反映
     # rclone_flags: 表示・保存・拒否・空で既定に戻す
     assert "rclone_flags" in c.get("/ui/settings").text and "--drive-pacer-burst 200" in c.get("/ui/settings").text   # 推奨例のヒント
     r = c.post("/ui/settings/set", data={"key": "rclone_flags", "value": "--transfers 8 --checkers 16"}, follow_redirects=False)
     assert r.status_code == 303 and "rclone_flags%20%3D%20--transfers%208%20--checkers%2016" in r.headers["location"]
-    assert cfg.load(conf.path).rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"] and conf.rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"]
+    assert cfg.load(conf.path).rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"] and holder.current().rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"]
     assert "<code>--transfers 8 --checkers 16</code>" in c.get("/ui/settings").text
     assert c.post("/ui/settings/set", data={"key": "rclone_flags", "value": "-v"}, follow_redirects=False).status_code == 400
     assert cfg.load(conf.path).rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"]
@@ -280,3 +283,36 @@ def test_index_shows_drive_state_and_refresh_button(conf, fake_drive, monkeypatc
     assert "acme: drive unavailable" in page and "Drive の方が新しい" in page and fetched == ["CASE-123"]
     assert c.post("/ui/refresh", data={"ws": "nowhere"}, follow_redirects=False).status_code == 404
     assert c.post("/ui/refresh", data={"ws": "acme"}, headers={"Origin": "http://evil.example"}, follow_redirects=False).status_code == 403
+
+
+def test_ui_reads_config_changes_without_restart(conf):
+    """常駐中に config.yaml が変わる（別プロセスの CLI: ws create / attach / rules …、または UI の設定ページ）→ 再起動なしで次のリクエストから反映。
+    一覧・案件ページは新しいワークスペースを認識し、設定ページは新しい rules を出す。壊れた設定に書き換わっても直前の設定で動き続ける。"""
+    from kairn import config as cfg
+    _seed(conf)
+    conf.save()
+    holder = cfg.ConfigHolder(conf, warn=lambda m: None)
+    c = TestClient(build_ui(holder))
+    assert "CASE-123" in c.get("/ui").text and c.get("/ui/beta/CASE-7").status_code == 404
+    # 別プロセスの `kairn ws create beta` 相当: ファイルから読み直した Config に足して保存（このプロセスの holder は知らない）
+    other = cfg.load(conf.path)
+    other.workspaces["beta"] = cfg.Workspace(name="beta", description="second")
+    other.save(); bump_mtime(conf.path)
+    st = CaseStore(other.workspaces["beta"].cases_dir)
+    st.create_case("CASE-7", "beta の案件", "beta", actor="human")
+    page = c.get("/ui").text
+    assert "CASE-7" in page and "beta の案件" in page and "CASE-123" in page
+    assert c.get("/ui/beta/CASE-7").status_code == 200 and holder.reloads == 1
+    assert c.post("/ui/beta/CASE-7/comment", data={"note": "hello"}, follow_redirects=False).status_code == 303
+    assert st.events("CASE-7")[-1]["note"] == "hello"
+    # 別プロセスの `kairn rules add-exclude` 相当 → 設定ページに出る。UI の設定ページで保存 → 直後の設定ページ・一覧に反映
+    cfg.add_exclude(cfg.load(conf.path), "logs/**"); bump_mtime(conf.path)
+    assert "<code>logs/**</code>" in c.get("/ui/settings").text and holder.reloads == 2
+    r = c.post("/ui/settings/set", data={"key": "raw_data.min_size", "value": "10M"}, follow_redirects=False)
+    assert r.status_code == 303
+    assert "value='10M'" in c.get("/ui/settings").text and "<code>logs/**</code>" in c.get("/ui/settings").text   # 直前の変更も失っていない
+    assert holder.current().rules["raw_data"]["min_size"] == "10M" and "logs/**" in holder.current().rules["exclude"]
+    assert "CASE-7" in c.get("/ui").text
+    # 壊れた設定に書き換わっても UI は直前の設定で動き続ける
+    conf.path.write_text("drive: {remote: [broken\n", encoding="utf-8"); bump_mtime(conf.path)
+    assert c.get("/ui/beta/CASE-7").status_code == 200 and "logs/**" in c.get("/ui/settings").text

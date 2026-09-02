@@ -3,6 +3,9 @@
 - MCP: streamable HTTP  /mcp   （mcp 2.x: mcp.server.mcpserver.MCPServer）
 - UI : /ui                      （kairn/ui.py。Mount ではなく同じ Starlette にルートを直接載せる）
 規則の実体は store（証拠必須・superseded 自動化）。ここでは引数を検証して委譲する。
+設定は cfg.ConfigHolder（MCP と UI で共有）から各ツールの入口で holder.current() として取る: config.yaml が変わっていれば
+そこで読み直されるので、CLI（ws create / attach / rules …）や UI の設定ページの変更は再起動なしで次の呼び出しから効く。
+1 回の呼び出しの間は入口で取った Config を使い、ジョブ（jobs.submit のクロージャ）は投入時点の Config を使う。
 ツール内の失敗は ToolError で返す（呼び出し元のエージェントに理由が文章で届く）。
 rclone の転送（checkin、open_case の取り寄せ）はジョブ（kairn/jobs.py、デーモンスレッド）にして job_id を返す
 （大きな案件で MCP クライアントの呼び出しタイムアウトに当たらないため）。状態は job_status で見る。
@@ -54,14 +57,16 @@ def _fail(e: Exception) -> ToolError:
     return ToolError(f"{type(e).__name__}: {e}")
 
 
-def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTable | None = None,
+def create_server(conf: cfg.Config | cfg.ConfigHolder, default_agent: str = "unknown", jobs: JobTable | None = None,
                   fetch_wait_sec: float = FETCH_WAIT_SEC) -> MCPServer:
     """設定に閉じた MCP サーバーを作る（テストでは in-process の Client から直接繋ぐ）。
+    conf は ConfigHolder（build_app が UI と共有する）か Config（専用の holder に包む）。各ツールは入口で holder.current() を取る。
     jobs は checkin / 取り寄せのジョブ表（UI と共有する。省略時は専用に作る）。fetch_wait_sec は open_case が取り寄せを待つ上限秒。"""
     mcp = MCPServer("kairn", instructions=INSTRUCTIONS, version="0.0.1")
     jobs = jobs if jobs is not None else JobTable()
+    holder = conf if isinstance(conf, cfg.ConfigHolder) else cfg.ConfigHolder(conf)
 
-    def _ws(workspace: str | None, case: str | None = None) -> cfg.Workspace:
+    def _ws(conf: cfg.Config, workspace: str | None, case: str | None = None) -> cfg.Workspace:
         if case is not None:  # ファイルシステムに触れる前に案件 ID を検証する（"../x" 等）
             try:
                 validate_case_id(case)
@@ -84,7 +89,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     def _store(ws: cfg.Workspace) -> CaseStore:
         return CaseStore(ws.cases_dir)
 
-    def _index(ws: cfg.Workspace) -> Index:
+    def _index(conf: cfg.Config, ws: cfg.Workspace) -> Index:
         ix = Index(ws.index_dir, ws.cases_dir, conf.rules.get("exclude"))
         ix.rebuild()  # 差分のみ
         return ix
@@ -95,7 +100,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     @mcp.tool()
     def open_case(case: str, workspace: str | None = None, agent: str = "") -> dict[str, Any]:
         """案件を開く: case / 最新計画 / open タスク / 直近イベント / 人からの差し戻し・コメント / 関連案件 / worklog 末尾 を 1 回で返す（available=true）。drive: Drive の版マーカー（.rev/）と rev を比べ、同じなら up_to_date=true（取り寄せ省略）、違えば取り寄せて fetched=true（20 秒で間に合わなければ job_id）。ローカルに無く Drive から取り寄せ中なら available=false, status=fetching, job_id（エラーではない。job_status が done になってから再実行）。取り寄せが失敗していれば status=failed, error。"""
-        ws = _ws(workspace, case); st = _store(ws)
+        conf = holder.current(); ws = _ws(conf, workspace, case); st = _store(ws)
         try:
             st.case_dir(case)  # ID の検証（Drive 取り寄せの前）
             # 順序: ワークスペース解決 → Drive の版マーカーの rev を比較 → 違えば取り寄せジョブ（events.jsonl はマージ、他は --update）を起動して
@@ -141,7 +146,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     def list_cases(workspace: str | None = None, status: str = "open", query: str = "") -> list[dict[str, Any]]:
         """案件一覧（進捗 done/全・最終イベント・Drive との同期状態付き）。status: open|closed|suspended|all。query は id/title の部分一致。drive.state: synced|drive_newer|local_changes|unknown（直近に読んだ Drive の版マーカーのキャッシュとの比較。checked は全案件を読んだ時刻）。"""
         from . import sync
-        ws = _ws(workspace); st = _store(ws)
+        ws = _ws(holder.current(), workspace); st = _store(ws)
         cache = sync.load_drive_revs_cache(ws)
         revs = cache["revs"] if cache else None
         out = []
@@ -161,7 +166,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     def plan(case: str, objective: str, tasks: list[dict[str, Any]], reason: str,
              workspace: str | None = None, agent: str = "") -> dict[str, Any]:
         """計画の新版を作る。tasks: [{title, owner?: ai|human, carried_from?: "T012"}]。新版に無い open タスクは superseded になる。版番号は自動。"""
-        ws = _ws(workspace, case)
+        ws = _ws(holder.current(), workspace, case)
         try:
             return _store(ws).new_plan_version(case, objective, tasks, reason, actor="ai", agent=_agent(agent))
         except Exception as e:
@@ -171,7 +176,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     def update_task(case: str, task: str, status: str, evidence: list[dict[str, Any]] | None = None, note: str = "",
                     workspace: str | None = None, agent: str = "") -> dict[str, Any]:
         """タスク状態の更新＋event 追記。status: open|doing|blocked|done|dropped。done は evidence 必須: [{type: commit|pr|file|test|url, ...}]。存在しない task は拒否。"""
-        ws = _ws(workspace, case)
+        ws = _ws(holder.current(), workspace, case)
         try:
             return _store(ws).set_task_status(case, task, status, evidence, note, actor="ai", agent=_agent(agent))
         except Exception as e:
@@ -183,7 +188,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
         """進捗・決定・コメントを追記する（actor=ai と agent を自動付与）。action: progress|decision|comment"""
         if action not in ("progress", "decision", "comment"):
             raise ToolError("action must be progress | decision | comment")
-        ws = _ws(workspace, case)
+        ws = _ws(holder.current(), workspace, case)
         try:
             _store(ws).load_case(case)
             return _store(ws).append_event(case, {"actor": "ai", "agent": _agent(agent), "action": action, "note": note,
@@ -197,7 +202,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
         if not isinstance(instruction, str) or not instruction.strip():
             raise ToolError("instruction is required: pass the person's own words that asked for this status change "
                             "(closing, suspending or reopening a case is a human decision; do not call this on the AI's own judgement)")
-        ws = _ws(workspace, case); st = _store(ws)
+        ws = _ws(holder.current(), workspace, case); st = _store(ws)
         try:
             r = st.set_case_status(case, status, actor="ai", agent=_agent(agent), note=instruction.strip())
             return {"case": case, "status": r["case"]["status"], "previous_status": r["previous_status"], "changed": r["changed"],
@@ -209,7 +214,8 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     def search(query: str, cases: list[str] | None = None, workspace: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
         """worklog 等の `## ` 節単位の全文検索（ワークスペース内のみ）。結果の file/heading で本文を特定できる。"""
         try:
-            return _index(_ws(workspace)).search_sections(query, cases, limit)
+            conf = holder.current()
+            return _index(conf, _ws(conf, workspace)).search_sections(query, cases, limit)
         except Exception as e:
             raise _fail(e) from e
 
@@ -217,7 +223,8 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     def find_cases(query: str, workspace: str | None = None, k: int = 5) -> list[dict[str, Any]]:
         """問いに関係する案件を理由付きで上位 k 件（案件カード＋全文の複合）。案件を選ぶのは人。"""
         try:
-            return _index(_ws(workspace)).find_cases(query, k)
+            conf = holder.current()
+            return _index(conf, _ws(conf, workspace)).find_cases(query, k)
         except Exception as e:
             raise _fail(e) from e
 
@@ -225,12 +232,13 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     def checkin(case: str, workspace: str | None = None, agent: str = "") -> dict[str, Any]:
         """ローカルの案件を Drive（設定済み remote）に戻すジョブを起動し、即座に {job_id, status, note} を返す。完了は job_status(job_id) が done になったとき（result に従来の結果と last_checkin_at）。同じ案件の checkin が走っていればその job_id を返す。"""
         from . import sync
-        ws = _ws(workspace, case); st = _store(ws)
+        conf = holder.current(); ws = _ws(conf, workspace, case); st = _store(ws)
         try:
             st.load_case(case)
         except Exception as e:
             raise _fail(e) from e
         agent_name = _agent(agent)
+        # ジョブは投入時点の conf（この呼び出しで取ったもの）を使う: 走っている間に設定が変わっても途中で入れ替わらない
         job, created = jobs.submit("checkin", ws.name, case, lambda progress: sync.checkin_job(conf, ws, case, agent_name, progress))
         note = (("checkin queued behind another job for this case (jobs for one case run one at a time); poll job_status(job_id) until status is done (or failed: see error)"
                  if job.status == "queued" else "checkin started in the background; poll job_status(job_id) until status is done (or failed: see error)")
@@ -250,7 +258,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     def extract_card(case: str, workspace: str | None = None) -> dict[str, Any]:
         """文脈隔離した子エージェント（設定 extract.agent）で case.json の下書きを作る。読み取り専用・書き込まない。失敗は ok=False と error で返す（is_error にしない）。"""
         from . import extract
-        ws = _ws(workspace, case)
+        conf = holder.current(); ws = _ws(conf, workspace, case)
         try:
             return extract.extract_card(conf, ws, case)
         except Exception as e:
@@ -261,7 +269,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
         """Drive 上のファイル一覧（drive-index.txt）を正規表現で検索する（生データの所在）。"""
         from . import sync
         try:
-            return sync.grep_drive_index(_ws(workspace), pattern, limit)
+            return sync.grep_drive_index(_ws(holder.current(), workspace), pattern, limit)
         except Exception as e:
             raise _fail(e) from e
 
@@ -316,11 +324,13 @@ def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, st: CaseStore, case: 
                      else "a fetch for this case is already running; this result is the current local copy. open_case again after job_status(job_id) reports done")}
 
 
-def build_app(conf: cfg.Config, host: str = "127.0.0.1", default_agent: str = "unknown") -> Starlette:
-    """UI（/ui…）と MCP（/mcp）を 1 つの Starlette に載せる。/ は /ui へ。"""
+def build_app(conf: cfg.Config | cfg.ConfigHolder, host: str = "127.0.0.1", default_agent: str = "unknown") -> Starlette:
+    """UI（/ui…）と MCP（/mcp）を 1 つの Starlette に載せる。/ は /ui へ。設定は 1 つの ConfigHolder を MCP と UI で共有する
+    （config.yaml の変更はどちらの入口でも次のリクエストから効く）。"""
     from .ui import ui_routes
     jobs = JobTable()  # MCP と UI で共有（UI は案件ページに進行中のジョブを出す）
-    mcp = create_server(conf, default_agent, jobs)
+    holder = conf if isinstance(conf, cfg.ConfigHolder) else cfg.ConfigHolder(conf)
+    mcp = create_server(holder, default_agent, jobs)
     mcp_app = mcp.streamable_http_app(streamable_http_path=MCP_PATH, host=host)
 
     @contextlib.asynccontextmanager
@@ -328,11 +338,12 @@ def build_app(conf: cfg.Config, host: str = "127.0.0.1", default_agent: str = "u
         async with mcp.session_manager.run():
             yield
 
-    routes = [Route("/", lambda r: RedirectResponse(UI_PATH)), *ui_routes(conf, UI_PATH, jobs),
+    routes = [Route("/", lambda r: RedirectResponse(UI_PATH)), *ui_routes(holder, UI_PATH, jobs),
               Mount("/", app=mcp_app)]  # Mount は残り全部を受けるので最後
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.mcp = mcp
     app.state.jobs = jobs
+    app.state.config = holder
     return app
 
 

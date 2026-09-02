@@ -348,7 +348,7 @@ def _warn(msg: str) -> None:
 
 class ConfigHolder:
     """常駐プロセスの設定の置き場（kairn serve。MCP と UI で 1 つを共有）。
-    current() を呼ぶたびに config.yaml を os.stat し、(mtime_ns, size) が前回と違えば loader（既定 load）で読み直して差し替える。
+    current() を呼ぶたびに config.yaml を os.stat し、(mtime_ns, size, inode) が前回と違えば loader（既定 load）で読み直して差し替える。
     読み直しに失敗したら直前の Config を維持し、warn に 1 行出す（同じ内容のファイルに対して繰り返し警告しない: 失敗した版の
     stat を記録し、次に変わったときにまた試す）。ファイルが消えた（stat 失敗）ときも同様。
     current() が返す Config はその呼び出し以降は書き換えないので、呼び出し側は 1 リクエストの間それを使い続けてよい
@@ -367,12 +367,13 @@ class ConfigHolder:
     def path(self) -> Path:
         return self._path
 
-    def _stat(self) -> tuple[int, int] | None:
+    def _stat(self) -> tuple[int, int, int] | None:
+        """(mtime_ns, size, inode)。Config.save() は一時ファイルを os.replace するので inode も変わり、mtime の粒度に隠れない。"""
         try:
             st = os.stat(self._path)
         except OSError:
             return None
-        return (st.st_mtime_ns, st.st_size)
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
 
     def current(self) -> Config:
         """今の設定。config.yaml が変わっていれば読み直してから返す（変わっていなければ stat 1 回だけ）。"""

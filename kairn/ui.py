@@ -2,6 +2,8 @@
 
 ルートは Mount ではなく `ui_routes(conf, prefix)` で外側のアプリに直接載せる
 （Mount 配下の "/" は末尾スラッシュ無しの /ui で 404 になるため）。
+設定は cfg.ConfigHolder（MCP と共有）から各ハンドラの入口で holder.current() として取る（config.yaml が変わっていればそこで
+読み直される）。設定ページの保存は受け取った Config を書いて config.yaml に保存し、次のリクエストで新しい Config に置き換わる。
 人の操作はすべて event として記録され、AI は次の open_case で human_feedback として受け取る。
 """
 from __future__ import annotations
@@ -88,15 +90,17 @@ def _age(f: dict | None) -> str:
     return f"<span class='{cls}'>{f['days']}d{' ⚠' if f['stale'] else ''}</span>"
 
 
-def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = None) -> list[Route]:
-    """jobs: MCP と共有するジョブ表（進行中の checkin / 取り寄せを案件ページに出す。None なら表示しない）。"""
+def ui_routes(conf: cfg.Config | cfg.ConfigHolder, prefix: str = "/ui", jobs: JobTable | None = None) -> list[Route]:
+    """conf: ConfigHolder（server.build_app が MCP と共有する）か Config（専用の holder に包む）。
+    jobs: MCP と共有するジョブ表（進行中の checkin / 取り寄せを案件ページに出す。None なら表示しない）。"""
     P = prefix.rstrip("/")
+    holder = conf if isinstance(conf, cfg.ConfigHolder) else cfg.ConfigHolder(conf)
 
     def _page(title: str, body: str) -> HTMLResponse:
         return HTMLResponse(f"<!doctype html><meta charset='utf-8'><title>kairn – {_esc(title)}</title><style>{CSS}</style>"
                             f"<header><a href='{P}'>kairn</a> {_esc(title)} <a class='right' href='{P}/settings'>設定</a></header><main>{body}</main>")
 
-    def _ws(name: str) -> cfg.Workspace:
+    def _ws(conf: cfg.Config, name: str) -> cfg.Workspace:
         if name not in conf.workspaces:
             raise KeyError(name)
         return conf.workspaces[name]
@@ -112,7 +116,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
             status = "open"
         rows = []
         checked: dict[str, str | None] = {}   # ws → 版マーカーのキャッシュで全案件を読んだ時刻（無ければ None）
-        for ws in conf.workspaces.values():
+        for ws in holder.current().workspaces.values():
             if want_ws and ws.name != want_ws:
                 continue
             st = CaseStore(ws.cases_dir)
@@ -158,6 +162,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
             return PlainTextResponse("forbidden: cross-site request", status_code=403)
         form = await req.form()
         want = str(form.get("ws", ""))
+        conf = holder.current()
         targets = [w for w in conf.workspaces.values() if not want or w.name == want]
         if want and not targets:
             return PlainTextResponse("not found", status_code=404)
@@ -170,8 +175,9 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
         return RedirectResponse(f"{P}?{'ws=' + quote(want, safe='') + '&' if want else ''}refreshed={quote(', '.join(results), safe='')}", status_code=303)
 
     async def case_page(req: Request) -> Response:
+        conf = holder.current()
         try:
-            ws = _ws(req.path_params["ws"])
+            ws = _ws(conf, req.path_params["ws"])
             cid = req.path_params["case"]; st = CaseStore(ws.cases_dir)
             c = st.load_case(cid)
         except (KeyError, ValueError):  # 未知のワークスペース／案件、不正な案件 ID
@@ -246,6 +252,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
 
     async def settings(req: Request) -> Response:
         """rules の現在値と編集フォーム（docs/ui.md「設定」）。保存後は ?saved=<メッセージ> で戻ってくる。"""
+        conf = holder.current()
         v = cfg.rules_view(conf)
         message = req.query_params.get("saved") or ""
         note = f"<p class='ok'>{_esc(message)}</p>" if message else ""
@@ -281,6 +288,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
             return PlainTextResponse("forbidden: cross-site request", status_code=403)
         op = req.path_params["op"]
         form = await req.form()
+        conf = holder.current()   # set_rule / add_exclude … はこの Config を書いて保存する。次のリクエストで読み直される
         try:
             if op == "set":
                 key = str(form.get("key", "")); out = cfg.set_rule(conf, key, str(form.get("value", "")))
@@ -302,8 +310,9 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
     async def act(req: Request) -> Response:
         if not same_origin(req):
             return PlainTextResponse("forbidden: cross-site request", status_code=403)
+        conf = holder.current()
         try:
-            ws = _ws(req.path_params["ws"])
+            ws = _ws(conf, req.path_params["ws"])
             cid = req.path_params["case"]; kind = req.path_params["kind"]
             st = CaseStore(ws.cases_dir); st.load_case(cid)
         except (KeyError, ValueError):
@@ -423,6 +432,6 @@ def _evidence(e: object) -> str:
     return str(e)
 
 
-def build_ui(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = None) -> Starlette:
+def build_ui(conf: cfg.Config | cfg.ConfigHolder, prefix: str = "/ui", jobs: JobTable | None = None) -> Starlette:
     """UI 単体のアプリ（テスト用）。本番は server.build_app が同じルートを /mcp と同居させる。"""
     return Starlette(routes=ui_routes(conf, prefix, jobs))

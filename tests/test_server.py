@@ -14,6 +14,7 @@ from kairn import server as srv
 from kairn import sync
 from kairn.jobs import JobTable
 from kairn.store import CaseStore
+from tests.conftest import bump_mtime
 
 TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "set_case_status", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status"}
 
@@ -868,4 +869,99 @@ def test_set_case_status_transitions_via_mcp(conf):
             st.set_task_status("CASE-1", "T002", "dropped", [], "", actor="ai")
             r = await c.call_tool("set_case_status", {"case": "CASE-1", "status": "closed", "instruction": "閉じて"})
             assert r.structured_content["open_tasks"] == 0 and r.structured_content["changed"] is True
+    run(main)
+
+
+# ---------- 設定のホットリロード（ConfigHolder）: serve 起動後の config.yaml の変更が再起動なしで MCP に効く ----------
+
+def test_mcp_sees_workspace_added_to_config_after_start(conf, jobs, fake_drive):
+    """serve 起動後に別プロセス（kairn ws create / attach）が config.yaml にワークスペースを足す → list_cases(workspace=新 ws) / open_case が
+    unknown workspace にならず認識する。変更が無ければ読み直さない。壊れた設定に書き換わっても直前の設定で動き続ける。"""
+    from kairn import config as cfg
+    conf.save()
+    warnings = []
+    holder = cfg.ConfigHolder(conf, warn=warnings.append)
+    CaseStore(conf.workspaces["acme"].cases_dir).create_case("CASE-1", "t", "acme", actor="human")
+    mcp = srv.create_server(holder, jobs=jobs)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("list_cases", {"workspace": "beta"})
+            assert r.is_error and "unknown workspace 'beta'" in r.content[0].text
+            assert (await c.call_tool("list_cases", {})).structured_content["result"][0]["case"] == "CASE-1" and holder.reloads == 0
+            # 別プロセスがワークスペースを足す（このプロセスの conf オブジェクトには触れない）
+            other = cfg.load(conf.path)
+            other.workspaces["beta"] = cfg.Workspace(name="beta", description="second")
+            other.save(); bump_mtime(conf.path)
+            bst = CaseStore(other.workspaces["beta"].cases_dir)
+            bst.create_case("CASE-7", "beta の案件", "beta", actor="human")
+            r = await c.call_tool("list_cases", {"workspace": "beta"})
+            assert not r.is_error, r.content
+            assert [x["case"] for x in r.structured_content["result"]] == ["CASE-7"] and holder.reloads == 1
+            # 複数ワークスペースになったので workspace 省略は案件 ID から解決する（CASE-7 は beta にだけある）
+            r = await c.call_tool("open_case", {"case": "CASE-7"})
+            assert not r.is_error, r.content
+            oc = r.structured_content
+            assert oc["available"] is True and oc["case"]["title"] == "beta の案件" and oc["paths"]["case_dir"] == str(bst.cases_dir / "CASE-7")
+            r = await c.call_tool("list_cases", {})
+            assert r.is_error and "workspace is required" in r.content[0].text
+            assert holder.reloads == 1 and warnings == []
+            # 壊れた設定に書き換わっても直前の設定で動く（警告 1 行）
+            conf.path.write_text("drive: {remote: [broken\n", encoding="utf-8"); bump_mtime(conf.path)
+            r = await c.call_tool("open_case", {"case": "CASE-7"})
+            assert not r.is_error and r.structured_content["case"]["id"] == "CASE-7"
+            assert holder.reloads == 1 and len(warnings) == 1 and "could not be reloaded" in warnings[0]
+            r = await c.call_tool("list_cases", {"workspace": "beta"})
+            assert not r.is_error and len(warnings) == 1
+    run(main)
+
+
+def test_mcp_checkin_uses_rclone_flags_set_after_start(conf, monkeypatch, jobs):
+    """serve 起動後に `kairn rules set rclone_flags …` した → 次の checkin ジョブの rclone 引数に付く。ジョブは投入時点の設定を使う。
+    rclone は subprocess の層（run / Popen）で偽装し、sync.checkin 本体を通す。"""
+    import subprocess
+    from kairn import config as cfg
+    conf.save()
+    holder = cfg.ConfigHolder(conf)
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    cmds = []
+
+    def fake_run(cmd, **kw):   # progress 無し（events.jsonl の copyto、版マーカーの lsf 等）: Drive に無い → 失敗させる（マージは飛ぶ）
+        cmds.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 3, "", "object not found")
+
+    class FakePopen:           # progress 付き（転送本体）: 1 行出して成功
+        def __init__(self, cmd, **kw):
+            cmds.append(list(cmd)); self.returncode = 0
+            self.stdout = iter(["Transferred: 1 / 1, 100%\n"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+    monkeypatch.setattr(sync.subprocess, "Popen", FakePopen)
+    mcp = srv.create_server(holder, jobs=jobs)
+
+    def transfer_cmds():
+        return [c for c in cmds if c[:2] == ["rclone", "sync"]]
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            js = await _checkin(c, jobs, "CASE-1")
+            assert js["status"] == "done", js
+            assert len(transfer_cmds()) == 1 and "--transfers" in transfer_cmds()[0] and "--checkers" not in transfer_cmds()[0]
+            # 別プロセスの `kairn rules set rclone_flags "--checkers 16 --drive-pacer-burst 200"` 相当
+            cfg.set_rule(cfg.load(conf.path), "rclone_flags", "--checkers 16 --drive-pacer-burst 200"); bump_mtime(conf.path)
+            js = await _checkin(c, jobs, "CASE-1")
+            assert js["status"] == "done", js
+            cmd = transfer_cmds()[1]
+            assert cmd[-4:] == ["--checkers", "16", "--drive-pacer-burst", "200"] and holder.reloads == 1
+            # 空に戻す → 付かない
+            cfg.set_rule(cfg.load(conf.path), "rclone_flags", ""); bump_mtime(conf.path)
+            js = await _checkin(c, jobs, "CASE-1")
+            assert js["status"] == "done" and "--checkers" not in transfer_cmds()[2] and holder.reloads == 2
     run(main)
