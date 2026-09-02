@@ -85,7 +85,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
         return CaseStore(ws.cases_dir)
 
     def _index(ws: cfg.Workspace) -> Index:
-        ix = Index(ws.index_dir, ws.cases_dir)
+        ix = Index(ws.index_dir, ws.cases_dir, conf.rules.get("exclude"))
         ix.rebuild()  # 差分のみ
         return ix
 

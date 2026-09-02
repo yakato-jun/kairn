@@ -193,11 +193,11 @@ def cmd_sync(a):
         if a.dry_run:
             print("(dry-run: index not rebuilt)")
         else:
-            print(Index(ws.index_dir, ws.cases_dir).rebuild())
+            print(Index(ws.index_dir, ws.cases_dir, conf.rules.get("exclude")).rebuild())
     elif a.cmd == "checkin":
         print(sync.checkin(conf, ws, a.case, dry=a.dry_run))
     elif a.cmd == "index":
-        print(Index(ws.index_dir, ws.cases_dir).rebuild(full=a.full))
+        print(Index(ws.index_dir, ws.cases_dir, conf.rules.get("exclude")).rebuild(full=a.full))
     elif a.cmd == "drive-index":
         print(sync.drive_index(conf, ws))
     elif a.cmd == "bag2zst":

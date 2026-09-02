@@ -2,6 +2,10 @@
 
 - sections: worklog*.md / *.md を `## ` 見出し単位に分割して全文検索
 - cases:    case.json の title / tickets / related / elements を検索用に平坦化
+
+索引しないもの（同期と同じ規則）: シンボリックリンク、rules.exclude のディレクトリ・ファイル（既定は config.DEFAULT_RULES。
+`.git/**` を含む。Index(exclude=…) に conf.rules["exclude"] を渡す）、作業領域（直下に .git ファイル / .kairn-nosync がある
+ディレクトリ。sync.is_workarea）の配下。
 """
 from __future__ import annotations
 
@@ -11,7 +15,9 @@ import re
 import sqlite3
 from pathlib import Path
 
+from .config import DEFAULT_RULES
 from .store import CaseStore
+from .sync import excluded_dir, excluded_file, is_workarea
 
 SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS sections USING fts5(case_id, file, heading, body, tokenize='trigram');
@@ -32,22 +38,24 @@ def split_sections(text: str) -> list[tuple[str, str]]:
 
 
 class Index:
-    def __init__(self, index_dir: Path, cases_dir: Path):
+    def __init__(self, index_dir: Path, cases_dir: Path, exclude: list[str] | None = None):
         index_dir.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(index_dir / "kairn.sqlite")
         self.db.executescript(SCHEMA)
         self.cases_dir = cases_dir
         self.store = CaseStore(cases_dir)
+        self.exclude = [str(x) for x in (DEFAULT_RULES["exclude"] if exclude is None else exclude)]
 
     def _md_files(self):
-        """索引対象の md。シンボリックリンク（同期対象外・壊れていることがある）と生成物ディレクトリは除く。"""
-        skip = {"target", "build", "node_modules", ".venv", "__pycache__"}
+        """索引対象の md。シンボリックリンク（同期対象外・壊れていることがある）、rules.exclude のディレクトリ（target/** 等）・
+        ファイル、作業領域（直下に .git ファイル / .kairn-nosync）の配下は除く（同期のフィルタと同じ規則）。"""
         if not self.cases_dir.exists():
             return
         for root, dirs, files in os.walk(self.cases_dir):
-            dirs[:] = [d for d in dirs if d not in skip and not os.path.islink(os.path.join(root, d))]
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d)) and not excluded_dir(d, self.exclude)
+                       and not is_workarea(Path(root) / d)]
             for fn in files:
-                if fn.endswith(".md") and not os.path.islink(os.path.join(root, fn)):
+                if fn.endswith(".md") and not os.path.islink(os.path.join(root, fn)) and not excluded_file(fn, self.exclude):
                     yield Path(root) / fn
 
     def rebuild(self, full: bool = False) -> dict:

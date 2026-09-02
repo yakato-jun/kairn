@@ -927,7 +927,7 @@ def daily(conf: Config, ws: Workspace, dry: bool = False) -> dict:
         ("checkin", lambda: checkin(conf, ws, dry=dry)),
         ("raw_move", lambda: raw_move(conf, ws, dry=dry)),
         ("drive_index", lambda: str(drive_index(conf, ws, dry=dry)) + (" (dry-run: not written)" if dry else "")),
-        ("index", lambda: "skipped (dry-run: index not rebuilt)" if dry else Index(ws.index_dir, ws.cases_dir).rebuild()),
+        ("index", lambda: "skipped (dry-run: index not rebuilt)" if dry else Index(ws.index_dir, ws.cases_dir, conf.rules.get("exclude")).rebuild()),
     ]
     out: dict = {"workspace": ws.name, "started": now_iso(), "dry": dry, "ok": True, "steps": {}}
 

@@ -31,3 +31,25 @@ def test_short_terms_fall_back_to_like(tmp_path):
     assert ix.find_cases("zz") == [] and ix.find_cases("") == []
     assert [r["case"] for r in ix.search_sections("C1")] == ["C1-widget", "C1-widget"]  # 節は case_id でも当たる
     assert ix.search_sections("zz") == []
+
+
+def test_index_skips_workareas_and_excluded_dirs(tmp_path):
+    """直下に .git ファイル（worktree）/ .kairn-nosync があるディレクトリの配下と、rules.exclude の既定（.git/** / target/** 等）は
+    索引しない。案件直下の worklog.md と clone/（.git がディレクトリ）の md は索引する。"""
+    cases = tmp_path / "cases"; st = CaseStore(cases)
+    st.create_case("CASE-1", "workarea", "acme", actor="human")
+    case = cases / "CASE-1"
+
+    def md(rel: str, word: str):
+        p = case / rel; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(f"# t\n## Notes\n{word} unique\n", encoding="utf-8")
+    md("worklog.md", "alphakeep"); md("wt/src/a.md", "betawt"); md("scratch/b.md", "gammascratch"); md("clone/c.md", "deltaclone")
+    md("clone/.git/notes.md", "epsilongit"); md("target/doc.md", "zetatarget")
+    (case / "wt" / ".git").write_text("gitdir: /elsewhere\n"); (case / "scratch" / ".kairn-nosync").touch(); (case / "clone" / ".git" / "HEAD").write_text("ref: x\n")
+    ix = Index(tmp_path / "index", cases)
+    assert ix.rebuild()["files_indexed"] == 2
+    assert sorted(r["file"] for r in ix.search_sections("unique")) == ["CASE-1/clone/c.md", "CASE-1/worklog.md"]
+    for word in ("betawt", "gammascratch", "epsilongit", "zetatarget"):
+        assert ix.search_sections(word) == [], word
+    assert ix.search_sections("alphakeep") and ix.search_sections("deltaclone")
+    ix2 = Index(tmp_path / "index2", cases, exclude=[])                      # rules.exclude が空なら target/ と .git/ の md も索引する
+    assert ix2.rebuild()["files_indexed"] == 4 and ix2.search_sections("zetatarget") and ix2.search_sections("betawt") == []
