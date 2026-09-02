@@ -7,6 +7,9 @@ MCP が呼ぶ規則の実体はここ（エージェントの文章には頼ら�
 - すべての変更は events.jsonl に追記する（追記専用。checkout / checkin で Drive 版と行の和集合にマージされる: kairn/sync.py）
 - open_case の閲覧記録は events.jsonl ではなく index/access.log（append_access_log。ローカルのみ、同期対象外）に書く。
   閲覧だけで events.jsonl に差分を作らないため（複数環境の events をマージする前提）
+- ワークスペースをまたぐ参照（docs/data-model.md「跨ぎ参照」）: 対象側の access.log には cross_from=<ws>/<case> を添え、参照元の案件の
+  events.jsonl には {action: "xref", workspace, case, tool} を 1 行追記する（append_xref。同じ対象は同一日に 1 回だけ）。
+  case.json.related は同じワークスペースの案件 ID に加え "<ws>/<case>" を許す（parse_related / validate_related）
 - last_checkin_at / last_checkin_events: 案件単位の最終 checkin 時刻とその時点の events.jsonl 行数（case.json）。
   open_case はこれより新しいローカル変更（kairn 自身の checkin event は除く）があれば checkout を skip する
 - rev / checked_in_from: checkin のたびに振り直す版マーカー（uuid4）と checkin したホスト名（case.json）。同じ rev を名前にした
@@ -28,8 +31,9 @@ JST = timezone(timedelta(hours=9))
 TASK_STATUSES = {"open", "doing", "blocked", "done", "dropped", "superseded"}
 CASE_STATUSES = {"open", "closed", "suspended"}
 EVENT_ACTIONS = {"opened", "plan", "started", "progress", "done", "dropped", "sendback", "comment", "decision",
-                 "checkin", "status", "extract"}  # 旧版が書いた "checkout" 行は読めるが、もう書かない（open_case は access.log へ）
+                 "checkin", "status", "extract", "xref"}  # 旧版が書いた "checkout" 行は読めるが、もう書かない（open_case は access.log へ）
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+WORKSPACE_NAME_RE = CASE_ID_RE   # "<ws>/<case>" 参照で使えるワークスペース名（ディレクトリ名と同じ制約）
 TASK_OWNERS = {"ai", "human"}
 EVIDENCE_TYPES = {"commit", "pr", "file", "test", "url"}
 EVIDENCE_REQUIRED_KEY = {"commit": "id", "pr": "id", "file": "path", "test": "cmd", "url": "url", "note": "text"}  # note は human のみ
@@ -97,11 +101,42 @@ def validate_evidence(evidence: list | None, actor: str) -> list[dict]:
     return evidence
 
 
-def append_access_log(path: Path, case_id: str, agent: str) -> str:
+def parse_related(ref: str) -> tuple[str | None, str]:
+    """related の要素を (ワークスペース | None, 案件 ID) に分解する。"CASE-1" → (None, "CASE-1")、"beta/CASE-1" → ("beta", "CASE-1")。
+    ワークスペース名・案件 ID の形が不正（"/" が 2 個以上、空、".." 等）なら ValueError。"""
+    if not isinstance(ref, str) or not ref:
+        raise ValueError(f"invalid related reference: {ref!r} (expected \"<case>\" or \"<ws>/<case>\")")
+    if "/" not in ref:
+        return None, validate_case_id(ref)
+    ws, _, case = ref.partition("/")
+    if not WORKSPACE_NAME_RE.match(ws) or ".." in ws or "/" in case:
+        raise ValueError(f"invalid related reference: {ref!r} (expected \"<case>\" or \"<ws>/<case>\")")
+    try:
+        return ws, validate_case_id(case)
+    except ValueError:
+        raise ValueError(f"invalid related reference: {ref!r} (expected \"<case>\" or \"<ws>/<case>\")") from None
+
+
+def validate_related(related: object) -> list[str]:
+    """case.json.related の検証: 文字列のリストで、各要素は "<case>"（同じワークスペース）か "<ws>/<case>"。不正なら ValueError。"""
+    if related is None:
+        return []
+    if not isinstance(related, list):
+        raise ValueError("related must be a list of case references")
+    for r in related:
+        parse_related(r)
+    return related
+
+
+def append_access_log(path: Path, case_id: str, agent: str, cross_from: str | None = None, tool: str = "open_case") -> str:
     """open_case の閲覧記録を 1 行追記する（`<時刻>\t<案件>\t<agent>`）。置き場所はワークスペースの index/access.log
     （ローカルのみ、Drive に同期しない）。events.jsonl には書かない: 閲覧のたびに追記するとローカルの events.jsonl が
-    常に Drive 版より新しくなり、他環境の events を取り込めないため。返り値: 書いた行。"""
+    常に Drive 版より新しくなり、他環境の events を取り込めないため。
+    他のワークスペースの案件からの参照（跨ぎ参照）なら cross_from="<ws>/<case>" を受け、行末に `\tcross_from=<ws>/<case>\ttool=<tool>`
+    を添える（search / find_cases のヒットもこの形で記録する）。返り値: 書いた行。"""
     line = f"{now_iso()}\t{validate_case_id(case_id)}\t{agent}"
+    if cross_from:
+        line += f"\tcross_from={cross_from}\ttool={tool}"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
@@ -165,7 +200,7 @@ class CaseStore:
         d.mkdir(parents=True, exist_ok=True)
         case = {"id": case_id, "title": title, "status": "open", "workspace": workspace,
                 "repos": extra.get("repos", []), "tickets": extra.get("tickets", []), "prs": extra.get("prs", []),
-                "related": extra.get("related", []), "elements": extra.get("elements", {}), "data": [],
+                "related": validate_related(extra.get("related", [])), "elements": extra.get("elements", {}), "data": [],
                 "created_at": now_iso(), "updated_at": now_iso(), "current_plan": 0}
         self.save_case(case)
         wl = d / "worklog.md"
@@ -400,6 +435,17 @@ class CaseStore:
         with f.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
         return ev
+
+    def append_xref(self, case_id: str, workspace: str, target_case: str, tool: str, agent: str = "") -> dict | None:
+        """跨ぎ参照の記録: この案件（参照元）の events.jsonl に {actor: ai, agent, action: xref, workspace, case: <対象案件>, tool} を追記する。
+        同じ対象（workspace, case）への参照が同じ日（JST）に既にあれば追記せず None（閲覧のたびに events を伸ばさない）。
+        ツール（open_case / search / find_cases）の違いは重複判定に含めない。"""
+        today = now_iso()[:10]
+        for e in self.events(case_id):
+            if e.get("action") == "xref" and e.get("workspace") == workspace and e.get("case") == target_case and str(e.get("t", ""))[:10] == today:
+                return None
+        return self.append_event(case_id, {"actor": "ai", "agent": agent, "action": "xref", "workspace": workspace,
+                                           "case": target_case, "tool": tool})
 
     def events(self, case_id: str, n: int | None = None) -> list[dict]:
         f = self._events_file(case_id)

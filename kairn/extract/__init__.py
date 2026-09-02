@@ -22,7 +22,7 @@ from pathlib import Path
 import jsonschema
 
 from .. import config as cfg
-from ..store import CaseStore
+from ..store import CaseStore, validate_related
 from ..sync import excluded_dir, excluded_file, is_raw, raw_rules
 from . import adapters
 
@@ -194,6 +194,7 @@ def apply_card(st: CaseStore, case: str, card: dict) -> dict:
     err = validate_card(card)
     if err:
         raise ValueError(err)
+    validate_related(card.get("related"))   # 形の検証は case.json.related と同じ（"<case>" か "<ws>/<case>"）
     c = st.load_case(case)
     for k in APPLY_KEYS:
         c[k] = card[k]

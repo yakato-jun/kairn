@@ -172,3 +172,44 @@ def test_set_case_status_writes_from_to_event_and_noops_on_same_status(store):
     assert store.load_case("CASE-1")["status"] == "open" and len(store.events("CASE-1")) == n + 2
     with pytest.raises(CaseNotFound):
         store.set_case_status("CASE-404", "closed", actor="human")
+
+
+# ---------- 跨ぎ参照（docs/data-model.md「跨ぎ参照」）: related の形、xref event、access.log の cross_from ----------
+
+def test_related_accepts_ws_slash_case_and_rejects_bad_forms(store):
+    from kairn.store import parse_related, validate_related
+    assert parse_related("CASE-1") == (None, "CASE-1") and parse_related("beta/CASE-9") == ("beta", "CASE-9")
+    assert validate_related(None) == [] and validate_related(["CASE-1", "beta/CASE-9"]) == ["CASE-1", "beta/CASE-9"]
+    for bad in ("", "/CASE-1", "beta/", "a/b/c", "../x", "beta/../x", ".hidden/CASE-1", "beta/.hidden", 12):
+        with pytest.raises(ValueError):
+            parse_related(bad)
+    with pytest.raises(ValueError):
+        validate_related("CASE-1")   # リストでない
+    c = store.create_case("CASE-1", "t", "acme", actor="human", related=["CASE-0", "beta/CASE-9"])
+    assert c["related"] == ["CASE-0", "beta/CASE-9"]
+    with pytest.raises(ValueError):
+        store.create_case("CASE-2", "t", "acme", actor="human", related=["a/b/c"])
+    assert not (store.cases_dir / "CASE-2" / "case.json").exists()
+
+
+def test_append_xref_once_per_day_and_access_log_cross_from(store, tmp_path):
+    from kairn.store import append_access_log
+    store.create_case("CASE-1", "t", "acme", actor="human")
+    ev = store.append_xref("CASE-1", "beta", "CASE-9", "open_case", agent="claude")
+    assert ev and ev["action"] == "xref" and ev["actor"] == "ai" and ev["agent"] == "claude"
+    assert ev["workspace"] == "beta" and ev["case"] == "CASE-9" and ev["tool"] == "open_case" and ev["t"]
+    assert store.append_xref("CASE-1", "beta", "CASE-9", "search") is None          # 同じ対象は同じ日に 1 回（ツールが違っても）
+    assert store.append_xref("CASE-1", "beta", "CASE-10", "search")["case"] == "CASE-10"  # 別の対象は記録する
+    assert store.append_xref("CASE-1", "gamma", "CASE-9", "search")["workspace"] == "gamma"
+    assert [e["case"] for e in store.events("CASE-1") if e["action"] == "xref"] == ["CASE-9", "CASE-10", "CASE-9"]
+    # 前日の記録は重複とみなさない（events.jsonl の t を書き換えて偽装）
+    f = store.cases_dir / "CASE-1" / "events.jsonl"
+    f.write_text(f.read_text().replace(ev["t"][:10], "2000-01-01"))
+    assert store.append_xref("CASE-1", "beta", "CASE-9", "open_case") is not None
+    # access.log: 跨ぎでなければ従来の 3 列、跨ぎなら cross_from= と tool= を添える
+    log = tmp_path / "index" / "access.log"
+    assert append_access_log(log, "CASE-9", "claude").split("\t")[1:] == ["CASE-9", "claude"]
+    line = append_access_log(log, "CASE-9", "claude", cross_from="acme/CASE-1", tool="search")
+    assert line.split("\t")[1:] == ["CASE-9", "claude", "cross_from=acme/CASE-1", "tool=search"]
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 and lines[0].split("\t")[1:] == ["CASE-9", "claude"] and lines[-1] == line
