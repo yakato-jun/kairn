@@ -88,8 +88,8 @@ def test_assert_data_not_tracked_checks_data_root(tmp_path):
         cfg.assert_data_not_tracked(repo / "data" / "acme")          # 配下でも検出
 
 
-def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys):
-    """L-5: kairn checkout --dry-run は索引（kairn.sqlite）を書き換えない。"""
+def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys, drive_manifest):
+    """L-5: kairn checkout --dry-run は索引（kairn.sqlite）を書き換えない。ワークスペース全体の checkout は manifest の rev が違う案件だけ。"""
     import subprocess
     from kairn import cli, sync
     from kairn.store import CaseStore
@@ -98,9 +98,11 @@ def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys):
     monkeypatch.setattr(cfg, "load", lambda path=None: conf)
     monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
     monkeypatch.setattr(sync, "_run", lambda cmd, dry=False, progress=None: subprocess.CompletedProcess(cmd, 0, "fake", ""))
+    drive_manifest.data = {"cases": {"CASE-1": {"rev": "on-drive"}}}
     monkeypatch.setattr("sys.argv", ["kairn", "checkout", "acme", "--dry-run"])
     cli.main()
-    assert not (ws.index_dir / "kairn.sqlite").exists() and "index not rebuilt" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert not (ws.index_dir / "kairn.sqlite").exists() and "index not rebuilt" in out and "would fetch 1 (CASE-1)" in out
     monkeypatch.setattr("sys.argv", ["kairn", "checkout", "acme"])
     cli.main()
     assert (ws.index_dir / "kairn.sqlite").exists()

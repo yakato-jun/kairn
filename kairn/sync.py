@@ -1,8 +1,10 @@
 """Drive 同期（rclone）。ワークスペース単位。remote は設定済みのものだけ使う。
 
-- checkout(ws[, case]):  <remote>:<root>/<ws>/cases[/<case>] -> local（テキスト層のみ、削除は追従しない）。
+- checkout(ws, case):    <remote>:<root>/<ws>/cases/<case> -> local（テキスト層のみ、削除は追従しない）。
                          events.jsonl は「新しい方で上書き」せず、Drive 版を取り寄せてローカル版と行の和集合にマージする
                          （merge_case_events → 他ファイルを rclone copy --update）
+- checkout(ws):          ワークスペース全体。manifest.json を取り寄せ、rev がローカルと違う案件（ローカルに無い案件を含む）だけを
+                         1 案件ずつ checkout する（checkout_workspace。ワークスペース全体の rclone copy --update はしない）
 - checkin(ws[, case]):   local -> remote（テキスト層）。先に events.jsonl を同じくマージし、各案件の case.json に版マーカー
                          （rev = uuid4 / last_checkin_at / checked_in_from。store.mark_checkin）を書いてから転送する。
                          案件単位は rclone sync（削除・Drive 側の新しい版は _deleted/<日付>/ へ退避）、
@@ -45,7 +47,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .config import Config, Workspace
-from .store import CaseStore, _atomic_write, now_iso, parse_iso
+from .store import CaseStore, _atomic_write, now_iso, parse_iso, validate_case_id
 
 
 class RcloneError(RuntimeError):
@@ -261,30 +263,61 @@ def _local_case_dirs(ws: Workspace) -> list[str]:
 
 
 def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False, progress: ProgressFn | None = None) -> str:
-    """Drive → ローカル。events.jsonl は先に Drive 版を取り寄せてマージし（merge_case_events）、転送から除外する
+    """Drive → ローカル（1 案件）。events.jsonl は先に Drive 版を取り寄せてマージし（merge_case_events）、転送から除外する
     （--update の mtime 比較でマージ済みの行を失わないため）。他のファイルは rclone copy --update（ローカルの方が新しいファイルは
-    上書きしない）。ワークスペース全体では、ローカルにある案件を先にマージ → 転送 → 転送で新しく現れた案件をマージする。
-    取得できない案件（Drive に無い・rclone 不在）はマージを飛ばして従来どおり転送する。dry ではマージしない（ローカルを書かない）。
-    progress は転送本体（rclone copy）の出力を行単位に受け取る（MCP のジョブが進捗として表示する。kairn/jobs.py）。"""
-    src = conf.drive_path(ws.name, "cases", *( [case] if case else [] ))
-    dst = ws.cases_dir / case if case else ws.cases_dir
+    上書きしない）。取得できない案件（Drive に無い・rclone 不在）はマージを飛ばして従来どおり転送する。dry ではマージしない（ローカルを書かない）。
+    progress は転送本体（rclone copy）の出力を行単位に受け取る（MCP のジョブが進捗として表示する。kairn/jobs.py）。
+    case を省略するとワークスペース全体（checkout_workspace: manifest の rev がローカルと違う案件だけを 1 案件ずつ）。"""
+    if not case:
+        return checkout_workspace(conf, ws, dry, progress)
+    src = conf.drive_path(ws.name, "cases", case)
+    dst = ws.cases_dir / case
     dst.mkdir(parents=True, exist_ok=True)
-    merged: list[str] = []
+    merged = False
     exclude: list[str] = []
-    if case:
-        if not dry and merge_case_events(conf, ws, case):
-            merged.append(case)
-            exclude = ["--exclude", "/events.jsonl"]
-    elif not dry:
-        before = _local_case_dirs(ws)
-        merged += [c for c in before if merge_case_events(conf, ws, c)]
-        exclude = ["--exclude", "/*/events.jsonl"]
+    if not dry and merge_case_events(conf, ws, case):
+        merged = True
+        exclude = ["--exclude", "/events.jsonl"]
     r = _run(["rclone", "copy", src, str(dst), "--update", "--fast-list", "--transfers", "8", *STATS_ARGS, "-v",
               *exclude, *_filters(conf), *_bw(conf)], dry, progress)
-    if not case and not dry:
-        merged += [c for c in _local_case_dirs(ws) if c not in before and merge_case_events(conf, ws, c)]
     msg = (r.stderr or r.stdout).strip()[-400:]
-    return f"{msg} [events merged: {len(merged)}]" if merged else msg
+    return f"{msg} [events merged: 1]" if merged else msg
+
+
+def checkout_workspace(conf: Config, ws: Workspace, dry: bool = False, progress: ProgressFn | None = None) -> str:
+    """ワークスペース全体の checkout（kairn checkout <ws>）: manifest.json を取り寄せ（キャッシュ更新。dry では更新しない）、
+    載っている案件のうち rev がローカルの case.json.rev と違うもの（ローカルに無い案件を含む）だけを checkout(case) する。
+    last_checkin_at より新しいローカル変更がある案件は取り寄せない（skipped）。manifest が取れなければ RcloneError
+    （オフライン、または未作成: `kairn manifest rebuild <ws>` で作る）。1 案件の失敗は残りを止めず、最後にまとめて RcloneError。"""
+    manifest = refresh_manifest(conf, ws, cache=not dry)
+    if manifest is None:
+        raise RcloneError(f"manifest unavailable: {manifest_drive_path(conf, ws)} (offline, or not created yet: run `kairn manifest rebuild {ws.name}`)")
+    st = CaseStore(ws.cases_dir)
+    fetched: list[str] = []; same: list[str] = []; skipped: list[str] = []; errors: list[str] = []
+    for cid, entry in sorted(manifest["cases"].items()):
+        try:
+            validate_case_id(cid)
+        except ValueError:
+            errors.append(f"{cid}: invalid case id in manifest")
+            continue
+        if (ws.cases_dir / cid / "case.json").exists():
+            if st.local_changes_since_checkin(cid):
+                skipped.append(cid)
+                continue
+            if st.load_case(cid).get("rev") == (entry or {}).get("rev"):
+                same.append(cid)
+                continue
+        try:
+            checkout(conf, ws, cid, dry, progress)
+            fetched.append(cid)
+        except (RcloneError, OSError) as e:
+            errors.append(f"{cid}: {e}")
+    msg = (f"manifest: {len(manifest['cases'])} case(s); {'would fetch' if dry else 'fetched'} {len(fetched)}"
+           f"{' (' + ', '.join(fetched) + ')' if fetched else ''}, up to date {len(same)}, "
+           f"skipped (local changes newer than last checkin) {len(skipped)}{' (' + ', '.join(skipped) + ')' if skipped else ''}")
+    if errors:
+        raise RcloneError(msg + "; errors: " + "; ".join(errors))
+    return msg
 
 
 def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False, progress: ProgressFn | None = None) -> str:

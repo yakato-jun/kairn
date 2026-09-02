@@ -224,9 +224,10 @@ def test_checkout_uses_update_and_bwlimit(conf, fake):
     assert "--update" in cmd and "--bwlimit" not in cmd and "--dry-run" not in cmd
     assert cmd[cmd.index("--max-size") + 1] == "50M" and "*.bag" in cmd
     conf.rules["bwlimit"] = "08:00,4M 20:00,off"
+    fake.manifest = {"cases": {"CASE-123": {"rev": "r1"}}}   # ワークスペース全体は manifest の rev が違う案件（ローカルに無い）だけ
     sync.checkout(conf, ws, dry=True)
     cmd = fake.calls[-1]
-    assert cmd[cmd.index("--bwlimit") + 1] == "08:00,4M 20:00,off" and cmd[-1] == "--dry-run"
+    assert cmd[:2] == ["rclone", "copy"] and cmd[cmd.index("--bwlimit") + 1] == "08:00,4M 20:00,off" and cmd[-1] == "--dry-run"
     sync.checkin(conf, ws, "CASE-123") if (ws.cases_dir / "CASE-123").mkdir(parents=True, exist_ok=True) is None else None
     cmd = [c for c in fake.calls if c[1] in ("sync", "copy")][-1]
     assert cmd[:2] == ["rclone", "sync"] and "--bwlimit" in cmd and "--backup-dir" in cmd
@@ -575,35 +576,32 @@ def test_checkin_case_merges_then_syncs(conf, monkeypatch):
 
 
 def test_checkout_and_checkin_workspace_merge_per_case(conf, monkeypatch):
-    """ワークスペース全体: checkout はローカルの各案件をマージ → copy --update（/*/events.jsonl を除外）→ 転送で現れた案件をマージ。
-    checkin は各案件をマージ → copy。"""
+    """ワークスペース全体: checkout は manifest（cat）を見て rev が違う案件（ローカルに無い案件を含む）だけを 1 案件ずつ
+    マージ → copy --update する（ワークスペース全体の copy はしない）。checkin は各案件をマージ → copy → manifest 更新。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "a", "acme", actor="human")
     st.create_case("CASE-2", "b", "acme", actor="human")
     remote = {"CASE-1": [_ev("2026-08-01T00:00:00+09:00", "r1")], "CASE-9": [_ev("2026-08-01T00:00:00+09:00", "r9")]}
     f = FakeRun(sync.raw_rules(conf), remote_events=remote)
-    orig_call = f.__call__
-
-    def call(cmd, **kw):  # copy が Drive にしか無い案件ディレクトリを作る（events.jsonl は除外されている）
-        r = orig_call(cmd, **kw)
-        if cmd[1] == "copy" and "--update" in cmd:  # checkout の転送
-            assert "/*/events.jsonl" in _excludes(cmd)
-            (ws.cases_dir / "CASE-9").mkdir(exist_ok=True)
-        return r
-    monkeypatch.setattr(subprocess, "run", call)
-    sync.checkout(conf, ws)
-    assert [(c[1], c[2].rsplit("/", 2)[-2] if c[1] == "copyto" else "") for c in f.calls] == \
-        [("copyto", "CASE-1"), ("copyto", "CASE-2"), ("copy", ""), ("copyto", "CASE-9")]
+    f.manifest = {"cases": {"CASE-1": {"rev": "d1"}, "CASE-2": {"rev": "d2"}, "CASE-9": {"rev": "d9"}}}
+    monkeypatch.setattr(subprocess, "run", f)
+    msg = sync.checkout(conf, ws)
+    assert [(c[1], c[2].rsplit("/", 2)[-2] if c[1] == "copyto" else c[2].rsplit("/", 1)[-1]) for c in f.calls] == \
+        [("cat", "manifest.json"), ("copyto", "CASE-1"), ("copy", "CASE-1"), ("copyto", "CASE-2"), ("copy", "CASE-2"), ("copyto", "CASE-9"), ("copy", "CASE-9")]
+    assert all("--update" in c and "/events.jsonl" in _excludes(c) for c in f.calls if c[1] == "copy" and c[2].endswith(("CASE-1", "CASE-9")))
+    assert "/events.jsonl" not in _excludes([c for c in f.calls if c[1] == "copy"][1])   # CASE-2 は Drive に events が無い → 除外しない
     assert [e["note"] for e in _events_of(ws, "CASE-1")] == ["r1", "case created: a"]
     assert [e["note"] for e in _events_of(ws, "CASE-2")] == ["case created: b"]
     assert [e["note"] for e in _events_of(ws, "CASE-9")] == ["r9"]
+    assert "fetched 3 (CASE-1, CASE-2, CASE-9)" in msg and "up to date 0" in msg
     f.calls.clear()
     sync.checkin(conf, ws)
     assert [c[1] for c in f.calls] == ["copyto", "copyto", "copyto", "copy", "cat", "rcat"]
     assert not any(x.endswith("events.jsonl") for x in _excludes(f.calls[3]))
     assert st.load_case("CASE-1")["last_checkin_events"] == 2
-    assert set(f.manifest["cases"]) == {"CASE-1", "CASE-2"} and f.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"]   # 案件なしのディレクトリは載せない
+    assert set(f.manifest["cases"]) == {"CASE-1", "CASE-2", "CASE-9"} and f.manifest["cases"]["CASE-9"] == {"rev": "d9"}   # 案件なしのディレクトリは触らない
+    assert f.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"] != "d1"
 
 
 # ---------- 版マーカー（rev）と manifest.json ----------
@@ -683,6 +681,37 @@ def test_checkin_workspace_stamps_only_changed_cases(conf, fake):
     assert st.load_case("CASE-1")["rev"] != r1 and st.load_case("CASE-2")["rev"] == r2
     assert fake.manifest["cases"]["CASE-1"]["rev"] == st.load_case("CASE-1")["rev"] and fake.manifest["cases"]["CASE-2"]["rev"] == r2
     os.utime(ws.cases_dir / "CASE-1" / "worklog.md", None)
+
+
+def test_checkout_workspace_fetches_only_rev_mismatch(conf, fake):
+    """kairn checkout <ws>: manifest の rev と違う案件（ローカルに無い案件を含む）だけ取り寄せる。一致は省略、
+    未 checkin のローカル変更がある案件は skip。manifest が無ければ RcloneError（manifest rebuild を案内）。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    for cid in ("CASE-1", "CASE-2", "CASE-4"):
+        st.create_case(cid, "t", "acme", actor="human")
+        st.mark_checkin(cid)
+    fake.manifest = {"cases": {"CASE-1": {"rev": st.load_case("CASE-1")["rev"]}, "CASE-2": {"rev": "other"}, "CASE-3": {"rev": "new"}, "../x": {"rev": "bad"}}}
+    with pytest.raises(sync.RcloneError, match="invalid case id") as ei:
+        sync.checkout(conf, ws)
+    assert "fetched 2 (CASE-2, CASE-3)" in str(ei.value) and "up to date 1" in str(ei.value)
+    assert [c[2].rsplit("/", 1)[-1] for c in fake.calls if c[1] == "copy"] == ["CASE-2", "CASE-3"]
+    assert json.loads((ws.index_dir / "manifest.cache.json").read_text(encoding="utf-8"))["cases"]["CASE-3"] == {"rev": "new"}
+    del fake.manifest["cases"]["../x"]
+    t = time.time() + 5
+    os.utime(ws.cases_dir / "CASE-2" / "worklog.md", (t, t))
+    fake.calls.clear()
+    msg = sync.checkout(conf, ws)
+    assert [c[2].rsplit("/", 1)[-1] for c in fake.calls if c[1] == "copy"] == ["CASE-3"] and "skipped (local changes newer than last checkin) 1 (CASE-2)" in msg
+    os.utime(ws.cases_dir / "CASE-2" / "worklog.md", None)
+    # dry: rclone に --dry-run、キャッシュは更新しない
+    (ws.index_dir / "manifest.cache.json").unlink()
+    fake.calls.clear()
+    assert "would fetch 2" in sync.checkout(conf, ws, dry=True)
+    assert all(c[-1] == "--dry-run" for c in fake.calls if c[1] == "copy") and not (ws.index_dir / "manifest.cache.json").exists()
+    fake.manifest = None
+    with pytest.raises(sync.RcloneError, match="manifest unavailable.*kairn manifest rebuild acme"):
+        sync.checkout(conf, ws)
 
 
 def test_manifest_fetch_failures_are_none(conf, monkeypatch):
