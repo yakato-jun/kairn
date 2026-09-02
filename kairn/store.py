@@ -185,6 +185,16 @@ class CaseStore:
         self.save_case(case)
         return case["last_checkin_at"]
 
+    def set_rev(self, case_id: str, rev: str) -> None:
+        """manifest rebuild 用: case.json の rev だけを書き換える（updated_at は触らず、mtime も元に戻す。
+        open_case の skip 判定（mtime）に影響させない）。"""
+        f = self._case_file(case_id)
+        case = self.load_case(case_id)
+        mtime = f.stat().st_mtime
+        case["rev"] = rev
+        _atomic_write(f, json.dumps(case, ensure_ascii=False, indent=1) + "\n")
+        os.utime(f, (mtime, mtime))
+
     def manifest_entry(self, case_id: str) -> dict | None:
         """manifest.json に載せる当該案件のエントリ {rev, checked_in_at, from}（case.json の rev / last_checkin_at / checked_in_from）。
         case.json が無い、または rev 未付与なら None。"""

@@ -108,6 +108,33 @@ def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys, 
     assert (ws.index_dir / "kairn.sqlite").exists()
 
 
+def test_cli_manifest_rebuild(conf, monkeypatch, capsys):
+    """kairn manifest rebuild <ws> [--dry-run]: sync.manifest_rebuild の結果を 1 案件 1 行で表示。dry は何も書かない旨を出す。エラーは exit 1。"""
+    from kairn import cli, sync
+    monkeypatch.setattr(cfg, "load", lambda path=None: conf)
+    monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
+    seen = []
+    result = {"dry": True, "manifest": "my-drive:ws/acme/manifest.json", "errors": {}, "local_skipped": ["CASE-2"],
+              "cases": {"CASE-1": {"rev": "r1", "rev_assigned": True, "checked_in_at_assigned": True, "remote": "updated", "local": "updated"},
+                        "CASE-2": {"rev": "r2", "rev_assigned": False, "checked_in_at_assigned": False, "remote": "same", "local": "skipped", "local_reason": "never checked in"}}}
+    monkeypatch.setattr(sync, "manifest_rebuild", lambda c, ws, dry=False: seen.append((ws.name, dry)) or {**result, "dry": dry})
+    monkeypatch.setattr("sys.argv", ["kairn", "manifest", "rebuild", "acme", "--dry-run"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert seen == [("acme", True)] and "[dry] CASE-1" in out and "rev assigned, last_checkin_at from drive mtime" in out and "local: updated" in out
+    assert "skipped (never checked in)" in out and "2 case(s), 0 error(s), local skipped: CASE-2 (dry-run: nothing written)" in out
+    monkeypatch.setattr("sys.argv", ["kairn", "manifest", "rebuild", "acme"])
+    cli.main()
+    assert seen[-1] == ("acme", False) and "dry" not in capsys.readouterr().out
+    result["errors"] = {"CASE-9": "case.json is not valid JSON"}
+    with pytest.raises(SystemExit) as ei:
+        cli.main()
+    assert ei.value.code == 1 and "ERROR CASE-9" in capsys.readouterr().err
+    monkeypatch.setattr(sync, "manifest_rebuild", lambda c, ws, dry=False: (_ for _ in ()).throw(sync.RcloneError("lsf failed")))
+    with pytest.raises(SystemExit, match="lsf failed"):
+        cli.main()
+
+
 def test_extract_timeout_setting(tmp_path):
     p = tmp_path / "config.yaml"
     p.write_text("drive: {remote: my-drive}\nworkspaces: {}\n", encoding="utf-8")

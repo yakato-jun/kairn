@@ -753,3 +753,68 @@ def test_drive_state(conf, fake):
     m["cases"]["CASE-1"]["rev"] = rev
     assert sync.drive_state(st, m, "CASE-1")["drive_differs"] is False
     os.utime(ws.cases_dir / "CASE-1" / "worklog.md", None)
+
+
+# ---------- manifest rebuild（既存 Drive データの移行） ----------
+
+def test_manifest_rebuild_assigns_rev_and_aligns_local(conf, fake):
+    """Drive の cases/*/case.json を列挙して読み、rev が無ければ付与して rcat で書き戻し（last_checkin_at は既存値を維持、無ければ
+    Drive のファイル更新時刻）、manifest.json を作り直す。ローカルの同じ案件（checkin 済み・変更なし）にも同じ rev を書く。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "one", "acme", actor="human"); st.create_case("CASE-2", "two", "acme", actor="human")
+    st.create_case("CASE-5", "local only", "acme", actor="human")
+    for cid in ("CASE-1", "CASE-2"):   # 旧方式で checkin 済み（rev 無し）: last_checkin_at より古い mtime にする
+        c = st.load_case(cid); c["last_checkin_at"] = "2026-08-20T10:00:00+09:00"; c["last_checkin_events"] = 1; st.save_case(c)
+        for name in ("case.json", "worklog.md", "events.jsonl"):
+            old = time.time() - 30 * DAY
+            os.utime(ws.cases_dir / cid / name, (old, old))
+    fake.remote_cases = {"CASE-1": {"id": "CASE-1", "title": "one", "status": "open"},                                            # rev / last_checkin_at 無し
+                         "CASE-2": {"id": "CASE-2", "title": "two", "status": "open", "rev": "r2", "last_checkin_at": "2026-08-21T00:00:00+09:00", "checked_in_from": "host-b"},
+                         "CASE-3": {"id": "CASE-3", "title": "drive only", "status": "closed"},
+                         "CASE-4": "not an object"}
+    t = time.time() + 5
+    os.utime(ws.cases_dir / "CASE-2" / "worklog.md", (t, t))     # 未 checkin のローカル変更 → ローカルは触らない
+    cj1 = ws.cases_dir / "CASE-1" / "case.json"; mtime1 = cj1.stat().st_mtime
+    # dry-run: 変更内容を返すだけで何も書かない
+    r = sync.manifest_rebuild(conf, ws, dry=True)
+    assert r["dry"] is True and fake.rcats == [] and fake.manifest is None and "rev" not in st.load_case("CASE-1")
+    assert r["cases"]["CASE-1"]["rev_assigned"] and r["cases"]["CASE-1"]["local"] == "updated" and r["cases"]["CASE-1"]["remote"] == "updated"
+    assert not r["cases"]["CASE-2"]["rev_assigned"] and r["cases"]["CASE-2"]["local"] == "skipped" and r["local_skipped"] == ["CASE-2"]
+    assert r["cases"]["CASE-3"]["local"] == "absent" and "CASE-4" in r["errors"] and "CASE-5" not in r["cases"]
+    assert not (ws.index_dir / "manifest.cache.json").exists()
+    # 実行
+    r = sync.manifest_rebuild(conf, ws)
+    lsf = [c for c in fake.calls if c[1] == "lsf"][0]
+    assert lsf[2:] == ["-R", "--files-only", "--format", "pt", "--separator", "\t", "--max-depth", "2", "--include", "/*/case.json", "my-drive:ws/acme/cases"]
+    assert [p.rsplit("/", 2)[-2] if p.endswith("case.json") else p for p, _ in fake.rcats] == ["CASE-1", "CASE-3", "my-drive:ws/acme/manifest.json"]
+    rev1 = fake.remote_cases["CASE-1"]["rev"]
+    assert len(rev1) == 36 and fake.remote_cases["CASE-1"]["last_checkin_at"] == sync._lsf_time_to_iso(fake.remote_case_mtime)
+    assert fake.remote_cases["CASE-2"] == {"id": "CASE-2", "title": "two", "status": "open", "rev": "r2", "last_checkin_at": "2026-08-21T00:00:00+09:00", "checked_in_from": "host-b"}
+    assert fake.manifest["cases"] == {"CASE-1": {"rev": rev1, "checked_in_at": fake.remote_cases["CASE-1"]["last_checkin_at"], "from": ""},
+                                      "CASE-2": {"rev": "r2", "checked_in_at": "2026-08-21T00:00:00+09:00", "from": "host-b"},
+                                      "CASE-3": {"rev": fake.remote_cases["CASE-3"]["rev"], "checked_in_at": fake.remote_cases["CASE-3"]["last_checkin_at"], "from": ""}}
+    assert fake.manifest["updated_at"] and r["cases"]["CASE-1"]["rev"] == rev1 == st.load_case("CASE-1")["rev"]
+    assert cj1.stat().st_mtime == mtime1 and st.local_changes_since_checkin("CASE-1") == []          # ローカルの mtime は動かさない
+    assert "rev" not in st.load_case("CASE-2") and "rev" not in st.load_case("CASE-5")
+    assert json.loads((ws.index_dir / "manifest.cache.json").read_text(encoding="utf-8"))["cases"] == fake.manifest["cases"]
+    # 2 回目: すべて既存の rev を保つ（Drive にもローカルにも書かない）
+    fake.rcats.clear()
+    r = sync.manifest_rebuild(conf, ws)
+    assert [p for p, _ in fake.rcats] == ["my-drive:ws/acme/manifest.json"] and r["cases"]["CASE-1"]["local"] == "same"
+    os.utime(ws.cases_dir / "CASE-2" / "worklog.md", None)
+    # 未 checkin（last_checkin_at 無し）のローカル案件は触らない（never checked in）
+    c5 = st.load_case("CASE-5"); fake.remote_cases["CASE-5"] = {"id": "CASE-5", "rev": "r5", "last_checkin_at": "2026-08-01T00:00:00+09:00"}
+    r = sync.manifest_rebuild(conf, ws)
+    assert r["cases"]["CASE-5"]["local"] == "skipped" and r["cases"]["CASE-5"]["local_reason"] == "never checked in" and "rev" not in st.load_case("CASE-5")
+    assert sync.manifest_rebuild(conf, ws)["cases"]["CASE-5"]["remote"] == "same"
+    # lsf の失敗は RcloneError
+    fake.fail = {"lsf"}
+    with pytest.raises(sync.RcloneError):
+        sync.manifest_rebuild(conf, ws)
+
+
+def test_lsf_time_to_iso():
+    iso = sync._lsf_time_to_iso("2026-08-15 09:30:00.123456789")
+    assert iso is not None and iso.startswith("2026-08-15T09:30:00") and ("+" in iso[19:] or "-" in iso[19:])
+    assert sync._lsf_time_to_iso("garbage") is None

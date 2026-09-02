@@ -47,7 +47,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .config import Config, Workspace
-from .store import CaseStore, _atomic_write, now_iso, parse_iso, validate_case_id
+from .store import CaseStore, _atomic_write, new_rev, now_iso, parse_iso, validate_case_id
 
 
 class RcloneError(RuntimeError):
@@ -253,6 +253,88 @@ def drive_state(st: CaseStore, manifest: dict | None, case_id: str) -> dict:
         out["state"] = "synced"
     else:
         out["state"] = "drive_newer"
+    return out
+
+
+def _lsf_time_to_iso(text: str) -> str | None:
+    """rclone lsf --format t の時刻（'2026-09-01 12:00:00' 形。ローカル時刻）→ ISO 8601（ローカル tz 付き）。読めなければ None。"""
+    try:
+        t = _dt.datetime.strptime(text.strip()[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return t.astimezone().isoformat(timespec="seconds")
+
+
+def manifest_rebuild(conf: Config, ws: Workspace, dry: bool = False) -> dict:
+    """既存 Drive データの移行（kairn manifest rebuild <ws>）: Drive 上の cases/*/case.json を rclone lsf で列挙し rclone cat で読み、
+    rev が無ければ uuid4 を付与（last_checkin_at は既存値を維持、無ければ Drive 側ファイルの更新時刻）して rclone rcat で書き戻し、
+    それらから manifest.json を作り直す。ローカルに同じ案件があり rev が無い／違う場合はローカルの case.json にも同じ rev を書く
+    （未 checkin のローカル変更がある案件、last_checkin_at の無い案件はそのまま local_skipped に列挙）。dry では何も書かない。
+    返り値: {dry, manifest, cases: {case: {rev, rev_assigned, checked_in_at, checked_in_at_assigned, remote: same|updated, local: absent|same|updated|skipped}},
+             errors: {case: reason}, local_skipped: [case]}"""
+    base = conf.drive_path(ws.name, "cases")
+    r = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--format", "pt", "--separator", "\t", "--max-depth", "2",
+                        "--include", "/*/case.json", base], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RcloneError((r.stderr or r.stdout).strip()[-800:])
+    st = CaseStore(ws.cases_dir)
+    out: dict = {"dry": dry, "manifest": manifest_drive_path(conf, ws), "cases": {}, "errors": {}, "local_skipped": []}
+    entries: dict[str, dict] = {}
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        path, *rest = line.split("\t")
+        cid = path.split("/")[0]
+        try:
+            validate_case_id(cid)
+        except ValueError as e:
+            out["errors"][cid] = str(e)
+            continue
+        cat = subprocess.run(["rclone", "cat", f"{base}/{path}"], capture_output=True, text=True)
+        if cat.returncode != 0:
+            out["errors"][cid] = f"rclone cat failed: {(cat.stderr or cat.stdout).strip()[-200:]}"
+            continue
+        try:
+            case = json.loads(cat.stdout)
+            if not isinstance(case, dict):
+                raise ValueError("not an object")
+        except ValueError as e:
+            out["errors"][cid] = f"case.json is not valid JSON: {e}"
+            continue
+        info: dict = {"rev_assigned": False, "checked_in_at_assigned": False, "local": "absent"}
+        if not case.get("rev"):
+            case["rev"] = new_rev()
+            info["rev_assigned"] = True
+        if not case.get("last_checkin_at"):
+            case["last_checkin_at"] = (_lsf_time_to_iso(rest[0]) if rest else None) or now_iso()
+            info["checked_in_at_assigned"] = True
+        remote_changed = info["rev_assigned"] or info["checked_in_at_assigned"]
+        if remote_changed and not dry:
+            w = subprocess.run(["rclone", "rcat", f"{base}/{path}"], input=json.dumps(case, ensure_ascii=False, indent=1) + "\n",
+                               capture_output=True, text=True)
+            if w.returncode != 0:
+                out["errors"][cid] = f"rclone rcat failed: {(w.stderr or w.stdout).strip()[-200:]}"
+                continue
+        info.update(rev=case["rev"], checked_in_at=case["last_checkin_at"], remote="updated" if remote_changed else "same")
+        entries[cid] = {"rev": case["rev"], "checked_in_at": case["last_checkin_at"], "from": case.get("checked_in_from", "")}
+        if (ws.cases_dir / cid / "case.json").exists():
+            local = st.load_case(cid)
+            changed = st.local_changes_since_checkin(cid)
+            if local.get("rev") == case["rev"]:
+                info["local"] = "same"
+            elif changed is None or changed:
+                info["local"] = "skipped"
+                info["local_reason"] = "never checked in" if changed is None else f"local changes newer than last checkin: {', '.join(changed)}"
+                out["local_skipped"].append(cid)
+            else:
+                info["local"] = "updated"
+                if not dry:
+                    st.set_rev(cid, case["rev"])
+        out["cases"][cid] = info
+    manifest = {"cases": entries, "updated_at": now_iso()}
+    if not dry:
+        write_manifest(conf, ws, manifest)
+        save_manifest_cache(ws, manifest)
     return out
 
 
