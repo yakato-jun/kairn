@@ -22,6 +22,7 @@ rules:
     - "__pycache__/**"
     - "node_modules/**"
     - ".venv/**"
+    - ".git/**"                 # 通常の clone の .git/（worktree の .git ファイルがあるディレクトリは配下ごと同期・索引・退避の対象外。docs/data-model.md）
     - "*.o"
     - "*.rlib"
     - "*.pyc"

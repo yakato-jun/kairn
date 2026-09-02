@@ -33,9 +33,11 @@ DATA_ROOT = Path(os.environ.get("KAIRN_DATA_ROOT", ROOT / "workspaces"))
 USER_CONFIG_PATH = Path(os.environ.get("KAIRN_CONFIG", os.path.expanduser("~/.config/kairn/config.yaml")))
 EXAMPLE_CONFIG_PATH = ROOT / "config" / "config.example.yaml"
 
-# exclude は rclone のフィルタ規則。先頭に / の無い `target/**` は任意の階層の target/ に一致する（`**/target/**` はルート直下に一致しない）
+# exclude は rclone のフィルタ規則。先頭に / の無い `target/**` は任意の階層の target/ に一致する（`**/target/**` はルート直下に一致しない）。
+# `.git/**` は通常の clone の .git ディレクトリ（worktree の .git ファイルは sync.WORKAREA_MARKERS で配下ごと除外）。
+# 既存の設定ファイルには自動で足さない（kairn rules add-exclude '.git/**'）
 DEFAULT_RULES = {
-    "exclude": ["target/**", "build/**", "__pycache__/**", "node_modules/**", ".venv/**", "*.o", "*.rlib", "*.pyc"],
+    "exclude": ["target/**", "build/**", "__pycache__/**", "node_modules/**", ".venv/**", ".git/**", "*.o", "*.rlib", "*.pyc"],
     "raw_data": {"extensions": ["bag", "zst", "pgm", "npz", "zip", "gz", "tar", "active", "pcd", "mp4"], "min_size": "50M", "min_age": "14d"},
     "bag_to_zst": True,
 }
