@@ -1,5 +1,6 @@
-"""MCP サーバー（mcp 2.x）: in-process の Client で 11 ツールを呼ぶ。rclone は monkeypatch。
-checkin と open_case の取り寄せはジョブ（スレッド）なので、結果を見る前に job.wait() で完了を待つ（_checkin / _open）。"""
+"""MCP サーバー（mcp 2.x）: in-process の Client で 11 ツールを呼ぶ。rclone は monkeypatch、Drive の manifest.json はメモリ内の偽物（drive_manifest）。
+checkin と open_case の取り寄せはジョブ（スレッド）なので、結果を見る前に job.wait() で完了を待つ（_checkin / _open）。
+open_case は manifest の rev がローカルと違うときだけ取り寄せる: 取り寄せを起こしたいテストは drive_manifest.set_rev(case, "…") で rev をずらす。"""
 from __future__ import annotations
 
 import threading
@@ -70,8 +71,9 @@ def test_tools_listed_with_instructions(conf):
     run(main)
 
 
-def test_full_flow(conf, mocked_rclone, jobs):
+def test_full_flow(conf, mocked_rclone, jobs, drive_manifest):
     ws = conf.workspaces["acme"]
+    drive_manifest.set_rev("CASE-123", "on-drive")   # ローカル（rev 無し）と違う → open_case は取り寄せる
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-123", "起動時に driver が初期化されない", "acme", actor="human", elements={"machine": ["unit-2"]}, related=["CASE-100"])
     (ws.cases_dir / "CASE-123" / "worklog.md").write_text("# t\n## Objective\n起動時に widget driver の init が終わらない\n## Notes\nUART 460800 で送信量が超過する\n", encoding="utf-8")
@@ -118,7 +120,7 @@ def test_full_flow(conf, mocked_rclone, jobs):
             assert not r.is_error and oc["case"]["id"] == "CASE-123" and oc["plan"]["version"] == 1
             assert [t["id"] for t in oc["open_tasks"]] == ["T002"]
             assert oc["human_feedback"][-1]["note"] == "unit-6 でも確認" and oc["related"] == ["CASE-100"]
-            assert "460800" in oc["worklog_tail"] and oc["drive"]["fetched"] is False and oc["drive"]["job_id"]
+            assert "460800" in oc["worklog_tail"] and oc["drive"]["fetched"] is True and oc["drive"]["job_id"] and oc["drive"]["drive_rev"] == "on-drive"
             assert jobs.get(oc["drive"]["job_id"]).kind == "checkout" and jobs.get(oc["drive"]["job_id"]).result == "fake checkout"
             assert st.events("CASE-123")[-1]["action"] == "sendback"  # open_case は events.jsonl に書かない
             assert (ws.index_dir / "access.log").read_text().splitlines()[-1].split("\t")[1:] == ["CASE-123", "test-agent"]
@@ -144,10 +146,11 @@ def test_full_flow(conf, mocked_rclone, jobs):
     assert ("checkout", "acme", "CASE-123") in mocked_rclone and ("checkin", "acme", "CASE-123") in mocked_rclone
 
 
-def test_open_case_continues_when_drive_fails(conf, monkeypatch, jobs):
-    """rclone の失敗は open_case を止めず（ローカル写しを返す）、取り寄せジョブの failed / error に残る。"""
+def test_open_case_continues_when_drive_fails(conf, monkeypatch, jobs, drive_manifest):
+    """rclone の失敗は open_case を止めず（ローカル写しを返す）、取り寄せジョブの failed / error に残る（drive にも status / error）。"""
     ws = conf.workspaces["acme"]
     CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
+    drive_manifest.set_rev("CASE-1", "on-drive")
 
     def boom(*a, **k):
         raise sync.RcloneError("remote unreachable")
@@ -159,7 +162,7 @@ def test_open_case_continues_when_drive_fails(conf, monkeypatch, jobs):
             r = await _open(c, jobs, "CASE-1")
             assert not r.is_error and r.structured_content["case"]["id"] == "CASE-1"
             d = r.structured_content["drive"]
-            assert d["fetched"] is False and d["job_id"] and "local copy" in d["note"]
+            assert d["fetched"] is False and d["job_id"] and "local copy" in d["note"] and d["status"] == "failed" and d["error"] == "RcloneError: remote unreachable"
             s = await c.call_tool("job_status", {"job_id": d["job_id"]})
             assert s.structured_content["status"] == "failed" and s.structured_content["error"] == "RcloneError: remote unreachable"
             assert s.structured_content["kind"] == "checkout" and s.structured_content["case"] == "CASE-1"
@@ -202,9 +205,10 @@ def _fake_checkout_creating_case(conf, calls, gate: threading.Event | None = Non
     return checkout
 
 
-def test_open_case_fetches_in_background_then_reads(conf, monkeypatch, jobs):
-    """Drive にしか無い案件: 1 回目の open_case は取り寄せジョブを起動し、エラーではなく通常の結果
-    {available: false, status: fetching, job_id, case: null, note} を返す。ジョブ完了後の 2 回目は取り寄せ後のディスクを反映する（available: true）。"""
+def test_open_case_fetches_in_background_then_reads(conf, monkeypatch, jobs, drive_manifest):
+    """Drive にしか無い案件: 1 回目の open_case は取り寄せジョブを起動し（待たない）、エラーではなく通常の結果
+    {available: false, status: fetching, job_id, case: null, note} を返す。manifest が無くても（未作成）ローカルに無い案件は取り寄せる。
+    ジョブ完了後の 2 回目は取り寄せ後のディスクを反映する（available: true。manifest の rev と違うので再度取り寄せ、fetched: true）。"""
     calls = []
     gate = threading.Event()
     monkeypatch.setattr(sync, "checkout", _fake_checkout_creating_case(conf, calls, gate))
@@ -227,10 +231,11 @@ def test_open_case_fetches_in_background_then_reads(conf, monkeypatch, jobs):
             assert job.status == "done" and job.result == "fake checkout created case"
             s = (await c.call_tool("job_status", {"job_id": f["job_id"]})).structured_content
             assert s["status"] == "done"
+            drive_manifest.set_rev("CASE-9", "d9")
             r = await _open(c, jobs, "CASE-9")
             assert not r.is_error, r.content
             oc = r.structured_content
-            assert oc["available"] is True and oc["drive"]["job_id"] and oc["case"]["title"] == "from drive"
+            assert oc["available"] is True and oc["drive"]["job_id"] and oc["drive"]["fetched"] is True and oc["case"]["title"] == "from drive"
             assert oc["plan"]["version"] == 1 and [t["id"] for t in oc["open_tasks"]] == ["T001"]
             assert "fetched text" in oc["worklog_tail"] and oc["recent_events"][0]["action"] == "opened"
             # 不正な ID は取り寄せる前に拒否
@@ -272,7 +277,7 @@ def inline_jobs(monkeypatch):
     monkeypatch.setattr(JobTable, "_start", lambda self, job, fn: self._run(job, fn))
 
 
-def test_open_case_unknown_case_when_fetch_finished_without_it(conf, mocked_rclone, jobs, inline_jobs):
+def test_open_case_unknown_case_when_fetch_finished_without_it(conf, mocked_rclone, jobs, inline_jobs, drive_manifest):
     """取り寄せジョブが done でも案件が無い（Drive にも無い）なら従来どおり unknown case のエラー。"""
     mcp = srv.create_server(conf, jobs=jobs)
 
@@ -285,7 +290,7 @@ def test_open_case_unknown_case_when_fetch_finished_without_it(conf, mocked_rclo
     assert ("checkout", "acme", "CASE-404") in mocked_rclone  # 取り寄せは試みた（ジョブ）
 
 
-def test_open_case_reports_failed_fetch_and_retries(conf, monkeypatch, jobs):
+def test_open_case_reports_failed_fetch_and_retries(conf, monkeypatch, jobs, drive_manifest):
     """ローカルに無い案件の取り寄せが失敗: 走っている間は fetching、失敗後の open_case は
     {available: false, status: failed, error} を返し、再試行のジョブを起動する（job_id）。"""
     gate = threading.Event(); calls = []
@@ -317,7 +322,7 @@ def test_open_case_reports_failed_fetch_and_retries(conf, monkeypatch, jobs):
     assert calls == ["CASE-9", "CASE-9"]
 
 
-def test_open_case_reports_failed_fetch_when_job_fails_immediately(conf, monkeypatch, jobs, inline_jobs):
+def test_open_case_reports_failed_fetch_when_job_fails_immediately(conf, monkeypatch, jobs, inline_jobs, drive_manifest):
     """取り寄せジョブが open_case の読み取りより先に失敗しても failed / error を返す（エラーにしない）。"""
     def boom(*a, **k):
         raise sync.RcloneError("remote unreachable")
@@ -334,7 +339,8 @@ def test_open_case_reports_failed_fetch_when_job_fails_immediately(conf, monkeyp
 
 
 def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, monkeypatch, jobs, drive_manifest):
-    """rclone は _run の層で偽装し、sync.checkout / sync.checkin 本体（last_checkin_at の記録を含む）を通す。"""
+    """rclone は _run の層で偽装し、sync.checkout / sync.checkin 本体（版マーカー・manifest 更新を含む）を通す。
+    checkin 直後（rev 一致）は取り寄せない。manifest の rev が違えば取り寄せる。未 checkin のローカル変更があれば rev が違っても skip。"""
     import os, subprocess, time
     mocked_rclone = []
 
@@ -352,29 +358,44 @@ def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, mo
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
-            # last_checkin_at 未記録 → checkout する（ジョブ）
+            # last_checkin_at 未記録・manifest 未作成 → 取り寄せず、ローカル写し（up_to_date: None）
             r = await _open(c, jobs, "CASE-1")
-            assert r.structured_content["drive"]["job_id"] and "skipped" not in r.structured_content["drive"]
+            d = r.structured_content["drive"]
+            assert d["up_to_date"] is None and "manifest unavailable" in d["note"] and "job_id" not in d and mocked_rclone == []
+            # manifest に別の rev → 取り寄せ（ジョブ完了まで待って fetched: true）
+            drive_manifest.set_rev("CASE-1", "d1")
+            r = await _open(c, jobs, "CASE-1")
+            d = r.structured_content["drive"]
+            assert d["fetched"] is True and d["up_to_date"] is True and d["job_id"] and d["drive_rev"] == "d1" and "skipped" not in d
             assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 1
-            # checkin → last_checkin_at が記録される。直後の open_case は（ローカル変更なし）checkout する
+            # checkin → rev / last_checkin_at が記録され manifest も同じ rev になる。直後の open_case は取り寄せない（up_to_date）
             js = await _checkin(c, jobs, "CASE-1")
             assert js["status"] == "done" and js["result"]["last_checkin_at"]
-            assert st.load_case("CASE-1")["last_checkin_at"] == js["result"]["last_checkin_at"]
+            c1 = st.load_case("CASE-1")
+            assert c1["last_checkin_at"] == js["result"]["last_checkin_at"] and drive_manifest.rev("CASE-1") == c1["rev"]
             r = await _open(c, jobs, "CASE-1")
-            assert r.structured_content["drive"]["job_id"] and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2
-            # checkin より新しいローカル変更（worklog.md の mtime を進める）→ checkout を skip（ジョブも作らない）
+            d = r.structured_content["drive"]
+            assert d == {"fetched": False, "up_to_date": True, "checked": d["checked"], "rev": c1["rev"]} and d["checked"]
+            assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 1
+            # 別環境が checkin した（manifest の rev が変わった）→ 取り寄せる
+            drive_manifest.set_rev("CASE-1", "from-another-host")
+            r = await _open(c, jobs, "CASE-1")
+            assert r.structured_content["drive"]["fetched"] is True and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2
+            # checkin より新しいローカル変更（worklog.md の mtime を進める）→ rev が違っても checkout を skip（ジョブも作らず manifest も見ない）
             t = time.time() + 30
             os.utime(wl, (t, t))
+            n = drive_manifest.fetches
             r = await _open(c, jobs, "CASE-1")
             d = r.structured_content["drive"]
             assert d["skipped"] == "local changes newer than last checkin" and d["fetched"] is False and "worklog.md" in d["files"] and "job_id" not in d
-            assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2  # 呼ばれていない
+            assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2 and drive_manifest.fetches == n  # 呼ばれていない
             assert st.events("CASE-1")[-1]["action"] == "checkin"             # open_case は event を書かない
-            # もう一度 checkin すれば skip は解ける（偽装した未来の mtime は現在に戻す）
+            # もう一度 checkin すれば skip は解ける（偽装した未来の mtime は現在に戻す）。rev が一致するので取り寄せない
             os.utime(wl, None)
             await _checkin(c, jobs, "CASE-1")
             r = await _open(c, jobs, "CASE-1")
-            assert r.structured_content["drive"]["job_id"] and mocked_rclone.count(("checkout", "acme", "CASE-1")) == 3
+            assert r.structured_content["drive"]["up_to_date"] is True and "job_id" not in r.structured_content["drive"]
+            assert mocked_rclone.count(("checkout", "acme", "CASE-1")) == 2
     run(main)
 
 
@@ -401,8 +422,9 @@ def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, mon
             await _checkin(c, jobs, "CASE-1")
             for i in range(3):
                 bump(ev)
+                drive_manifest.set_rev("CASE-1", f"other-{i}")      # 取り寄せの理由を作る（rev が違う）
                 r = await _open(c, jobs, "CASE-1")
-                assert r.structured_content["drive"].get("job_id"), (i, r.structured_content["drive"])
+                assert r.structured_content["drive"].get("job_id") and r.structured_content["drive"]["fetched"] is True, (i, r.structured_content["drive"])
             assert calls.count("copy") == 3 and st.events("CASE-1")[-1]["action"] == "checkin"
             # AI の実質的な変更 → skip
             await c.call_tool("log_event", {"case": "CASE-1", "action": "progress", "note": "worked"})
@@ -413,6 +435,7 @@ def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, mon
             # checkin で解け、UI 操作（人の comment）で再び skip、update_task でも skip
             await _checkin(c, jobs, "CASE-1")
             bump(ev)
+            drive_manifest.set_rev("CASE-1", "other-3")
             assert (await _open(c, jobs, "CASE-1")).structured_content["drive"].get("job_id")
             st.append_event("CASE-1", {"actor": "human", "action": "comment", "note": "check unit-6"})
             bump(ev)
@@ -422,6 +445,59 @@ def test_open_case_repeated_after_checkin_does_not_block_next_checkout(conf, mon
             bump(ev); bump(ws.cases_dir / "CASE-1" / "plan" / "v0001.json")
             r = await _open(c, jobs, "CASE-1")
             assert r.structured_content["drive"]["fetched"] is False and "plan/v0001.json" in r.structured_content["drive"]["files"]
+    run(main)
+
+
+def test_open_case_manifest_decides_fetch(conf, monkeypatch, jobs, drive_manifest):
+    """manifest の rev 一致 → 取り寄せ省略（rclone cat 1 回だけ。checkout は呼ばれない）。不一致 → 取り寄せ、20 秒以内に完了すれば fetched: true。
+    完了しなければ job_id / status。manifest 取得失敗 → up_to_date: None でローカル。エントリが無い案件は未知として取り寄せる。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    st.mark_checkin("CASE-1")
+    rev = st.load_case("CASE-1")["rev"]
+    calls = []; release = threading.Event()
+
+    def checkout(c, w, case=None, dry=False, progress=None):
+        calls.append(case)
+        assert release.wait(5)
+        return "fake checkout"
+    monkeypatch.setattr(sync, "checkout", checkout)
+    mcp = srv.create_server(conf, jobs=jobs, fetch_wait_sec=0.3)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            drive_manifest.data = {"cases": {"CASE-1": {"rev": rev, "checked_in_at": "2026-09-01T00:00:00+09:00", "from": "host-a"}}}
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            d = r.structured_content["drive"]
+            assert d["up_to_date"] is True and d["fetched"] is False and d["rev"] == rev and "job_id" not in d
+            assert drive_manifest.fetches == 1 and calls == [] and jobs.all() == []
+            cache = sync.load_manifest_cache(ws)
+            assert cache["cases"]["CASE-1"]["rev"] == rev and cache["fetched_at"]
+            # rev 不一致・取り寄せが間に合わない → job_id と status、ローカル写し
+            drive_manifest.set_rev("CASE-1", "newer")
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            d = r.structured_content["drive"]
+            assert d["fetched"] is False and d["up_to_date"] is False and d["status"] in ("queued", "running") and d["drive_rev"] == "newer"
+            assert "not finished within 0.3s" in d["note"] and "open_case again" in d["note"] and jobs.get(d["job_id"]).active
+            r2 = await c.call_tool("open_case", {"case": "CASE-1"})
+            assert r2.structured_content["drive"]["job_id"] == d["job_id"] and "already running" in r2.structured_content["drive"]["note"]
+            release.set(); _wait(jobs, d["job_id"])
+            # 間に合う → fetched: true（案件は rev が違うままなので再度取り寄せる）
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            d = r.structured_content["drive"]
+            assert d["fetched"] is True and d["up_to_date"] is True and jobs.get(d["job_id"]).status == "done" and d["rev"] == rev
+            assert calls == ["CASE-1", "CASE-1"]
+            # manifest にエントリが無い → 未知として取り寄せる（安全側）
+            drive_manifest.data = {"cases": {}}
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            assert r.structured_content["drive"]["fetched"] is True and r.structured_content["drive"]["drive_rev"] is None and len(calls) == 3
+            # manifest が取れない（オフライン）→ 取り寄せずローカル、up_to_date: None
+            drive_manifest.unavailable = True
+            r = await c.call_tool("open_case", {"case": "CASE-1"})
+            d = r.structured_content["drive"]
+            assert d["up_to_date"] is None and d["fetched"] is False and "manifest unavailable" in d["note"] and "job_id" not in d and len(calls) == 3
+            assert r.structured_content["available"] is True and r.structured_content["case"]["id"] == "CASE-1"
     run(main)
 
 
@@ -483,9 +559,10 @@ def test_plan_validation_via_mcp(conf):
     run(main)
 
 
-def test_open_case_writes_access_log_not_events(conf, mocked_rclone, jobs):
+def test_open_case_writes_access_log_not_events(conf, mocked_rclone, jobs, drive_manifest):
     """open_case を繰り返しても events.jsonl は変わらず（内容も mtime も）、index/access.log（ローカル）に 1 行ずつ増える。"""
     ws = conf.workspaces["acme"]
+    drive_manifest.set_rev("CASE-1", "on-drive")
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "t", "acme", actor="human")
     ev = ws.cases_dir / "CASE-1" / "events.jsonl"
@@ -580,11 +657,13 @@ def test_job_status_failed_and_unknown(conf, monkeypatch, jobs):
     run(main)
 
 
-def test_open_case_drive_job_id_and_dedupe(conf, monkeypatch, jobs):
-    """open_case は取り寄せを待たず今のローカル内容を返し、drive に job_id / status を入れる。取り寄せ中にもう一度開いても新しいジョブは作らない。"""
+def test_open_case_drive_job_id_and_dedupe(conf, monkeypatch, jobs, drive_manifest):
+    """取り寄せが待ち時間（fetch_wait_sec）に間に合わなければ open_case は今のローカル内容を返し、drive に job_id / status を入れる。
+    取り寄せ中にもう一度開いても新しいジョブは作らない。"""
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "before fetch", "acme", actor="human")
+    drive_manifest.set_rev("CASE-1", "on-drive")
     started = threading.Event(); release = threading.Event()
 
     def slow_checkout(c, w, case=None, dry=False, progress=None):
@@ -593,7 +672,7 @@ def test_open_case_drive_job_id_and_dedupe(conf, monkeypatch, jobs):
         case_json = st.load_case(case); case_json["title"] = "after fetch"; st.save_case(case_json)
         return "fake copy done"
     monkeypatch.setattr(sync, "checkout", slow_checkout)
-    mcp = srv.create_server(conf, jobs=jobs)
+    mcp = srv.create_server(conf, jobs=jobs, fetch_wait_sec=0.2)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
@@ -610,6 +689,7 @@ def test_open_case_drive_job_id_and_dedupe(conf, monkeypatch, jobs):
             assert s["status"] == "done" and s["kind"] == "checkout" and s["result"] == "fake copy done"
             r3 = await _open(c, jobs, "CASE-1")
             assert r3.structured_content["case"]["title"] == "after fetch" and r3.structured_content["drive"]["job_id"] != d["job_id"]
+            assert r3.structured_content["drive"]["fetched"] is True
     run(main)
 
 

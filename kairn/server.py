@@ -4,8 +4,11 @@
 - UI : /ui                      （kairn/ui.py。Mount ではなく同じ Starlette にルートを直接載せる）
 規則の実体は store（証拠必須・superseded 自動化）。ここでは引数を検証して委譲する。
 ツール内の失敗は ToolError で返す（呼び出し元のエージェントに理由が文章で届く）。
-rclone の転送（checkin、open_case の取り寄せ）はジョブ（kairn/jobs.py、デーモンスレッド）にして即座に job_id を返す
+rclone の転送（checkin、open_case の取り寄せ）はジョブ（kairn/jobs.py、デーモンスレッド）にして job_id を返す
 （大きな案件で MCP クライアントの呼び出しタイムアウトに当たらないため）。状態は job_status で見る。
+open_case の取り寄せは、先に Drive の manifest.json（rclone cat 1 回、10 秒）で案件の rev を見て、ローカルの case.json.rev と同じなら
+省略する（差分なしの取り寄せでも 30 秒かかるため）。違うときだけジョブを起動し、最大 FETCH_WAIT_SEC 秒待って間に合えば取り寄せ後の
+内容を返す（_fetch_from_drive）。
 停止（SIGTERM / SIGINT）: MCP クライアントが streamable HTTP のセッション（SSE）を張ったままだと uvicorn の graceful shutdown が
 接続の終了を待ち続け systemd の停止タイムアウトに当たるので、開いている接続は最大 GRACEFUL_SHUTDOWN_SEC 秒しか待たない。
 受信時に running のジョブがあれば一覧をログに 1 行出す（ジョブ表はメモリ内。整合は次回の checkin / checkout に任せる）。
@@ -25,7 +28,7 @@ from starlette.routing import Mount, Route
 from . import config as cfg
 from .index import Index
 from .jobs import JobTable
-from .store import CaseNotFound, CaseStore, append_access_log, validate_case_id
+from .store import CaseNotFound, CaseStore, append_access_log, now_iso, validate_case_id
 
 INSTRUCTIONS = (
     "kairn: 案件（case）単位の作業ログ。案件を開くときは open_case（無ければ find_cases / list_cases で選ぶ。選ぶのは人）。"
@@ -35,6 +38,7 @@ INSTRUCTIONS = (
 MCP_PATH = "/mcp"
 UI_PATH = "/ui"
 GRACEFUL_SHUTDOWN_SEC = 5   # SIGTERM 後、開いている接続（MCP の SSE 等）を待つ上限秒。systemd の TimeoutStopSec（15）より短くする
+FETCH_WAIT_SEC = 20         # open_case が取り寄せジョブの完了を待つ上限秒（間に合えば取り寄せ後の内容を返す。越えたらローカル写し＋job_id）
 
 
 def _fail(e: Exception) -> ToolError:
@@ -43,9 +47,10 @@ def _fail(e: Exception) -> ToolError:
     return ToolError(f"{type(e).__name__}: {e}")
 
 
-def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTable | None = None) -> MCPServer:
+def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTable | None = None,
+                  fetch_wait_sec: float = FETCH_WAIT_SEC) -> MCPServer:
     """設定に閉じた MCP サーバーを作る（テストでは in-process の Client から直接繋ぐ）。
-    jobs は checkin / 取り寄せのジョブ表（UI と共有する。省略時は専用に作る）。"""
+    jobs は checkin / 取り寄せのジョブ表（UI と共有する。省略時は専用に作る）。fetch_wait_sec は open_case が取り寄せを待つ上限秒。"""
     mcp = MCPServer("kairn", instructions=INSTRUCTIONS, version="0.0.1")
     jobs = jobs if jobs is not None else JobTable()
 
@@ -82,15 +87,16 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
 
     @mcp.tool()
     def open_case(case: str, workspace: str | None = None, agent: str = "") -> dict[str, Any]:
-        """案件を開く: case / 最新計画 / open タスク / 直近イベント / 人からの差し戻し・コメント / 関連案件 / worklog 末尾 を 1 回で返す（available=true）。ローカルに無く Drive から取り寄せ中なら available=false, status=fetching, job_id（エラーではない。job_status が done になってから再実行）。取り寄せが失敗していれば status=failed, error。"""
+        """案件を開く: case / 最新計画 / open タスク / 直近イベント / 人からの差し戻し・コメント / 関連案件 / worklog 末尾 を 1 回で返す（available=true）。drive: Drive の manifest と rev を比べ、同じなら up_to_date=true（取り寄せ省略）、違えば取り寄せて fetched=true（20 秒で間に合わなければ job_id）。ローカルに無く Drive から取り寄せ中なら available=false, status=fetching, job_id（エラーではない。job_status が done になってから再実行）。取り寄せが失敗していれば status=failed, error。"""
         ws = _ws(workspace, case); st = _store(ws)
         try:
             st.case_dir(case)  # ID の検証（Drive 取り寄せの前）
-            # 順序: ワークスペース解決 → 取り寄せジョブの起動（events.jsonl はマージ、他は --update。待たない）→ 今のローカル内容を読む。
-            # 取り寄せ完了後（job_status が done）にもう一度 open_case すると最新になる
+            # 順序: ワークスペース解決 → manifest の rev を比較 → 違えば取り寄せジョブ（events.jsonl はマージ、他は --update）を起動して
+            # 最大 fetch_wait_sec 待つ → ローカル内容を読む（間に合えば取り寄せ後、間に合わなければ今の写し。job_status が done になってから
+            # もう一度 open_case すると最新になる）
             # ローカルに無い案件の直前の取り寄せが failed なら、その error を報告する（新しい取り寄せは下で起動＝再試行）
             prev = None if (ws.cases_dir / case / "case.json").exists() else jobs.latest("checkout", ws.name, case)
-            fetched = _fetch_from_drive(conf, ws, st, case, jobs)
+            fetched = _fetch_from_drive(conf, ws, st, case, jobs, wait_sec=fetch_wait_sec)
             try:
                 c = st.load_case(case)
             except CaseNotFound:
@@ -237,20 +243,49 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
     return mcp
 
 
-def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, st: CaseStore, case: str, jobs: JobTable) -> dict[str, Any]:
-    """open_case の取り寄せ。case.json.last_checkin_at より新しいローカル変更があれば skip（未 checkin の変更を Drive で上書きしない）。
-    open_case 自身は events.jsonl に書かない（閲覧記録は index/access.log）ので、繰り返し開いても skip にならない。
-    skip でなければ checkout をジョブとして起動し、待たずに {fetched: False, job_id, status, note} を返す（open_case は今のローカル内容を返す。
-    取り寄せ完了後の再 open_case で最新になる）。同じ案件の取り寄せが走っていればその job_id。rclone の失敗はジョブの error に残る（docs/mcp-tools.md）。"""
+def _fetch_from_drive(conf: cfg.Config, ws: cfg.Workspace, st: CaseStore, case: str, jobs: JobTable,
+                      wait_sec: float = FETCH_WAIT_SEC) -> dict[str, Any]:
+    """open_case の取り寄せ判定（docs/mcp-tools.md「open_case の drive」）。順に:
+    1. case.json.last_checkin_at より新しいローカル変更があれば skip（未 checkin の変更を Drive で上書きしない。manifest も見ない）。
+       open_case 自身は events.jsonl に書かない（閲覧記録は index/access.log）ので、繰り返し開いても skip にならない
+    2. Drive の manifest.json を rclone cat で 1 回読む（sync.MANIFEST_TIMEOUT_SEC。キャッシュも更新）。
+       ローカルに案件があり、manifest が取れなければ取り寄せず {up_to_date: None, note: "manifest unavailable"}。
+       manifest の当該案件の rev がローカルの case.json.rev と同じなら取り寄せず {up_to_date: True, checked}
+    3. それ以外（rev が違う／manifest にエントリが無い＝未知として安全側／ローカルに無い）は checkout をジョブとして起動する。
+       ローカルに案件があれば最大 wait_sec 秒待ち、done なら {fetched: True}、failed なら {fetched: False, status: failed, error}、
+       間に合わなければ {fetched: False, job_id, status}（open_case は今のローカル写しを返す）。ローカルに無い案件は待たない
+       （従来の fetching 応答。open_case が available=false で返す）。同じ案件の取り寄せが走っていればその job_id。
+    rclone の失敗はジョブの error に残る。"""
     from . import sync
     changed = st.local_changes_since_checkin(case)
     if changed:
         return {"fetched": False, "skipped": "local changes newer than last checkin", "files": changed}
+    local = (ws.cases_dir / case / "case.json").exists()
+    manifest = sync.refresh_manifest(conf, ws)
+    checked = now_iso()
+    entry = manifest["cases"].get(case) if manifest else None
+    entry = entry if isinstance(entry, dict) else None
+    if local:
+        if manifest is None:
+            return {"fetched": False, "up_to_date": None, "checked": checked,
+                    "note": f"manifest unavailable ({sync.manifest_drive_path(conf, ws)}: offline, or not created yet: kairn manifest rebuild {ws.name}); "
+                            "the drive was not consulted and this result is the current local copy"}
+        local_rev = st.load_case(case).get("rev")
+        if entry is not None and local_rev and entry.get("rev") == local_rev:
+            return {"fetched": False, "up_to_date": True, "checked": checked, "rev": local_rev}
     job, created = jobs.submit("checkout", ws.name, case, lambda progress: sync.checkout(conf, ws, case, progress=progress))
-    return {"fetched": False, "job_id": job.id, "status": job.status,
-            "note": ("fetching from the drive in the background; this result is the current local copy. "
-                     "open_case again after job_status(job_id) reports done" if created
-                     else "a fetch for this case is already running; this result is the current local copy")}
+    base: dict[str, Any] = {"fetched": False, "up_to_date": False, "checked": checked, "job_id": job.id,
+                            "drive_rev": entry.get("rev") if entry else None}
+    if local and job.wait(wait_sec):
+        if job.status == "done":
+            return {**base, "fetched": True, "up_to_date": True, "rev": st.load_case(case).get("rev"),
+                    "note": "fetched from the drive (rev differed); this result reflects the fetched content"}
+        return {**base, "status": "failed", "error": job.error,
+                "note": "the fetch from the drive failed (error); this result is the current local copy"}
+    return {**base, "status": job.status,
+            "note": ((f"fetching from the drive in the background (not finished within {wait_sec:g}s); this result is the current local copy. "
+                      "open_case again after job_status(job_id) reports done") if created
+                     else "a fetch for this case is already running; this result is the current local copy. open_case again after job_status(job_id) reports done")}
 
 
 def build_app(conf: cfg.Config, host: str = "127.0.0.1", default_agent: str = "unknown") -> Starlette:

@@ -2,6 +2,7 @@
 MCP（streamable HTTP, mcp 2.x Client）と UI（HTTP）を実際に叩く。rclone は PATH 先頭の偽物。"""
 from __future__ import annotations
 
+import json
 import socket
 import subprocess
 import sys
@@ -81,6 +82,8 @@ def test_end_to_end(tmp_path, env, fake_rclone):
         r = subprocess.run([str(script), "cases", "acme"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
         assert r.returncode == 0 and "CASE-123" in r.stdout, r.stderr
 
+    # Drive の manifest.json（偽 rclone の cat / rcat が <tmp>/drive/ を読み書きする）: 別の rev を置いて open_case に取り寄せさせる
+    (tmp_path / "drive" / "manifest.json").write_text('{"cases": {"CASE-123": {"rev": "stale", "checked_in_at": "2026-08-01T00:00:00+09:00", "from": "other-host"}}}', encoding="utf-8")
     port = _free_port()
     proc = subprocess.Popen([PY, "-m", "kairn.cli", "serve", "--port", str(port)], cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     base = f"http://127.0.0.1:{port}"
@@ -113,12 +116,17 @@ def test_end_to_end(tmp_path, env, fake_rclone):
                 r = await c.call_tool("open_case", {"case": "CASE-123"})
                 oc = r.structured_content
                 assert not r.is_error and oc["human_feedback"][-1]["note"] == "unit-6 でも確認" and oc["human_feedback"][-1]["task"] == "T002"
-                assert oc["drive"]["job_id"] and oc["drive"]["fetched"] is False  # 取り寄せはジョブ（待たない）
-                assert (await _job(c, oc["drive"]["job_id"]))["status"] == "done"   # 偽 rclone が成功を返す
+                assert oc["drive"]["job_id"] and oc["drive"]["fetched"] is True and oc["drive"]["drive_rev"] == "stale"   # manifest の rev が違う → 取り寄せ（偽 rclone は即成功）
+                assert (await _job(c, oc["drive"]["job_id"]))["status"] == "done"
                 r = await c.call_tool("checkin", {"case": "CASE-123"})
                 assert not r.is_error and r.structured_content["job_id"]
                 js = await _job(c, r.structured_content["job_id"])
                 assert js["status"] == "done" and js["result"]["ok"] and js["result"]["last_checkin_at"], js
+                manifest = json.loads((tmp_path / "drive" / "manifest.json").read_text(encoding="utf-8"))      # rcat で書き戻された
+                rev = json.loads((case_dir / "case.json").read_text(encoding="utf-8"))["rev"]
+                assert manifest["cases"]["CASE-123"]["rev"] == rev and manifest["updated_at"]
+                r = await c.call_tool("open_case", {"case": "CASE-123"})                                        # rev 一致 → 取り寄せ省略
+                assert r.structured_content["drive"]["up_to_date"] is True and "job_id" not in r.structured_content["drive"]
                 r = await c.call_tool("job_status", {"job_id": "nope"})
                 assert r.is_error and "unknown job" in r.content[0].text
         anyio.run(mcp_flow)
@@ -138,4 +146,5 @@ def test_end_to_end(tmp_path, env, fake_rclone):
             proc.kill()
     log = (tmp_path / "rclone.log").read_text()
     assert "copy my-drive:ws/acme/cases/CASE-123" in log and "sync " in log and "my-drive:ws/acme/cases/CASE-123" in log
+    assert "cat my-drive:ws/acme/manifest.json" in log and "rcat my-drive:ws/acme/manifest.json" in log
     assert "checkin" in [l.split('"action": "')[1].split('"')[0] for l in (case_dir / "events.jsonl").read_text().splitlines() if '"action"' in l]
