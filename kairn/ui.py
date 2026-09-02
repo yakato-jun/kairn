@@ -22,7 +22,7 @@ from starlette.routing import Route
 from . import config as cfg
 from . import sync
 from .jobs import JobTable
-from .store import JST, TASK_OWNERS, CaseStore
+from .store import JST, TASK_OWNERS, CaseStore, parse_related
 
 STALE_DAYS = 7  # これを超えて動きの無い open タスクを目立たせる（自動では消さない）
 LIVE = ("open", "doing", "blocked")
@@ -207,7 +207,7 @@ def ui_routes(conf: cfg.Config | cfg.ConfigHolder, prefix: str = "/ui", jobs: Jo
             + "".join(f"<li>{_esc(t['id'])} [{_esc(t['status'])}] {_esc(t['title'])}{' ← ' + _esc(t['carried_from']) if t.get('carried_from') else ''}"
                       f"{' → ' + _esc(t['superseded_by']) if t.get('superseded_by') else ''}</li>" for t in p["tasks"]) + "</ul></details>"
             for p in reversed(st.list_plans(cid)))
-        related = ", ".join(f"<a href='{_url(ws, r)}'>{_esc(r)}</a>" if (ws.cases_dir / r / "case.json").exists() else _esc(r) for r in c.get("related", []))
+        related = ", ".join(_related_link(conf, ws, r) for r in c.get("related", []))
         el = c.get("elements") or {}
         elements = " ".join(f"{_esc(k)}: " + "".join(f"<a class='tag' href='{P}?element={quote(v, safe='')}'>{_esc(v)}</a>" for v in vs) for k, vs in el.items())
         meta = " · ".join(x for x in (f"status: <b>{_esc(c.get('status'))}</b>",
@@ -389,6 +389,17 @@ def ui_routes(conf: cfg.Config | cfg.ConfigHolder, prefix: str = "/ui", jobs: Jo
                 f"<button>この下書きを case.json に適用</button> <small>title / summary / elements / related / causal を置き換え、decision として記録する</small></form>"
                 f"<details><summary>下書き JSON</summary><pre>{_esc(json.dumps(card, ensure_ascii=False, indent=1))}</pre></details>")
 
+    def _related_link(conf: cfg.Config, ws: cfg.Workspace, ref: object) -> str:
+        """関連欄の 1 要素: 同 ws の案件 ID はそのまま、"<ws>/<case>" は ws 名付きで表示し、実在する案件（ws が登録済みで case.json がある）ならリンク。"""
+        try:
+            ws_name, case = parse_related(str(ref))
+        except ValueError:
+            return _esc(ref)
+        target = conf.workspaces.get(ws_name) if ws_name else ws
+        if target is not None and (target.cases_dir / case / "case.json").exists():
+            return f"<a href='{_url(target, case)}'>{_esc(ref)}</a>"
+        return _esc(ref)
+
     return [Route(P, index), Route(P + "/", index), Route(P + "/refresh", refresh, methods=["POST"]),
             Route(P + "/settings", settings), Route(P + "/settings/{op}", settings_act, methods=["POST"]),
             Route(P + "/{ws}/{case}", case_page), Route(P + "/{ws}/{case}/{kind}", act, methods=["POST"])]
@@ -420,9 +431,12 @@ def same_origin(req: Request) -> bool:
 
 
 def _event_target(e: dict) -> str:
-    """時系列の action の後ろに出す対象: task（T012）か、ステータス変更（action: status）なら「<from> → <to>」（旧形式の from/to 無しは空）。"""
+    """時系列の action の後ろに出す対象: task（T012）か、ステータス変更（action: status）なら「<from> → <to>」（旧形式の from/to 無しは空）、
+    跨ぎ参照（action: xref）なら「他 ws 参照: <ws>/<case> (<tool>)」。"""
     if e.get("action") == "status" and e.get("to"):
         return f"{e.get('from') or '?'} → {e['to']}"
+    if e.get("action") == "xref":
+        return f"他 ws 参照: {e.get('workspace') or '?'}/{e.get('case') or '?'}" + (f" ({e['tool']})" if e.get("tool") else "")
     return e.get("task") or ""
 
 

@@ -316,3 +316,25 @@ def test_ui_reads_config_changes_without_restart(conf):
     # 壊れた設定に書き換わっても UI は直前の設定で動き続ける
     conf.path.write_text("drive: {remote: [broken\n", encoding="utf-8"); bump_mtime(conf.path)
     assert c.get("/ui/beta/CASE-7").status_code == 200 and "logs/**" in c.get("/ui/settings").text
+
+
+def test_case_page_shows_xref_events_and_cross_workspace_related(conf2):
+    """時系列: xref event は「他 ws 参照: <ws>/<case> (<tool>)」で出る。関連欄: "<ws>/<case>" は実在すれば /ui/<ws>/<case> へのリンク、
+    無ければ文字列のまま。一覧には跨ぎ参照の印を出さない。"""
+    _seed(conf2)
+    a = CaseStore(conf2.workspaces["acme"].cases_dir)
+    b = CaseStore(conf2.workspaces["beta"].cases_dir)
+    b.create_case("CASE-9", "beta の案件", "beta", actor="human", related=["acme/CASE-123", "acme/CASE-404", "gamma/CASE-1", "CASE-9"])
+    ev = b.append_xref("CASE-9", "acme", "CASE-123", "open_case", agent="claude")
+    b.append_xref("CASE-9", "acme", "CASE-404", "search")
+    c = TestClient(build_ui(conf2))
+    page = c.get("/ui/beta/CASE-9").text
+    assert "xref 他 ws 参照: acme/CASE-123 (open_case)" in page and "他 ws 参照: acme/CASE-404 (search)" in page and "<b>ai</b> <small>claude</small>" in page
+    assert "<a href='/ui/acme/CASE-123'>acme/CASE-123</a>" in page and "<a href='/ui/beta/CASE-9'>CASE-9</a>" in page
+    assert "acme/CASE-404" in page and "href='/ui/acme/CASE-404'" not in page and "gamma/CASE-1" in page and "href='/ui/gamma/CASE-1'" not in page
+    assert c.get("/ui/acme/CASE-123").status_code == 200
+    # 参照された側（acme/CASE-123）のページ・一覧には何も出ない
+    assert "他 ws 参照" not in c.get("/ui/acme/CASE-123").text
+    listing = c.get("/ui").text
+    assert "CASE-9" in listing and "CASE-123" in listing and "他 ws" not in listing   # 参照元の最終イベント欄に xref が出るのは従来どおり（印は足さない）
+    assert a.events("CASE-123")[-1]["action"] != "xref" and ev["t"][:16] in page
