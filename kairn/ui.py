@@ -207,7 +207,10 @@ def ui_routes(conf: cfg.Config | cfg.ConfigHolder, prefix: str = "/ui", jobs: Jo
             + "".join(f"<li>{_esc(t['id'])} [{_esc(t['status'])}] {_esc(t['title'])}{' ← ' + _esc(t['carried_from']) if t.get('carried_from') else ''}"
                       f"{' → ' + _esc(t['superseded_by']) if t.get('superseded_by') else ''}</li>" for t in p["tasks"]) + "</ul></details>"
             for p in reversed(st.list_plans(cid)))
-        related = ", ".join(_related_link(conf, ws, r) for r in c.get("related", []))
+        related = ", ".join(
+            _related_link(conf, ws, r)
+            + f"<form class='inline' method=post action='{_url(ws, cid, 'unrelated')}' accept-charset='utf-8'><input type=hidden name=ref value='{_esc(r)}'>"
+              f"<button title='関連から外す（人の操作。event に記録）'>×</button></form>" for r in c.get("related", []))
         el = c.get("elements") or {}
         elements = " ".join(f"{_esc(k)}: " + "".join(f"<a class='tag' href='{P}?element={quote(v, safe='')}'>{_esc(v)}</a>" for v in vs) for k, vs in el.items())
         meta = " · ".join(x for x in (f"status: <b>{_esc(c.get('status'))}</b>",
@@ -237,6 +240,8 @@ def ui_routes(conf: cfg.Config | cfg.ConfigHolder, prefix: str = "/ui", jobs: Jo
                  f"<form method=post action='{_url(ws, cid, 'status')}' accept-charset='utf-8'><select name=status>"
                  + "".join(f"<option{' selected' if s == c.get('status') else ''}>{s}</option>" for s in ("open", "closed", "suspended"))
                  + f"</select><input name=note placeholder='理由' size=30><button>案件の状態を変更</button></form>"
+                 f"<form method=post action='{_url(ws, cid, 'related')}' accept-charset='utf-8'><input name=ref placeholder='関連案件（CASE-123 か <ws>/<case>）' size=30>"
+                 f"<button>関連に追加</button> <small>case.json の related に足す（形だけ検証。削除は related 欄の ×）</small></form>"
                  f"<form method=post action='{_url(ws, cid, 'extract')}'><button>下書きを取得</button> "
                  f"<small>extract.agent={_esc(conf.extract_agent)} の子エージェントが案件ディレクトリを読んで case.json の下書きを返す（書き込まない。適用は次の画面で）</small></form>")
         body = (f"<h2>{_esc(cid)} <small>{_esc(c.get('title', ''))}</small></h2><p><small>{meta}</small></p>{running}"
@@ -344,6 +349,16 @@ def ui_routes(conf: cfg.Config | cfg.ConfigHolder, prefix: str = "/ui", jobs: Jo
                 st.set_case_status(cid, str(form.get("status")), actor="human", note=note)
             except ValueError as e:
                 return PlainTextResponse(str(e), status_code=400)
+        elif kind in ("related", "unrelated"):  # related の追加／削除（人の操作。形だけ検証し、実在は問わない）
+            ref = str(form.get("ref", "")).strip()
+            if not ref:
+                return PlainTextResponse("ref is required", status_code=400)
+            try:
+                r = st.link_related(cid, [ref], actor="human", note=note) if kind == "related" else st.unlink_related(cid, ref, actor="human", note=note)
+            except ValueError as e:
+                return PlainTextResponse(f"invalid: {e}", status_code=400)
+            if not r["changed"]:
+                return PlainTextResponse(f"related already has {ref}" if kind == "related" else f"related does not have {ref}", status_code=400)
         elif kind == "extract":  # 子エージェントで下書きを作り、差分と適用ボタンを表示する（case.json は書かない）
             from . import extract
             # 子プロセスは最長 extract.timeout 秒ブロックする。同じプロセスの MCP（/mcp）を止めないようスレッドで実行する
@@ -432,11 +447,13 @@ def same_origin(req: Request) -> bool:
 
 def _event_target(e: dict) -> str:
     """時系列の action の後ろに出す対象: task（T012）か、ステータス変更（action: status）なら「<from> → <to>」（旧形式の from/to 無しは空）、
-    跨ぎ参照（action: xref）なら「他 ws 参照: <ws>/<case> (<tool>)」。"""
+    跨ぎ参照（action: xref）なら「他 ws 参照: <ws>/<case> (<tool>)」、related の変更（action: related）なら「+<ref>」「-<ref>」。"""
     if e.get("action") == "status" and e.get("to"):
         return f"{e.get('from') or '?'} → {e['to']}"
     if e.get("action") == "xref":
         return f"他 ws 参照: {e.get('workspace') or '?'}/{e.get('case') or '?'}" + (f" ({e['tool']})" if e.get("tool") else "")
+    if e.get("action") == "related":
+        return " ".join([f"+{r}" for r in e.get("added") or []] + [f"-{r}" for r in e.get("removed") or []])
     return e.get("task") or ""
 
 

@@ -338,3 +338,40 @@ def test_case_page_shows_xref_events_and_cross_workspace_related(conf2):
     listing = c.get("/ui").text
     assert "CASE-9" in listing and "CASE-123" in listing and "他 ws" not in listing   # 参照元の最終イベント欄に xref が出るのは従来どおり（印は足さない）
     assert a.events("CASE-123")[-1]["action"] != "xref" and ev["t"][:16] in page
+
+
+def test_case_page_adds_and_removes_related(conf2):
+    """関連の追加（POST related）/ 削除（POST unrelated）: case.json.related を変え、actor=human の related event（added / removed）を書き、
+    関連欄と時系列に出る。不正な形・空・重複・無いものの削除は 400 で何も書かない。CSRF は same_origin。"""
+    st = _seed(conf2)
+    b = CaseStore(conf2.workspaces["beta"].cases_dir)
+    b.create_case("CASE-9", "beta の案件", "beta", actor="human")
+    c = TestClient(build_ui(conf2))
+    r = c.post("/ui/acme/CASE-123/related", data={"ref": "beta/CASE-9", "note": "同種の症状"}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/ui/acme/CASE-123"
+    r = c.post("/ui/acme/CASE-123/related", data={"ref": " CASE-100 "}, follow_redirects=False)
+    assert r.status_code == 303
+    assert st.load_case("CASE-123")["related"] == ["beta/CASE-9", "CASE-100"]     # 実在しない CASE-100 も形だけで受ける
+    ev = [e for e in st.events("CASE-123") if e["action"] == "related"]
+    assert [(e["actor"], e["added"], e["note"]) for e in ev] == [("human", ["beta/CASE-9"], "同種の症状"), ("human", ["CASE-100"], "")]
+    assert not any(e["action"] == "xref" for e in st.events("CASE-123"))          # UI の追加は跨ぎ参照（xref）にしない
+    page = c.get("/ui/acme/CASE-123").text
+    assert "<a href='/ui/beta/CASE-9'>beta/CASE-9</a>" in page and "related +beta/CASE-9" in page and "related +CASE-100" in page
+    assert "action='/ui/acme/CASE-123/unrelated'" in page and "value='beta/CASE-9'" in page and "action='/ui/acme/CASE-123/related'" in page
+    # 400: 不正な形・空・重複
+    for data in ({"ref": "a/b/c"}, {"ref": "../x"}, {"ref": ""}, {"ref": "CASE-100"}):
+        assert c.post("/ui/acme/CASE-123/related", data=data).status_code == 400, data
+    assert st.load_case("CASE-123")["related"] == ["beta/CASE-9", "CASE-100"] and len(st.events("CASE-123")) == 4   # opened + plan + related ×2
+    # 削除
+    r = c.post("/ui/acme/CASE-123/unrelated", data={"ref": "CASE-100", "note": "誤り"}, follow_redirects=False)
+    assert r.status_code == 303 and st.load_case("CASE-123")["related"] == ["beta/CASE-9"]
+    e = st.events("CASE-123")[-1]
+    assert e["action"] == "related" and e["actor"] == "human" and e["removed"] == ["CASE-100"] and e["note"] == "誤り" and "added" not in e
+    assert c.post("/ui/acme/CASE-123/unrelated", data={"ref": "CASE-100"}).status_code == 400   # もう無い
+    assert "related -CASE-100" in c.get("/ui/acme/CASE-123").text
+    # CSRF
+    for kind in ("related", "unrelated"):
+        assert c.post(f"/ui/acme/CASE-123/{kind}", data={"ref": "beta/CASE-9"}, headers={"Origin": "http://evil.example"}).status_code == 403
+    assert st.load_case("CASE-123")["related"] == ["beta/CASE-9"]
+    # 未知の案件は 404
+    assert c.post("/ui/acme/CASE-999/related", data={"ref": "CASE-123"}).status_code == 404
