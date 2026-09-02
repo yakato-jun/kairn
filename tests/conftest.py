@@ -30,6 +30,15 @@ def conf(tmp_path: Path, monkeypatch) -> cfg.Config:
                       workspaces={"acme": ws}, path=tmp_path / "config.yaml")
 
 
+@pytest.fixture
+def conf2(conf: cfg.Config) -> cfg.Config:
+    """conf に 2 つ目のワークスペース beta を足したもの（跨ぎ参照のテスト用）。"""
+    beta = cfg.Workspace(name="beta", description="second", data_root=conf.workspaces["acme"].data_root)
+    beta.cases_dir.mkdir(parents=True)
+    conf.workspaces["beta"] = beta
+    return conf
+
+
 def bump_mtime(path: Path) -> None:
     """ファイルの mtime を +1 秒進める（ConfigHolder の更新検知をテストで決定的にする: 連続した書き込みが同じ mtime 粒度に収まっても変更と分かる）。"""
     st = path.stat()

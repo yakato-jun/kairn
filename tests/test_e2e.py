@@ -111,9 +111,9 @@ def test_end_to_end(tmp_path, env, fake_rclone):
                 r = await c.call_tool("update_task", {"case": "CASE-123", "task": "T001", "status": "done", "note": "ok", "evidence": [{"type": "pr", "id": 42}]})
                 assert not r.is_error and r.structured_content["status"] == "done"
                 r = await c.call_tool("search", {"query": "UART 460800"})
-                assert not r.is_error and r.structured_content["result"][0]["heading"] == "Notes"
+                assert not r.is_error and r.structured_content["results"][0]["heading"] == "Notes" and r.structured_content["searched"] == ["acme"]
                 r = await c.call_tool("find_cases", {"query": "driver init"})
-                assert not r.is_error and r.structured_content["result"][0]["case"] == "CASE-123"
+                assert not r.is_error and r.structured_content["results"][0]["case"] == "CASE-123"
                 # UI から差し戻し → open_case の human_feedback に出る
                 assert _post(f"{base}/ui/acme/CASE-123/sendback", {"task": "T002", "note": "unit-6 でも確認"}) == 303
                 r = await c.call_tool("open_case", {"case": "CASE-123"})

@@ -105,12 +105,14 @@ def test_full_flow(conf, mocked_rclone, jobs, fake_drive):
             assert r.is_error
             # search / find_cases
             r = await c.call_tool("search", {"query": "UART 460800"})
-            hits = r.structured_content["result"]
+            hits = r.structured_content["results"]
             assert not r.is_error and hits[0]["case"] == "CASE-123" and hits[0]["heading"] == "Notes"
+            assert hits[0]["workspace"] == "acme" and hits[0]["cross_workspace"] is False
+            assert r.structured_content["workspace"] == "acme" and r.structured_content["scope"] == "auto" and r.structured_content["searched"] == ["acme"]
             r = await c.call_tool("search", {"query": "送信量（超過）", "cases": ["CASE-123"]})
-            assert not r.is_error and r.structured_content["result"]
+            assert not r.is_error and r.structured_content["results"]
             r = await c.call_tool("find_cases", {"query": "unit-2 driver init"})
-            assert not r.is_error and r.structured_content["result"][0]["case"] == "CASE-123"
+            assert not r.is_error and r.structured_content["results"][0]["case"] == "CASE-123" and r.structured_content["searched"] == ["acme"]
             # list_cases
             r = await c.call_tool("list_cases", {})
             lc = r.structured_content["result"]
@@ -122,7 +124,8 @@ def test_full_flow(conf, mocked_rclone, jobs, fake_drive):
             oc = r.structured_content
             assert not r.is_error and oc["case"]["id"] == "CASE-123" and oc["plan"]["version"] == 1
             assert [t["id"] for t in oc["open_tasks"]] == ["T002"]
-            assert oc["human_feedback"][-1]["note"] == "unit-6 でも確認" and oc["related"] == ["CASE-100"]
+            assert oc["human_feedback"][-1]["note"] == "unit-6 でも確認" and oc["cross_workspace"] is False
+            assert oc["related"] == [{"ref": "CASE-100", "workspace": "acme", "case": "CASE-100", "cross_workspace": False, "exists": False, "title": None, "status": None}]
             assert "460800" in oc["worklog_tail"] and oc["drive"]["fetched"] is True and oc["drive"]["job_id"] and oc["drive"]["drive_rev"] == "on-drive"
             assert jobs.get(oc["drive"]["job_id"]).kind == "checkout" and jobs.get(oc["drive"]["job_id"]).result == "fake checkout"
             assert st.events("CASE-123")[-1]["action"] == "sendback"  # open_case は events.jsonl に書かない
@@ -185,7 +188,7 @@ def test_search_survives_broken_symlink(conf, monkeypatch):
         async with Client(mcp, raise_exceptions=True) as c:
             r = await c.call_tool("search", {"query": "Objective"})
             assert not r.is_error, r.content
-            assert r.structured_content["result"][0]["case"] == "CASE-1"
+            assert r.structured_content["results"][0]["case"] == "CASE-1"
     run(main)
 
 
@@ -965,3 +968,165 @@ def test_mcp_checkin_uses_rclone_flags_set_after_start(conf, monkeypatch, jobs):
             js = await _checkin(c, jobs, "CASE-1")
             assert js["status"] == "done" and "--checkers" not in transfer_cmds()[2] and holder.reloads == 2
     run(main)
+
+
+# ---------- 跨ぎ参照（docs/mcp-tools.md「跨ぎ参照」）: scope / from_case / related の展開 ----------
+
+def _seed_two_workspaces(conf2):
+    """acme: CASE-1（worklog に alphaword）、beta: CASE-9（worklog に betaword。related に acme/CASE-1）。"""
+    a = CaseStore(conf2.workspaces["acme"].cases_dir); b = CaseStore(conf2.workspaces["beta"].cases_dir)
+    a.create_case("CASE-1", "acme の案件 alpha", "acme", actor="human", elements={"machine": ["unit-2"]})
+    (conf2.workspaces["acme"].cases_dir / "CASE-1" / "worklog.md").write_text("# a\n## Notes\nalphaword only here\n", encoding="utf-8")
+    b.create_case("CASE-9", "beta の案件 beta", "beta", actor="human", related=["acme/CASE-1", "CASE-8"])
+    (conf2.workspaces["beta"].cases_dir / "CASE-9" / "worklog.md").write_text("# b\n## Notes\nbetaword only here\n## Decision Log\nbetaword again\n", encoding="utf-8")
+    return a, b
+
+
+def test_search_and_find_cases_scope(conf2):
+    """scope=auto: 自 ws にヒットがあれば他 ws を見ない、0 件なら全 ws を検索し cross_workspace / searched が付く。scope=workspace: 自 ws のみ。scope=all: 両方。
+    自 ws は workspace= → from_case の ws → 登録が 1 つならそれ。決まらなければ scope=all 以外は ToolError。不正な scope は ToolError。"""
+    _seed_two_workspaces(conf2)
+    mcp = srv.create_server(conf2)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            # auto: 自 ws にヒット → 他 ws は検索しない
+            r = await c.call_tool("search", {"query": "alphaword", "workspace": "acme"})
+            out = r.structured_content
+            assert not r.is_error and out["workspace"] == "acme" and out["scope"] == "auto" and out["searched"] == ["acme"]
+            assert [(h["case"], h["workspace"], h["cross_workspace"]) for h in out["results"]] == [("CASE-1", "acme", False)]
+            # auto: 自 ws に 0 件 → 全 ws を検索し、他 ws のヒットは cross_workspace
+            r = await c.call_tool("search", {"query": "betaword", "workspace": "acme"})
+            out = r.structured_content
+            assert out["searched"] == ["acme", "beta"] and len(out["results"]) == 2
+            assert all(h["case"] == "CASE-9" and h["workspace"] == "beta" and h["cross_workspace"] is True for h in out["results"])
+            assert {h["heading"] for h in out["results"]} == {"Notes", "Decision Log"}
+            # workspace: 自 ws のみ（0 件でも他を見ない）
+            r = await c.call_tool("search", {"query": "betaword", "workspace": "acme", "scope": "workspace"})
+            assert r.structured_content["searched"] == ["acme"] and r.structured_content["results"] == []
+            # all: 両方（自 ws が先。limit は全体に効く）
+            r = await c.call_tool("search", {"query": "only here", "workspace": "acme", "scope": "all"})
+            out = r.structured_content
+            assert out["searched"] == ["acme", "beta"] and {(h["case"], h["cross_workspace"]) for h in out["results"]} == {("CASE-1", False), ("CASE-9", True)}
+            r = await c.call_tool("search", {"query": "only here", "workspace": "beta", "scope": "all", "limit": 1})
+            assert r.structured_content["searched"] == ["beta", "acme"] and len(r.structured_content["results"]) == 1
+            # find_cases も同じ規則
+            r = await c.call_tool("find_cases", {"query": "unit-2", "workspace": "beta"})
+            out = r.structured_content
+            assert not r.is_error and out["searched"] == ["beta", "acme"] and [(h["case"], h["workspace"], h["cross_workspace"]) for h in out["results"]] == [("CASE-1", "acme", True)]
+            assert out["results"][0]["reasons"]
+            r = await c.call_tool("find_cases", {"query": "unit-2", "workspace": "acme"})
+            assert r.structured_content["searched"] == ["acme"] and r.structured_content["results"][0]["cross_workspace"] is False
+            r = await c.call_tool("find_cases", {"query": "unit-2", "workspace": "beta", "scope": "workspace"})
+            assert r.structured_content["searched"] == ["beta"] and r.structured_content["results"] == []
+            r = await c.call_tool("find_cases", {"query": "案件", "scope": "all"})     # 自 ws が決まらなくても all なら全 ws（workspace: null、cross_workspace は付かない）
+            out = r.structured_content
+            assert out["workspace"] is None and out["searched"] == ["acme", "beta"] and {h["case"] for h in out["results"]} == {"CASE-1", "CASE-9"}
+            assert all(h["cross_workspace"] is False for h in out["results"])
+            # 自 ws が決まらない（2 ws・workspace / from_case 無し）→ auto / workspace は ToolError
+            for scope in ("auto", "workspace"):
+                r = await c.call_tool("search", {"query": "alphaword", "scope": scope})
+                assert r.is_error and "workspace is required" in r.content[0].text and "from_case" in r.content[0].text, scope
+            # from_case の ws が自 ws になる
+            r = await c.call_tool("search", {"query": "betaword", "from_case": "beta/CASE-9"})
+            assert r.structured_content["workspace"] == "beta" and r.structured_content["searched"] == ["beta"]
+            # 不正な scope
+            r = await c.call_tool("search", {"query": "x", "workspace": "acme", "scope": "everything"})
+            assert r.is_error and "scope must be one of" in r.content[0].text
+    run(main)
+
+
+def test_from_case_records_cross_reference_once_per_day(conf2, fake_drive):
+    """open_case(from_case=<他 ws の案件>) は対象 ws の access.log に cross_from を添えた 1 行と、from 側の案件の events.jsonl に xref を 1 行書く。
+    同じ日の 2 回目は access.log には増えるが xref は増えない。同じ ws（from の ws = 対象の ws）なら access.log は従来の 3 列で xref は無い。
+    search / find_cases の他 ws ヒットも案件ごとに記録する。from_case の形が不正・未知・ローカルに無い案件は ToolError（何も書かない）。"""
+    a, b = _seed_two_workspaces(conf2)
+    acme, beta = conf2.workspaces["acme"], conf2.workspaces["beta"]
+    mcp = srv.create_server(conf2, default_agent="test-agent")
+
+    def xrefs(st, case):
+        return [e for e in st.events(case) if e["action"] == "xref"]
+
+    def log_lines(ws):
+        p = ws.index_dir / "access.log"
+        return p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            # 他 ws の案件を from_case 付きで開く（Drive は照会失敗＝取り寄せず、ローカル写し）
+            fake_drive.unavailable = True
+            r = await c.call_tool("open_case", {"case": "CASE-1", "workspace": "acme", "from_case": "beta/CASE-9", "agent": "claude"})
+            assert not r.is_error, r.content
+            oc = r.structured_content
+            assert oc["available"] is True and oc["case"]["id"] == "CASE-1" and oc["cross_workspace"] is True
+            lines = log_lines(acme)
+            assert len(lines) == 1 and lines[0].split("\t")[1:] == ["CASE-1", "claude", "cross_from=beta/CASE-9", "tool=open_case"]
+            x = xrefs(b, "CASE-9")
+            assert len(x) == 1 and x[0]["actor"] == "ai" and x[0]["agent"] == "claude" and x[0]["workspace"] == "acme" and x[0]["case"] == "CASE-1" and x[0]["tool"] == "open_case"
+            assert log_lines(beta) == [] and xrefs(a, "CASE-1") == []          # 対象側の events には書かない
+            # 同じ日の 2 回目: access.log は増える、xref は増えない
+            r = await c.call_tool("open_case", {"case": "CASE-1", "from_case": "beta/CASE-9"})       # workspace 省略でも案件 ID から一意
+            assert not r.is_error and r.structured_content["cross_workspace"] is True
+            assert len(log_lines(acme)) == 2 and len(xrefs(b, "CASE-9")) == 1
+            # 同じ ws からの from_case: 従来の 3 列、xref 無し
+            n = len(b.events("CASE-9"))
+            r = await c.call_tool("open_case", {"case": "CASE-9", "from_case": "beta/CASE-9"})
+            assert not r.is_error and r.structured_content["cross_workspace"] is False
+            assert log_lines(beta)[-1].split("\t")[1:] == ["CASE-9", "test-agent"] and len(b.events("CASE-9")) == n
+            # search の他 ws ヒット → 案件ごとに 1 回（2 節ヒットでも access.log 1 行・xref 1 行）
+            a.create_case("CASE-2", "second", "acme", actor="human")
+            (acme.cases_dir / "CASE-2" / "worklog.md").write_text("# c\n## Notes\nalphaword too\n", encoding="utf-8")
+            r = await c.call_tool("search", {"query": "alphaword", "from_case": "beta/CASE-9", "agent": "codex"})
+            out = r.structured_content
+            assert out["workspace"] == "beta" and out["searched"] == ["beta", "acme"] and {h["case"] for h in out["results"]} == {"CASE-1", "CASE-2"}
+            lines = log_lines(acme)
+            assert len(lines) == 4 and sorted(l.split("\t")[1] for l in lines[2:]) == ["CASE-1", "CASE-2"]
+            assert all(l.split("\t")[2:] == ["codex", "cross_from=beta/CASE-9", "tool=search"] for l in lines[2:])
+            x = xrefs(b, "CASE-9")
+            assert [(e["case"], e["tool"]) for e in x] == [("CASE-1", "open_case"), ("CASE-2", "search")]   # CASE-1 は同じ日に記録済み
+            # find_cases: 自 ws（beta）で当たれば他 ws を見ないので記録なし
+            r = await c.call_tool("find_cases", {"query": "betaword", "from_case": "beta/CASE-9"})
+            assert r.structured_content["searched"] == ["beta"] and len(log_lines(acme)) == 4 and len(xrefs(b, "CASE-9")) == 2
+            # from_case 無し・自 ws 内: 何も記録しない
+            r = await c.call_tool("search", {"query": "alphaword", "workspace": "beta"})
+            assert r.structured_content["searched"] == ["beta", "acme"] and len(log_lines(acme)) == 4 and len(xrefs(b, "CASE-9")) == 2
+            # 不正な from_case
+            for bad, msg in [("CASE-9", 'must be "<ws>/<case>"'), ("a/b/c", "invalid related reference"), ("gamma/CASE-9", "unknown workspace 'gamma'"),
+                             ("beta/CASE-404", "unknown case 'CASE-404'"), ("beta/../x", "invalid related reference")]:
+                r = await c.call_tool("open_case", {"case": "CASE-1", "workspace": "acme", "from_case": bad})
+                assert r.is_error and msg in r.content[0].text, (bad, r.content)
+                r = await c.call_tool("search", {"query": "alphaword", "from_case": bad})
+                assert r.is_error and msg in r.content[0].text, (bad, r.content)
+            assert len(log_lines(acme)) == 4 and len(xrefs(b, "CASE-9")) == 2
+    run(main)
+
+
+def test_open_case_expands_related_across_workspaces(conf2, fake_drive):
+    """related の "<ws>/<case>" は他 ws の案件の title と status だけ展開する（cross_workspace: true）。同 ws の要素も同じ形。実在しない要素は exists: false。
+    create_case / apply_card 相当の不正な形（"a/b/c"）は ValueError（store）。"""
+    a, b = _seed_two_workspaces(conf2)
+    b.set_case_status("CASE-9", "suspended", actor="human")
+    a.set_case_status("CASE-1", "closed", actor="human")
+    mcp = srv.create_server(conf2)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            fake_drive.unavailable = True
+            r = await c.call_tool("open_case", {"case": "CASE-9", "workspace": "beta"})
+            assert not r.is_error, r.content
+            rel = r.structured_content["related"]
+            assert rel == [{"ref": "acme/CASE-1", "workspace": "acme", "case": "CASE-1", "cross_workspace": True, "exists": True, "title": "acme の案件 alpha", "status": "closed"},
+                           {"ref": "CASE-8", "workspace": "beta", "case": "CASE-8", "cross_workspace": False, "exists": False, "title": None, "status": None}]
+            assert r.structured_content["case"]["related"] == ["acme/CASE-1", "CASE-8"]     # case.json の値はそのまま
+            # 展開だけでは跨ぎ参照を記録しない
+            assert not (conf2.workspaces["acme"].index_dir / "access.log").exists() and not any(e["action"] == "xref" for e in b.events("CASE-9"))
+            # 同 ws の実在する要素、未知の ws を指す要素、形の壊れた要素（手で書かれた case.json）
+            case = b.load_case("CASE-9"); case["related"] = ["CASE-9", "gamma/CASE-1", "bad/../x"]; b.save_case(case)
+            r = await c.call_tool("open_case", {"case": "CASE-9", "workspace": "beta"})
+            rel = r.structured_content["related"]
+            assert rel[0] == {"ref": "CASE-9", "workspace": "beta", "case": "CASE-9", "cross_workspace": False, "exists": True, "title": "beta の案件 beta", "status": "suspended"}
+            assert rel[1]["workspace"] == "gamma" and rel[1]["cross_workspace"] is True and rel[1]["exists"] is False
+            assert rel[2] == {"ref": "bad/../x", "workspace": "beta", "case": None, "cross_workspace": False, "exists": False, "title": None, "status": None}
+    run(main)
+    with pytest.raises(ValueError):
+        a.create_case("CASE-3", "t", "acme", actor="human", related=["a/b/c"])

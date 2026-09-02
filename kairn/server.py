@@ -7,6 +7,9 @@
 そこで読み直されるので、CLI（ws create / attach / rules …）や UI の設定ページの変更は再起動なしで次の呼び出しから効く。
 1 回の呼び出しの間は入口で取った Config を使い、ジョブ（jobs.submit のクロージャ）は投入時点の Config を使う。
 ツール内の失敗は ToolError で返す（呼び出し元のエージェントに理由が文章で届く）。
+ワークスペースをまたぐ参照（docs/mcp-tools.md「跨ぎ参照」）: find_cases / search は scope（auto | workspace | all）で他ワークスペースも検索し、
+open_case / find_cases / search は呼び出し元の案件文脈 from_case="<ws>/<case>" を受ける。from の ws と対象の ws が違えば、対象 ws の
+index/access.log に cross_from を添えて記録し、from 側の案件の events.jsonl に xref を 1 行追記する（_record_xref。同じ対象は同じ日に 1 回）。
 rclone の転送（checkin、open_case の取り寄せ）はジョブ（kairn/jobs.py、デーモンスレッド）にして job_id を返す
 （大きな案件で MCP クライアントの呼び出しタイムアウトに当たらないため）。状態は job_status で見る。
 open_case の取り寄せは、先に Drive の案件フォルダの版マーカー（cases/<case>/.rev/<rev>。rclone lsf 1 回、10 秒）を見て、ローカルの
@@ -37,13 +40,17 @@ from starlette.routing import Mount, Route
 from . import config as cfg
 from .index import Index
 from .jobs import JobTable
-from .store import CaseNotFound, CaseStore, append_access_log, now_iso, validate_case_id
+from .store import CaseNotFound, CaseStore, append_access_log, now_iso, parse_related, validate_case_id
 
 INSTRUCTIONS = (
     "kairn: 案件（case）単位の作業ログ。案件を開くときは open_case（無ければ find_cases / list_cases で選ぶ。選ぶのは人）。"
     "作業したら log_event / update_task（done は証拠必須）。方針が変わったら plan で計画を出し直す（載せなかった open タスクは superseded になる）。"
-    "終わったら checkin（ジョブとして走る。job_status で done を確認する）。ワークスペースをまたぐ参照はしない。"
+    "終わったら checkin（ジョブとして走る。job_status で done を確認する）。"
+    "自ワークスペースに無ければ他ワークスペースも検索してよい（find_cases / search の scope=auto が既定）。開いている案件の文脈は "
+    "from_case=\"<ws>/<case>\" に入れる（跨ぎ参照は記録される）。他ワークスペースの案件から得た内容を worklog・タスク・成果物に書くときは、"
+    "相手の案件 ID や顧客固有の情報（機体名・拠点名・図面等）を書かず一般化した表現にし、出典は related に \"<ws>/<case>\" として残す。"
 )
+SCOPES = ("auto", "workspace", "all")   # find_cases / search の scope
 MCP_PATH = "/mcp"
 UI_PATH = "/ui"
 GRACEFUL_SHUTDOWN_SEC = 5   # SIGTERM 後、開いている接続（MCP の SSE 等）を待つ上限秒。systemd の TimeoutStopSec（15）より短くする
@@ -97,10 +104,100 @@ def create_server(conf: cfg.Config | cfg.ConfigHolder, default_agent: str = "unk
     def _agent(agent: str) -> str:
         return agent or default_agent
 
+    def _origin(conf: cfg.Config, from_case: str | None) -> tuple[cfg.Workspace, str] | None:
+        """from_case="<ws>/<case>"（呼び出し元の案件文脈）を (Workspace, case) にする。省略なら None。形が不正・未知の ws・ローカルに無い案件は ToolError。"""
+        if not from_case:
+            return None
+        try:
+            ws_name, case = parse_related(from_case)
+        except ValueError as e:
+            raise ToolError(f"from_case: {e}") from None
+        if ws_name is None:
+            raise ToolError(f"from_case must be \"<ws>/<case>\" (got {from_case!r})")
+        if ws_name not in conf.workspaces:
+            raise ToolError(f"from_case: unknown workspace {ws_name!r} (known: {list(conf.workspaces)})")
+        ws = conf.workspaces[ws_name]
+        if not (ws.cases_dir / case / "case.json").exists():
+            raise ToolError(f"from_case: unknown case {case!r} in workspace {ws_name!r} (the case must exist locally)")
+        return ws, case
+
+    def _record_xref(origin: tuple[cfg.Workspace, str] | None, target: cfg.Workspace, target_case: str, tool: str, agent: str) -> bool:
+        """跨ぎ参照（origin の ws ≠ target の ws）なら、target の index/access.log に cross_from を添えて 1 行、origin の案件の events.jsonl に
+        xref を 1 行（同じ対象は同じ日に 1 回）記録して True。同じ ws・origin 無しなら何もせず False。"""
+        if origin is None or origin[0].name == target.name:
+            return False
+        cross_from = f"{origin[0].name}/{origin[1]}"
+        append_access_log(target.index_dir / "access.log", target_case, agent, cross_from=cross_from, tool=tool)
+        _store(origin[0]).append_xref(origin[1], target.name, target_case, tool, agent)
+        return True
+
+    def _home(conf: cfg.Config, workspace: str | None, origin: tuple[cfg.Workspace, str] | None, scope: str) -> cfg.Workspace | None:
+        """find_cases / search の自ワークスペース: workspace= → from_case の ws → 登録が 1 つならそれ。決まらなければ scope=all のときだけ None
+        （全ワークスペースを対等に検索）、それ以外は ToolError。"""
+        if workspace:
+            return _ws(conf, workspace)
+        if origin is not None:
+            return origin[0]
+        if len(conf.workspaces) == 1:
+            return next(iter(conf.workspaces.values()))
+        if scope == "all":
+            return None
+        raise ToolError(f"workspace is required (registered: {list(conf.workspaces)}): pass workspace= or from_case=, or scope=\"all\"")
+
+    def _search_scope(conf: cfg.Config, home: cfg.Workspace | None, scope: str, run: Callable[[cfg.Workspace], list[dict[str, Any]]],
+                      limit: int) -> tuple[list[str], list[dict[str, Any]]]:
+        """scope に従ってワークスペースを検索する。workspace: 自 ws のみ。auto: 自 ws を先に検索し、ヒットが 0 なら残りの全 ws。all: 全 ws。
+        各結果に workspace と cross_workspace（自 ws 以外なら true）を付け、score の降順に並べて limit 件。返り値 (検索した ws 名の順, 結果)。"""
+        if scope not in SCOPES:
+            raise ToolError(f"scope must be one of {', '.join(SCOPES)} (got {scope!r})")
+        others = [w for w in conf.workspaces.values() if home is None or w.name != home.name]
+        order = ([home] if home is not None else []) + others
+        searched: list[str] = []; results: list[dict[str, Any]] = []
+        for w in order:
+            if w is not home and (scope == "workspace" or (scope == "auto" and results)):
+                break
+            hits = run(w)
+            searched.append(w.name)
+            results.extend({**h, "workspace": w.name, "cross_workspace": home is not None and w is not home} for h in hits)
+        results.sort(key=lambda r: -float(r.get("score", 0)))
+        return searched, results[:limit]
+
+    def _record_hits(origin: tuple[cfg.Workspace, str] | None, conf: cfg.Config, results: list[dict[str, Any]], tool: str, agent: str) -> None:
+        """検索結果のうち他ワークスペースのヒットを案件ごとに 1 回ずつ跨ぎ参照として記録する。"""
+        if origin is None:
+            return
+        seen: set[tuple[str, str]] = set()
+        for r in results:
+            key = (r["workspace"], r["case"])
+            if r.get("cross_workspace") and key not in seen:
+                seen.add(key)
+                _record_xref(origin, conf.workspaces[r["workspace"]], r["case"], tool, agent)
+
+    def _expand_related(conf: cfg.Config, ws: cfg.Workspace, related: list) -> list[dict[str, Any]]:
+        """case.json.related を展開する: 各要素を {ref, workspace, case, cross_workspace, exists, title, status} に。
+        他ワークスペースの案件（"<ws>/<case>"）も title と status だけ返す。実在しない・形が不正な要素は exists=false（title / status は null）。"""
+        out = []
+        for ref in related or []:
+            item: dict[str, Any] = {"ref": ref, "workspace": ws.name, "case": None, "cross_workspace": False, "exists": False, "title": None, "status": None}
+            try:
+                ws_name, case = parse_related(ref)
+            except ValueError:
+                out.append(item); continue
+            target = conf.workspaces.get(ws_name) if ws_name else ws
+            item.update(workspace=ws_name or ws.name, case=case, cross_workspace=bool(ws_name) and ws_name != ws.name)
+            if target is not None:
+                try:
+                    c = _store(target).load_case(case)
+                    item.update(exists=True, title=c.get("title"), status=c.get("status"))
+                except (CaseNotFound, ValueError, OSError):
+                    pass
+            out.append(item)
+        return out
+
     @mcp.tool()
-    def open_case(case: str, workspace: str | None = None, agent: str = "") -> dict[str, Any]:
-        """案件を開く: case / 最新計画 / open タスク / 直近イベント / 人からの差し戻し・コメント / 関連案件 / worklog 末尾 を 1 回で返す（available=true）。drive: Drive の版マーカー（.rev/）と rev を比べ、同じなら up_to_date=true（取り寄せ省略）、違えば取り寄せて fetched=true（20 秒で間に合わなければ job_id）。ローカルに無く Drive から取り寄せ中なら available=false, status=fetching, job_id（エラーではない。job_status が done になってから再実行）。取り寄せが失敗していれば status=failed, error。"""
-        conf = holder.current(); ws = _ws(conf, workspace, case); st = _store(ws)
+    def open_case(case: str, workspace: str | None = None, agent: str = "", from_case: str | None = None) -> dict[str, Any]:
+        """案件を開く: case / 最新計画 / open タスク / 直近イベント / 人からの差し戻し・コメント / 関連案件（related: 各要素を workspace / case / title / status に展開。他 ws の案件は title と status だけ）/ worklog 末尾 を 1 回で返す（available=true）。drive: Drive の版マーカー（.rev/）と rev を比べ、同じなら up_to_date=true（取り寄せ省略）、違えば取り寄せて fetched=true（20 秒で間に合わなければ job_id）。ローカルに無く Drive から取り寄せ中なら available=false, status=fetching, job_id（エラーではない。job_status が done になってから再実行）。取り寄せが失敗していれば status=failed, error。from_case="<ws>/<case>": 呼び出し元の案件文脈。他ワークスペースの案件を開くときは必ず渡す（対象 ws の access.log と from 側の案件の xref event に記録される）。"""
+        conf = holder.current(); origin = _origin(conf, from_case); ws = _ws(conf, workspace, case); st = _store(ws)
         try:
             st.case_dir(case)  # ID の検証（Drive 取り寄せの前）
             # 順序: ワークスペース解決 → Drive の版マーカーの rev を比較 → 違えば取り寄せジョブ（events.jsonl はマージ、他は --update）を起動して
@@ -132,11 +229,14 @@ def create_server(conf: cfg.Config | cfg.ConfigHolder, default_agent: str = "unk
             feedback = [e for e in all_events if e.get("actor") == "human" and e.get("action") in ("sendback", "comment")][-5:]
             wl = ws.cases_dir / case / "worklog.md"
             tail = wl.read_text(encoding="utf-8", errors="replace")[-3000:] if wl.exists() else ""
-            # 閲覧記録はローカルの index/access.log へ（events.jsonl には書かない: 閲覧で Drive との差分を作らない）
-            append_access_log(ws.index_dir / "access.log", case, _agent(agent))
+            # 閲覧記録はローカルの index/access.log へ（events.jsonl には書かない: 閲覧で Drive との差分を作らない）。
+            # 跨ぎ参照（from_case の ws ≠ この ws）なら cross_from を添え、from 側の案件に xref を 1 行（同じ対象は同じ日に 1 回）
+            cross = _record_xref(origin, ws, case, "open_case", _agent(agent))
+            if not cross:
+                append_access_log(ws.index_dir / "access.log", case, _agent(agent))
             return {"available": True, "case": c, "plan": plan, "open_tasks": st.open_tasks(case), "recent_events": all_events[-20:],
-                    "human_feedback": feedback, "related": c.get("related", []), "worklog_tail": tail,
-                    "drive": fetched, "paths": {"case_dir": str(ws.cases_dir / case), "worklog": str(wl)}}
+                    "human_feedback": feedback, "related": _expand_related(conf, ws, c.get("related", [])), "worklog_tail": tail,
+                    "cross_workspace": cross, "drive": fetched, "paths": {"case_dir": str(ws.cases_dir / case), "worklog": str(wl)}}
         except ToolError:
             raise
         except Exception as e:
@@ -211,22 +311,32 @@ def create_server(conf: cfg.Config | cfg.ConfigHolder, default_agent: str = "unk
             raise _fail(e) from e
 
     @mcp.tool()
-    def search(query: str, cases: list[str] | None = None, workspace: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
-        """worklog 等の `## ` 節単位の全文検索（ワークスペース内のみ）。結果の file/heading で本文を特定できる。"""
+    def search(query: str, cases: list[str] | None = None, workspace: str | None = None, limit: int = 10,
+               scope: str = "auto", from_case: str | None = None, agent: str = "") -> dict[str, Any]:
+        """worklog 等の `## ` 節単位の全文検索。結果の file/heading で本文を特定できる。scope: auto（自 ws を先に検索し、0 件なら全 ws）| workspace（自 ws のみ）| all（全 ws）。自 ws は workspace= → from_case の ws → 登録が 1 つならそれ。返り値 {workspace: 自 ws, scope, searched: [検索した ws], results: [{case, file, heading, snippet, score, workspace, cross_workspace}]}。from_case="<ws>/<case>": 呼び出し元の案件文脈（他 ws のヒットは跨ぎ参照として記録される）。"""
+        conf = holder.current(); origin = _origin(conf, from_case); home = _home(conf, workspace, origin, scope)
         try:
-            conf = holder.current()
-            return _index(conf, _ws(conf, workspace)).search_sections(query, cases, limit)
+            searched, results = _search_scope(conf, home, scope, lambda w: _index(conf, w).search_sections(query, cases, limit), limit)
+        except ToolError:
+            raise
         except Exception as e:
             raise _fail(e) from e
+        _record_hits(origin, conf, results, "search", _agent(agent))
+        return {"workspace": home.name if home else None, "scope": scope, "searched": searched, "results": results}
 
     @mcp.tool()
-    def find_cases(query: str, workspace: str | None = None, k: int = 5) -> list[dict[str, Any]]:
-        """問いに関係する案件を理由付きで上位 k 件（案件カード＋全文の複合）。案件を選ぶのは人。"""
+    def find_cases(query: str, workspace: str | None = None, k: int = 5, scope: str = "auto", from_case: str | None = None,
+                   agent: str = "") -> dict[str, Any]:
+        """問いに関係する案件を理由付きで上位 k 件（案件カード＋全文の複合）。案件を選ぶのは人。scope: auto（自 ws を先に検索し、0 件なら全 ws）| workspace（自 ws のみ）| all（全 ws）。返り値 {workspace: 自 ws, scope, searched: [検索した ws], results: [{case, score, reasons, workspace, cross_workspace}]}。from_case="<ws>/<case>": 呼び出し元の案件文脈（他 ws のヒットは跨ぎ参照として記録される）。"""
+        conf = holder.current(); origin = _origin(conf, from_case); home = _home(conf, workspace, origin, scope)
         try:
-            conf = holder.current()
-            return _index(conf, _ws(conf, workspace)).find_cases(query, k)
+            searched, results = _search_scope(conf, home, scope, lambda w: _index(conf, w).find_cases(query, k), k)
+        except ToolError:
+            raise
         except Exception as e:
             raise _fail(e) from e
+        _record_hits(origin, conf, results, "find_cases", _agent(agent))
+        return {"workspace": home.name if home else None, "scope": scope, "searched": searched, "results": results}
 
     @mcp.tool()
     def checkin(case: str, workspace: str | None = None, agent: str = "") -> dict[str, Any]:
