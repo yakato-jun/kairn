@@ -132,9 +132,12 @@ def test_full_flow(conf, mocked_rclone, jobs):
             (ws.index_dir / "drive-index.txt").write_text("acme/cases/CASE-123/0901_1200_run.bag.zst\t123456\t2026-09-01T00:00:00\nacme/cases/other.txt\t1\t\n")
             r = await c.call_tool("drive_index", {"pattern": r"CASE-123.*\.zst$"})
             assert r.structured_content["result"] == [{"path": "acme/cases/CASE-123/0901_1200_run.bag.zst", "size": "123456", "mtime": "2026-09-01T00:00:00"}]
-            # unknown case / workspace
+            # unknown case（取り寄せジョブがまだ走っていれば available=false / fetching、終わって無ければ unknown case）/ workspace
             r = await c.call_tool("open_case", {"case": "CASE-404"})
-            assert r.is_error and "CASE-404" in r.content[0].text
+            if r.is_error:
+                assert "CASE-404" in r.content[0].text
+            else:
+                assert r.structured_content["available"] is False and r.structured_content["status"] == "fetching"
             r = await c.call_tool("list_cases", {"workspace": "nowhere"})
             assert r.is_error and "nowhere" in r.content[0].text
     run(main)
@@ -182,10 +185,13 @@ def test_search_survives_broken_symlink(conf, monkeypatch):
 
 # ---------- open_case の順序・checkout skip（項目 1） ----------
 
-def _fake_checkout_creating_case(conf, calls):
-    """Drive にしか無い案件を取り寄せる偽 checkout: 案件ディレクトリを作って成功を返す（2 回目以降は何もしない）。"""
+def _fake_checkout_creating_case(conf, calls, gate: threading.Event | None = None):
+    """Drive にしか無い案件を取り寄せる偽 checkout: 案件ディレクトリを作って成功を返す（2 回目以降は何もしない）。
+    gate を渡すと、それが set されるまで転送を始めない（open_case が「取り寄せ中」を返す状況を作る）。"""
     def checkout(c, ws, case=None, dry=False, **kw):
         calls.append(("checkout", ws.name, case))
+        if gate is not None:
+            assert gate.wait(5)
         st = CaseStore(ws.cases_dir)
         if (ws.cases_dir / case / "case.json").exists():
             return "fake checkout (already local)"
@@ -197,23 +203,34 @@ def _fake_checkout_creating_case(conf, calls):
 
 
 def test_open_case_fetches_in_background_then_reads(conf, monkeypatch, jobs):
-    """Drive にしか無い案件: 1 回目の open_case は取り寄せジョブを起動して unknown case（job_id 付き）を返す。
-    ジョブ完了後の 2 回目は取り寄せ後のディスクを反映する。"""
+    """Drive にしか無い案件: 1 回目の open_case は取り寄せジョブを起動し、エラーではなく通常の結果
+    {available: false, status: fetching, job_id, case: null, note} を返す。ジョブ完了後の 2 回目は取り寄せ後のディスクを反映する（available: true）。"""
     calls = []
-    monkeypatch.setattr(sync, "checkout", _fake_checkout_creating_case(conf, calls))
+    gate = threading.Event()
+    monkeypatch.setattr(sync, "checkout", _fake_checkout_creating_case(conf, calls, gate))
     mcp = srv.create_server(conf, jobs=jobs)
 
     async def main():
         async with Client(mcp, raise_exceptions=True) as c:
             r = await c.call_tool("open_case", {"case": "CASE-9"})
-            assert r.is_error and "CASE-9" in r.content[0].text and "job_id" in r.content[0].text and "open_case again" in r.content[0].text
-            job = jobs.active("acme", "CASE-9") or jobs.all()
-            _wait(jobs, job[0].id)
-            assert job[0].status == "done" and job[0].result == "fake checkout created case"
+            assert not r.is_error, r.content
+            f = r.structured_content
+            assert f["available"] is False and f["status"] == "fetching" and f["case"] is None and f["job_id"]
+            assert "取り寄せ中" in f["note"] and "job_status" in f["note"] and "open_case" in f["note"]
+            assert jobs.get(f["job_id"]).kind == "checkout" and jobs.get(f["job_id"]).active
+            # 取り寄せ中にもう一度開いても同じジョブ（新しく起動しない）
+            r = await c.call_tool("open_case", {"case": "CASE-9"})
+            assert r.structured_content["status"] == "fetching" and r.structured_content["job_id"] == f["job_id"]
+            gate.set()
+            _wait(jobs, f["job_id"])
+            job = jobs.get(f["job_id"])
+            assert job.status == "done" and job.result == "fake checkout created case"
+            s = (await c.call_tool("job_status", {"job_id": f["job_id"]})).structured_content
+            assert s["status"] == "done"
             r = await _open(c, jobs, "CASE-9")
             assert not r.is_error, r.content
             oc = r.structured_content
-            assert oc["drive"]["job_id"] and oc["case"]["title"] == "from drive"
+            assert oc["available"] is True and oc["drive"]["job_id"] and oc["case"]["title"] == "from drive"
             assert oc["plan"]["version"] == 1 and [t["id"] for t in oc["open_tasks"]] == ["T001"]
             assert "fetched text" in oc["worklog_tail"] and oc["recent_events"][0]["action"] == "opened"
             # 不正な ID は取り寄せる前に拒否
@@ -249,7 +266,14 @@ def test_invalid_case_id_is_rejected_before_touching_filesystem(conf, monkeypatc
     run(main)
 
 
-def test_open_case_unknown_case_reports_drive_result(conf, mocked_rclone, jobs):
+@pytest.fixture
+def inline_jobs(monkeypatch):
+    """ジョブのスレッドを起動せず submit の中で同期実行する（ジョブが open_case の読み取りより先に終わる状況を決定的に作る）。"""
+    monkeypatch.setattr(JobTable, "_start", lambda self, job, fn: self._run(job, fn))
+
+
+def test_open_case_unknown_case_when_fetch_finished_without_it(conf, mocked_rclone, jobs, inline_jobs):
+    """取り寄せジョブが done でも案件が無い（Drive にも無い）なら従来どおり unknown case のエラー。"""
     mcp = srv.create_server(conf, jobs=jobs)
 
     async def main():
@@ -257,9 +281,56 @@ def test_open_case_unknown_case_reports_drive_result(conf, mocked_rclone, jobs):
             r = await c.call_tool("open_case", {"case": "CASE-404"})
             assert r.is_error and "CASE-404" in r.content[0].text and "fetched" in r.content[0].text and "job_id" in r.content[0].text
     run(main)
-    for j in jobs.all():
-        _wait(jobs, j.id)
+    assert jobs.latest("checkout", "acme", "CASE-404").status == "done"
     assert ("checkout", "acme", "CASE-404") in mocked_rclone  # 取り寄せは試みた（ジョブ）
+
+
+def test_open_case_reports_failed_fetch_and_retries(conf, monkeypatch, jobs):
+    """ローカルに無い案件の取り寄せが失敗: 走っている間は fetching、失敗後の open_case は
+    {available: false, status: failed, error} を返し、再試行のジョブを起動する（job_id）。"""
+    gate = threading.Event(); calls = []
+
+    def failing_checkout(c, ws, case=None, dry=False, **kw):
+        calls.append(case)
+        assert gate.wait(5)
+        raise sync.RcloneError("directory not found")
+    monkeypatch.setattr(sync, "checkout", failing_checkout)
+    mcp = srv.create_server(conf, jobs=jobs)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("open_case", {"case": "CASE-9"})
+            f = r.structured_content
+            assert not r.is_error and f["available"] is False and f["status"] == "fetching" and "error" not in f
+            gate.set(); _wait(jobs, f["job_id"])
+            assert jobs.get(f["job_id"]).status == "failed"
+            gate.clear()
+            r = await c.call_tool("open_case", {"case": "CASE-9"})
+            f2 = r.structured_content
+            assert not r.is_error and f2["available"] is False and f2["status"] == "failed" and f2["case"] is None
+            assert f2["error"] == "RcloneError: directory not found" and "人に伝える" in f2["note"]
+            assert f2["job_id"] != f["job_id"] and jobs.get(f2["job_id"]).active      # 再試行のジョブ
+            r = await c.call_tool("open_case", {"case": "CASE-9"})                     # 再試行中は fetching（同じジョブ）
+            assert r.structured_content["status"] == "fetching" and r.structured_content["job_id"] == f2["job_id"]
+            gate.set(); _wait(jobs, f2["job_id"])
+    run(main)
+    assert calls == ["CASE-9", "CASE-9"]
+
+
+def test_open_case_reports_failed_fetch_when_job_fails_immediately(conf, monkeypatch, jobs, inline_jobs):
+    """取り寄せジョブが open_case の読み取りより先に失敗しても failed / error を返す（エラーにしない）。"""
+    def boom(*a, **k):
+        raise sync.RcloneError("remote unreachable")
+    monkeypatch.setattr(sync, "checkout", boom)
+    mcp = srv.create_server(conf, jobs=jobs)
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("open_case", {"case": "CASE-9"})
+            f = r.structured_content
+            assert not r.is_error and f["available"] is False and f["status"] == "failed" and f["error"] == "RcloneError: remote unreachable"
+            assert f["job_id"] and jobs.get(f["job_id"]).status == "failed"
+    run(main)
 
 
 def test_open_case_skips_checkout_when_local_changes_newer_than_checkin(conf, monkeypatch, jobs):

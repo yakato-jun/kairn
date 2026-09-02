@@ -85,9 +85,12 @@ class JobTable:
                     return j, False
             job = Job(id=uuid.uuid4().hex[:12], kind=kind, workspace=workspace, case=case)
             self._jobs[job.id] = job
-        t = threading.Thread(target=self._run, args=(job, fn), name=f"kairn-job-{kind}-{case}", daemon=True)
-        t.start()
+        self._start(job, fn)
         return job, True
+
+    def _start(self, job: Job, fn: Callable[[Callable[[str], None]], Any]) -> None:
+        """ジョブをデーモンスレッドで走らせる（テストはここを差し替えて同期実行にできる）。"""
+        threading.Thread(target=self._run, args=(job, fn), name=f"kairn-job-{job.kind}-{job.case}", daemon=True).start()
 
     def _run(self, job: Job, fn: Callable[[Callable[[str], None]], Any]) -> None:
         def progress(text: str) -> None:
@@ -126,6 +129,13 @@ class JobTable:
             self._prune_locked()
             return [j for j in self._jobs.values() if j.active
                     and (workspace is None or j.workspace == workspace) and (case is None or j.case == case)]
+
+    def latest(self, kind: str, workspace: str, case: str) -> Job | None:
+        """同じ (kind, workspace, case) のうち最後に登録されたジョブ（状態を問わない）。無ければ None。"""
+        with self._lock:
+            self._prune_locked()
+            hits = [j for j in self._jobs.values() if (j.kind, j.workspace, j.case) == (kind, workspace, case)]
+            return max(hits, key=lambda j: j._created_mono) if hits else None
 
     def all(self) -> list[Job]:
         with self._lock:

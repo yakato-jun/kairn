@@ -78,19 +78,33 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
 
     @mcp.tool()
     def open_case(case: str, workspace: str | None = None, agent: str = "") -> dict[str, Any]:
-        """案件を開く: case / 最新計画 / open タスク / 直近イベント / 人からの差し戻し・コメント / 関連案件 / worklog 末尾 を 1 回で返す。"""
+        """案件を開く: case / 最新計画 / open タスク / 直近イベント / 人からの差し戻し・コメント / 関連案件 / worklog 末尾 を 1 回で返す（available=true）。ローカルに無く Drive から取り寄せ中なら available=false, status=fetching, job_id（エラーではない。job_status が done になってから再実行）。取り寄せが失敗していれば status=failed, error。"""
         ws = _ws(workspace, case); st = _store(ws)
         try:
             st.case_dir(case)  # ID の検証（Drive 取り寄せの前）
             # 順序: ワークスペース解決 → 取り寄せジョブの起動（events.jsonl はマージ、他は --update。待たない）→ 今のローカル内容を読む。
             # 取り寄せ完了後（job_status が done）にもう一度 open_case すると最新になる
+            # ローカルに無い案件の直前の取り寄せが failed なら、その error を報告する（新しい取り寄せは下で起動＝再試行）
+            prev = None if (ws.cases_dir / case / "case.json").exists() else jobs.latest("checkout", ws.name, case)
             fetched = _fetch_from_drive(conf, ws, st, case, jobs)
             try:
                 c = st.load_case(case)
             except CaseNotFound:
-                raise ToolError(f"unknown case {case!r} in workspace {ws.name!r} (drive: {fetched})"
-                                + ("; the case may exist only on the drive: wait for job_status to report done, then open_case again"
-                                   if fetched.get("job_id") else "")) from None
+                # ローカルに無い案件はエラーにせず、取り寄せの状態を通常の結果として返す（available=false）:
+                #   fetching: 取り寄せジョブが queued / running（job_status が done になってから open_case を再実行）
+                #   failed:   取り寄せが失敗した（直前のジョブ、または今起動したジョブが即座に失敗）。job_id は再試行のジョブ
+                # ジョブが done なのに無い（Drive にも無い）／取り寄せを起動しなかった（skip）なら従来どおり unknown case
+                job = jobs.get(fetched["job_id"]) if fetched.get("job_id") else None
+                if prev is not None and prev.status == "failed" and job is not None:
+                    return {"available": False, "status": "failed", "case": None, "error": prev.error, "job_id": job.id,
+                            "note": "直前の取り寄せが失敗した（error）。再試行のジョブを起動した: job_status で確認し、失敗が続くなら error を人に伝える"}
+                if job is not None and job.active:
+                    return {"available": False, "status": "fetching", "job_id": job.id, "case": None,
+                            "note": "取り寄せ中。job_status で done を確認してから open_case を再実行"}
+                if job is not None and job.status == "failed":
+                    return {"available": False, "status": "failed", "case": None, "error": job.error, "job_id": job.id,
+                            "note": "取り寄せが失敗した（error）。open_case を再実行すると再試行する。失敗が続くなら error を人に伝える"}
+                raise ToolError(f"unknown case {case!r} in workspace {ws.name!r} (drive: {fetched})") from None
             plan = st.current_plan(case)
             all_events = st.events(case)
             feedback = [e for e in all_events if e.get("actor") == "human" and e.get("action") in ("sendback", "comment")][-5:]
@@ -98,7 +112,7 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
             tail = wl.read_text(encoding="utf-8", errors="replace")[-3000:] if wl.exists() else ""
             # 閲覧記録はローカルの index/access.log へ（events.jsonl には書かない: 閲覧で Drive との差分を作らない）
             append_access_log(ws.index_dir / "access.log", case, _agent(agent))
-            return {"case": c, "plan": plan, "open_tasks": st.open_tasks(case), "recent_events": all_events[-20:],
+            return {"available": True, "case": c, "plan": plan, "open_tasks": st.open_tasks(case), "recent_events": all_events[-20:],
                     "human_feedback": feedback, "related": c.get("related", []), "worklog_tail": tail,
                     "drive": fetched, "paths": {"case_dir": str(ws.cases_dir / case), "worklog": str(wl)}}
         except ToolError:

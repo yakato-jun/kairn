@@ -14,13 +14,17 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
    ログ `~/.local/state/kairn/serve.log` の内容を人に伝える）。
 1. 案件名が分かっていれば `open_case(case)`。分からなければ `find_cases(query)`（理由付きの候補）か
    `list_cases()`（`status`: open|closed|suspended|all、`query` で id/title 絞り込み）で候補を出し、**人に選んでもらう**。
-2. `open_case` の返り値は **`human_feedback`（人からの差し戻し sendback・コメント comment）を最初に読む**。
+2. `open_case` の返り値は、まず `available` を見る。**`available: false` なら案件はまだローカルに無い**（Drive から取り寄せ中。
+   `status: fetching`、`job_id`）: `job_status(job_id)` が `done` になるまで待って `open_case` を再呼び出しする。人には
+   「取り寄せ中で今すぐは操作できない」と伝える。`status: failed` なら `error` を人に伝える（`job_id` は再試行のジョブ。
+   `job_status` で確認し、失敗が続くなら人の判断を仰ぐ）。エラー（is_error）ではなく通常の結果なので、案件が無いと決めつけない。
+   `available: true` なら **`human_feedback`（人からの差し戻し sendback・コメント comment）を最初に読む**。
    次に `open_tasks`、`plan`、`recent_events`、`worklog_tail`、`related`。
    - `drive` は Drive からの取り寄せの状態。`drive.job_id` があれば取り寄せがジョブとして走っている（返り値は**取り寄せ前の
      ローカル内容**）。他の環境で作業した後など最新が要るときは `job_status(job_id)` が `done` になってからもう一度
      `open_case` する（`failed` なら `error` を人に伝えてローカル写しで続行）。ローカルだけで作業を続けるなら待たなくてよい。
    - `drive.skipped` は未 checkin のローカル変更があるため取り寄せなかった（ローカル写しで続行）。
-   - 「unknown case … job_id …」のエラーは Drive にしか無い案件を取り寄せ中。`job_status` が `done` になってから `open_case` し直す。
+   - 「unknown case …」のエラーは取り寄せを終えても案件が無い（Drive にも無い）とき。`find_cases` / `list_cases` で人に選んでもらう。
 3. 計画が無い案件は `plan(case, objective, tasks, reason)` で v1 を作る（`tasks: [{title, owner?: ai|human}]`）。
 4. 案件ディレクトリ（worklog.md・作業ファイル）はリポジトリの外、kairn の `workspaces/<ws>/cases/<case>/` にある。
    `open_case` の返り値 `paths.case_dir` / `paths.worklog`（絶対パス）で読み書きする。リポジトリ内の `tmp/` 等を探さない。
