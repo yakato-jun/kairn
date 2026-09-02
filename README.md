@@ -37,6 +37,24 @@ skills/kairn/SKILL.md  各エージェント共通の運用手順（`kairn insta
 docs/                  データモデル・MCP ツール・UI の仕様
 ```
 
+## 導入
+
+コマンドは `uv tool install` で入れる（`~/.local/bin/kairn`。専用の隔離環境に依存ごと入る）。開発用の `.venv`（`uv sync --group dev` → `pytest`）とは別物で、
+片方を作り直してももう片方には影響しない。
+
+```
+git clone <このリポジトリ> ~/kairn && cd ~/kairn
+uv tool install --editable . --python 3.13     # ~/.local/bin/kairn（--editable なので clone 先の変更がそのまま効く）
+kairn setup --remote <rclone remote>           # 使う remote（これ以外は使わない）。rclone config create <name> drive scope=drive で先に作る
+kairn attach <ws>                              # 各リポジトリで。ワークスペースが無ければ kairn ws create <ws>
+kairn install-skill                            # 各エージェントに skill を置き、workspaces/ の許可手順を表示
+kairn install-service                          # systemd user service（常駐・日次同期）を生成・登録（後述）
+```
+
+- 更新: `cd ~/kairn && git pull && uv tool upgrade kairn`（`--editable` なので通常は `git pull` だけで反映される。依存が変わった時に upgrade）
+- 削除: `uv tool uninstall kairn`
+- 開発（テスト）: `uv sync --group dev && .venv/bin/pytest`。`.venv/bin/kairn` も同じ CLI だが、常駐 unit には `install-service` を実行した側の `kairn` のパスが入る
+
 ## CLI（`kairn --help`）
 
 設定ファイル `~/.config/kairn/config.yaml` はこれらのコマンドが書く（人は編集しない）。`<ws>` 省略時は cwd が属するワークスペース。
