@@ -218,6 +218,16 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 - `open_case` の checkout skip 判定は人／AI の実質的な変更だけを見る: `events.jsonl` が checkin 時点（`case.json.last_checkin_events` 行）以後に kairn 自身の `checkin` event で伸びただけなら変更と数えない。
 - `daily --dry-run` は rclone に `--dry-run` を渡し、`drive-index.txt` と索引（`kairn.sqlite`）を書き換えない。
 - 帯域制限は `rules.bwlimit`（例 `"08:00,4M 20:00,off"`。rclone の `--bwlimit` にそのまま渡す）。
+- **テキスト層の上限と除外**（大量のログ・CSV を持つ案件向け）。`checkout` / `checkin`（MCP の `open_case` / `checkin` も）が転送するのは
+  `rules.exclude` に当たらず、`rules.raw_data.extensions` の拡張子でなく、**`rules.raw_data.min_size`（既定 `50M`）以下**のファイルだけ
+  （rclone の `--exclude` / `--max-size`。`kairn/sync.py` `_filters`）。それを超えるものは生データ層で、`raw-move` が `min_age`（既定 `14d`）後に Drive へ移動する。
+  1 ファイルは小さくても件数が多い（数百ファイル・数百 MB のログや CSV）と転送に数分かかるので、案件に合わせて調整する:
+  - 上限を下げる: `rules.raw_data.min_size: 10M` 等（超えたファイルはテキスト層から外れ、`min_age` 後に `raw-move` の対象になる）
+  - 同期しないパターンを足す: `rules.exclude` に `logs/**`、`*.csv`、`*.log` 等（`**` で終わるパターンはどの階層のそのディレクトリにも、
+    ファイルパターンはどの階層のそのファイルにも一致。rclone のフィルタ規則）。除外したものは同期も `raw-move` もされない（ローカルにだけ残る）
+  - 書き換える場所は `~/.config/kairn/config.yaml` の `rules:`（書式は `config/config.example.yaml`）。`rules:` だけは人が手で編集する
+    （`kairn setup` / `attach` / `install-service` は既存の `rules` を引き継ぐ）。変更後は `kairn checkin <ws> <case> --dry-run` で転送対象を確認する
+    （`-v` の出力に転送するファイル名が出る）。
 - 日次実行（systemd user timer、既定は毎日 12:30 ± 10 分、停止中だった分は次回起動時に実行）は `kairn install-service` がワークスペースごとに
   `kairn-daily@<ws>.timer` を生成・登録する（「各エージェントへの適用」1）。確認:
   ```
