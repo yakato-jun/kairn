@@ -67,8 +67,8 @@ kairn detach [<repo path>]                # 所属を外す（glob: 由来なら
 kairn status                              # 設定・cwd の所属・各ワークスペースの案件数と所属リポジトリ
 kairn cases [<ws>] [--all]                # 案件一覧（既定は open のみ）
 kairn new <case id> "<title>" [--ws <ws>] # 案件を作る（case.json）
-kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新（--dry-run では索引を書き換えない）
-kairn checkin <ws> [<case>] [--dry-run]   # ローカル → Drive（案件単位は rclone sync、ワークスペース全体は rclone copy。last_checkin_at 更新）
+kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新（--dry-run では索引を書き換えない）。同期実行（タイムアウト無し）
+kairn checkin <ws> [<case>] [--dry-run]   # ローカル → Drive（案件単位は rclone sync、ワークスペース全体は rclone copy。last_checkin_at 更新）。同期実行（タイムアウト無し）
 kairn index <ws> [--full]                 # 索引（SQLite FTS5）の差分再生成（--full で全部）
 kairn drive-index <ws>                    # Drive 上の全ファイル一覧を index/drive-index.txt に
 kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮
@@ -211,6 +211,10 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 - `open_case` は `events.jsonl` に書かない。閲覧記録はワークスペースの `index/access.log`（ローカルのみ、同期しない）に 1 行追記する。
 - `checkin <ws> <case>`（MCP の `checkin(case)` も）は `rclone sync`: 案件内の削除を追従し、Drive 側に新しい版があっても `_deleted/<日付>/` に退避して上書きする（events.jsonl はマージ済み）。**他環境で作業した後は先に `checkout` する**。
 - `checkin <ws>`（案件指定なし。`daily` が毎日呼ぶ）は `rclone copy`: ローカルに無い案件ディレクトリを Drive から消さない（原則 2「ローカルの案件ディレクトリは消してよい」）。上書きされる Drive 側の版は同じく `_deleted/` へ。
+- **MCP の `checkin(case)` と `open_case` の取り寄せはジョブ**（`kairn/jobs.py`。サーバー内のスレッド）で、ツールは待たずに `job_id` を返し、`job_status(job_id)` で done / failed を見る
+  （docs/mcp-tools.md「ジョブ」。大きな案件で MCP クライアントの呼び出しタイムアウトに当たらないため）。ジョブ表はサーバーのメモリ内で、`kairn serve` の再起動で消える。
+  **CLI の `kairn checkin` / `kairn checkout` は従来どおり同期**（終わるまで待つ。タイムアウト無し）。**大きな初回投入（数百 MB・数百ファイル）は MCP ではなく CLI で行う**:
+  `kairn checkin <ws> <case>`。
 - `open_case` の checkout skip 判定は人／AI の実質的な変更だけを見る: `events.jsonl` が checkin 時点（`case.json.last_checkin_events` 行）以後に kairn 自身の `checkin` event で伸びただけなら変更と数えない。
 - `daily --dry-run` は rclone に `--dry-run` を渡し、`drive-index.txt` と索引（`kairn.sqlite`）を書き換えない。
 - 帯域制限は `rules.bwlimit`（例 `"08:00,4M 20:00,off"`。rclone の `--bwlimit` にそのまま渡す）。

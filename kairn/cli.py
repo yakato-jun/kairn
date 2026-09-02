@@ -8,6 +8,7 @@
   kairn cases [<ws>] [--all]
   kairn new <case id> "<title>" [--ws <ws>]
   kairn checkout <ws> [<case>] [--dry-run] | checkin <ws> [<case>] [--dry-run] | index <ws> [--full] | drive-index <ws>
+                                         # checkout / checkin は同期実行（終わるまで待つ。タイムアウト無し）。大きな初回投入は MCP ではなくここで行う
   kairn bag2zst <ws> [<case>] [--dry-run]   # *.bag / *.bag.active を zstd 圧縮（30 分以上更新のないもの）
   kairn raw-move <ws> [<case>] [--dry-run]  # 生データ（rules.raw_data）を Drive へ移動し、所在を案件に記録
   kairn daily <ws> [--dry-run]              # bag2zst -> checkin -> raw-move -> drive-index -> index（systemd timer 用）
