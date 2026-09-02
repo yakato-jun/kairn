@@ -81,9 +81,12 @@ workspaces/<ws>/
 - 要素は `"<case>"`（同じワークスペースの案件 ID）か `"<ws>/<case>"`（他ワークスペースの案件）。ワークスペース名・案件 ID とも
   `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`（`..` 不可。`kairn/store.py` `parse_related` / `validate_related`）。`create_case` と extract の
   `apply_card` が検証し、不正な形は ValueError（MCP では `ToolError`）。実在しない案件を指してもよい（検証は形だけ）。
+- 書く経路: AI は MCP `link_case`（`CaseStore.link_related`。重複なく追記、既存は保持。実在も検証する。他 ws を足せば `xref` も記録）、
+  人は UI の「関連に追加」（`link_related`。形だけ）と関連欄の × （`unlink_related`）。**削除は人の操作のみ**（MCP に削除ツールは無い）。
+  どちらも `{action: related, added | removed}` を events に書く（下記）。extract の適用（`apply_card`）は `related` を置き換える。
 - `open_case` は各要素を `{ref, workspace, case, cross_workspace, exists, title, status}` に展開して返す。他ワークスペースの案件は
   **title と status だけ**（内容は開かない。開くなら `open_case(case, workspace=…, from_case=…)`）。UI の関連欄は実在する案件へリンクする。
-- 他ワークスペースの案件から得た内容を worklog 等に書くときの出典はここに `<ws>/<case>` として残す（skills/kairn/SKILL.md）。
+- 他ワークスペースの案件から得た内容を worklog 等に書くときの出典はここに `<ws>/<case>` として残す（`link_case`。skills/kairn/SKILL.md）。
 
 ### summary / elements / related / causal（抽出の下書きの適用先）
 - `kairn/extract`（MCP `extract_card` / `kairn extract` / UI「下書きを取得」）は下書きを返すだけで case.json には書かない。
@@ -152,11 +155,14 @@ bag2zst・全文索引の対象外になる（`kairn/sync.py` `WORKAREA_MARKERS`
 {"t": "…", "actor": "human", "action": "status", "from": "open", "to": "closed", "note": "対応完了"}
 {"t": "…", "actor": "ai", "agent": "claude-code", "action": "status", "from": "closed", "to": "open", "note": "この案件を再開して"}
 ```
-`action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | status | extract | xref
+`action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | status | extract | xref | related
 （`checkout` は旧版が `open_case` のたびに書いていた action。読めるが、もう書かない）
 `xref`（跨ぎ参照。`CaseStore.append_xref`）は**参照元**の案件の events に書く: `{actor: ai, agent, action: xref, workspace: <対象 ws>, case: <対象案件>, tool: open_case | search | find_cases}`
 （`case` は他の event と違い**参照した相手**の案件 ID）。同じ対象（workspace, case）への参照は同じ日（JST）に 1 回だけ（ツールの違いは数えない）。
 参照された側の events には書かない（対象 ws の `index/access.log` に `cross_from=` 付きで 1 行。ローカルのみ）。
+`related`（`case.json.related` の変更。`CaseStore.link_related` / `unlink_related`）: 追記は `{actor, agent, action: related, added: [<ref>, …], note}`、
+削除は `{actor: human, action: related, removed: [<ref>], note}`。MCP `link_case` は `actor: ai`（他 ws の案件を足したときは `xref`（`tool: link_case`）も 1 行）、
+UI は `actor: human`。変化が無ければ（全部含まれている・無いものの削除）書かない。
 `status`（案件のステータス変更。`CaseStore.set_case_status`）は `from` / `to`（open | closed | suspended）と `note` を持つ。人の操作（UI の「案件の状態を変更」・
 CLI `kairn close | suspend | reopen`）は `actor: human`、MCP `set_case_status` は `actor: ai` で `note` に人の発言（`instruction`）そのもの。
 同じステータスへの変更は event を書かない（case.json も触らない）。旧版が書いた `from` / `to` の無い `status` 行（`note: "closed: 理由"`）は読める。

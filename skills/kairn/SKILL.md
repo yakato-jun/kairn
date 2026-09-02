@@ -5,7 +5,7 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 
 # kairn 運用手順（Claude Code / Codex / OpenCode 共通）
 
-判断の規則は MCP サーバー `kairn`（12 ツール）が強制する。ここでは「いつ何を呼ぶか」だけを定める。
+判断の規則は MCP サーバー `kairn`（13 ツール）が強制する。ここでは「いつ何を呼ぶか」だけを定める。
 ツールの引数・返り値の詳細は kairn リポジトリの `docs/mcp-tools.md`。
 
 ## 案件を開く
@@ -62,9 +62,11 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
   `workspaces/` 配下を直接 grep して他 ws を読む経路は記録に残らないので使わない。
 - 他 ws の案件を開くときは `open_case(case, workspace=<ws>, from_case=…)`。`related` の展開（他 ws は title と status だけ）で足りるなら開かない。
 - **他 ws の案件から得た内容を worklog・タスク・成果物に書くときは、相手の案件 ID や顧客固有の情報（機体名・拠点名・図面等）を書かず
-  一般化した表現にする**（例: 「別案件で同種の UART 送信量超過を 1 バイト送信の廃止で解決した」）。出典は `related` に `"<ws>/<case>"`
-  として残す（`case.json.related`）。related を書く MCP ツールは無いので、書いた内容の出典として `<ws>/<case>` を related に足してほしいと
-  人に伝える（`case.json` を直接編集しない）。相手の案件 ID を書いてよいのは related だけ。
+  一般化した表現にする**（例: 「別案件で同種の UART 送信量超過を 1 バイト送信の廃止で解決した」）。出典は
+  **`link_case(case, related="<ws>/<case>", note=何を参考にしたか)`** で `case.json.related` に残す（書いたのと同じ節目で呼ぶ。
+  `case.json` を直接編集しない）。同 ws の関係する案件も `link_case(case, related="<case>")` で足せる。追記だけで、既にあれば
+  `changed: false`。実在しない案件・不正な形は拒否される。**related から外すのは人だけ**（UI の関連欄の ×）。AI は削除を頼まれても
+  ツールが無いので UI で外してもらう。相手の案件 ID を書いてよいのは related だけ。
 
 ## 案件のステータス（閉じる・保留する・再開する）
 - 案件を閉じる（closed）・保留する（suspended）・再開する（open）のは**人の判断**。AI の判断で変えない
@@ -96,6 +98,6 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 - `checkin` の `job_status` が `done` になる前に「Drive に戻した」と報告する（`failed` を黙って流す）。
 - ファイルを直接編集してタスク状態・計画・イベントを変える（`case.json` / `plan/` / `events.jsonl` は必ず MCP 経由）。
 - 他ワークスペースの案件を `from_case` 無しで開く・検索する、または `workspaces/` を直接 grep する（記録に残らない）。
-- 他ワークスペースの案件 ID・顧客固有の情報を自案件の worklog・タスク・成果物にそのまま書く（一般化し、出典は `related`）。
+- 他ワークスペースの案件 ID・顧客固有の情報を自案件の worklog・タスク・成果物にそのまま書く（一般化し、出典は `link_case` で `related` に）。
 - `extract_card` の下書きを確認なしに case.json や worklog に書き込む。
 - 証拠なしで done にする（`note` 型や空の `evidence` は拒否される）。
