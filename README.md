@@ -28,7 +28,7 @@
 kairn/                 パッケージ（config / store / index / server(MCP) / ui / sync / extract）
 kairn/extract/         案件カードの下書き抽出: prompt.md（子エージェントへの指示）/ schema.json（出力の JSON Schema）/ adapters.py（claude / codex / opencode / antigravity）
 config/config.example.yaml  環境ローカル設定の書式例（架空名）。実体は ~/.config/kairn/config.yaml（kairn のコマンドが書く。コミットしない）
-contrib/systemd/       systemd user unit（kairn-serve.service: MCP+UI 常駐 / kairn-daily.service + .timer: 日次同期）
+kairn/service.py       systemd user unit のテンプレート（`kairn install-service` が生成・登録）と `kairn ensure`
 contrib/opencode/agents/kairn-extract.md  OpenCode 用の読み取り専用エージェント定義（extract の opencode アダプタが `--agent kairn-extract` で使う）
 workspaces/<ws>/       データ実体（.gitignore、Drive 同期）。案件の置き場はここだけ（リポジトリ側にはリンクも作らない）
   cases/<case>/        worklog.md、作業ファイル、plan/、events.jsonl。エージェントは open_case が返す paths.case_dir（絶対パス）で読み書きする
@@ -83,16 +83,28 @@ kairn ensure [--timeout 15]               # /mcp が応答しなければ kairn 
 
 ## 各エージェントへの適用
 
-### 1. サーバーを常駐させる（`kairn serve`）
+### 1. サーバーを常駐させる（`kairn install-service`）
 
-MCP（`http://127.0.0.1:8765/mcp`）と UI（`http://127.0.0.1:8765/ui`）は同じプロセス。systemd user service で常駐させる:
+MCP（`http://127.0.0.1:8765/mcp`）と UI（`http://127.0.0.1:8765/ui`）は同じプロセス（`kairn serve`）。systemd user service で常駐させる。
+unit は雛形ファイルではなく `kairn install-service` がコード内テンプレート（`kairn/service.py`）から生成する:
 
 ```
-cp contrib/systemd/kairn-serve.service ~/.config/systemd/user/
-# clone 先が %h/kairn でなければ ExecStart の %h/kairn を書き換える
-systemctl --user daemon-reload && systemctl --user enable --now kairn-serve.service
+kairn install-service            # 対話式。--yes で既定値のまま非対話、--print で書く内容を表示するだけ（ファイルもコマンドも実行しない）
 systemctl --user status kairn-serve.service; journalctl --user -u kairn-serve
 ```
+
+- 対話項目: バインド先（既定 `127.0.0.1`。他を選ぶと「ネットワークに公開される」確認が出る）、ポート（既定 8765）、日次同期を回すワークスペース
+  （設定にあるものから複数選択。無しも可）、日次の時刻（既定 12:30）、`enable --now` するか、ログインしていなくても起動するか
+  （`loginctl enable-linger`。管理者認証を求められることがある。失敗しても他は続行）。
+- 生成先: `~/.config/systemd/user/kairn-serve.service`（`Restart=on-failure`）、`kairn-daily@.service`（テンプレート unit、`%i` = ワークスペース名）、
+  `kairn-daily@<ws>.timer`（`Persistent=true`、`RandomizedDelaySec=10m`）。`ExecStart` には install-service を実行した `kairn` 自身の絶対パスが入る
+  （`uv tool install` なら `~/.local/bin/kairn`、`.venv/bin/kairn` から実行すればそのパス）。既存の unit と差分があれば表示して上書きを確認する（`--yes` は上書き）。
+- 実行するもの: `systemctl --user daemon-reload` → `enable [--now] kairn-serve.service kairn-daily@<ws>.timer …` → （選んだ時だけ）`loginctl enable-linger` → `is-active` の表示。
+  `systemctl` の無い環境では unit を書くだけにして案内を出す。
+- 選んだバインド先とポートは `~/.config/kairn/config.yaml` の `serve:` に書かれ、`kairn ensure` がそれを見る。ポートを変えたら各エージェントの MCP 登録 URL も合わせる。
+
+`kairn ensure`: 設定のポートで `/mcp` が応答しなければ `kairn serve` を切り離して起動（`start_new_session`。出力は `~/.local/state/kairn/serve.log`）し、
+応答が出るまで最大 15 秒待つ（`--timeout`）。動いていれば何もしない。終了コード 0 = 応答あり。skill は案件を開く前にこれを 1 回実行する（service が止まっていた時の保険）。
 
 ### 2. skill を置く（Claude Code / Codex / OpenCode 共通の SKILL.md）
 
@@ -202,12 +214,10 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 - `open_case` の checkout skip 判定は人／AI の実質的な変更だけを見る: `events.jsonl` が checkin 時点（`case.json.last_checkin_events` 行）以後に kairn 自身の `checkin` event で伸びただけなら変更と数えない。
 - `daily --dry-run` は rclone に `--dry-run` を渡し、`drive-index.txt` と索引（`kairn.sqlite`）を書き換えない。
 - 帯域制限は `rules.bwlimit`（例 `"08:00,4M 20:00,off"`。rclone の `--bwlimit` にそのまま渡す）。
-- 日次実行（systemd user timer、毎日 12:30 ± 10 分、停止中だった分は次回起動時に実行）:
+- 日次実行（systemd user timer、既定は毎日 12:30 ± 10 分、停止中だった分は次回起動時に実行）は `kairn install-service` がワークスペースごとに
+  `kairn-daily@<ws>.timer` を生成・登録する（「各エージェントへの適用」1）。確認:
   ```
-  cp contrib/systemd/kairn-daily.{service,timer} ~/.config/systemd/user/
-  sed -i 's/<workspace>/acme/' ~/.config/systemd/user/kairn-daily.service   # 自分のワークスペース名に（clone 先が %h/kairn でなければ ExecStart も書き換える）
-  systemctl --user daemon-reload && systemctl --user enable --now kairn-daily.timer
-  systemctl --user list-timers kairn-daily.timer; journalctl --user -u kairn-daily
+  systemctl --user list-timers 'kairn-daily@*'; journalctl --user -u 'kairn-daily@*'
   ```
 
 ## 抽出（extract）
@@ -233,5 +243,5 @@ MCP からは `extract_card(case)`（失敗も `ok=false` の結果として返�
 
 段階 1（config / store / index / server(MCP, mcp 2.x) / ui）完了（2026-09-02）。段階 5（sync: bag2zst / raw-move / daily / systemd timer）完了（2026-09-02）。
 段階 7（extract: MCP `extract_card` / `kairn extract` / UI の取得・適用）完了（2026-09-02）。
-段階 6（skill の最終化、`kairn install-skill`、各エージェントの MCP 登録手順、opencode agent、`kairn-serve.service`）完了（2026-09-02）。
+段階 6（skill の最終化、`kairn install-skill`、各エージェントの MCP 登録手順、opencode agent、`kairn install-service` / `kairn ensure`）完了（2026-09-02）。
 実装順は docs/roadmap.md（8 の既存 worklog の移行は別件）。
