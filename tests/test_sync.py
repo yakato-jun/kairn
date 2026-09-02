@@ -849,6 +849,31 @@ def test_manifest_lock_timeout_is_recorded_in_checkin_result(conf, fake, monkeyp
     assert [c[1] for c in fake.calls] == ["copyto", "sync", "cat", "rcat"] and set(fake.manifest["cases"]) == {"CASE-1"}
 
 
+def test_merge_manifest_never_drops_entries(conf, fake, monkeypatch):
+    """update_manifest は読み込んだ manifest のエントリを減らさない: merge_manifest は自分の案件だけ置き換えて他を保ち、
+    書き戻す直前の refuse_entry_loss が（万一）減っていれば ManifestWriteRefused で rcat を止める。"""
+    read = {"cases": {"CASE-1": {"rev": "a"}, "CASE-2": {"rev": "b"}}, "updated_at": "x", "extra": 1}
+    m = sync.merge_manifest(read, {"CASE-2": {"rev": "b2"}, "CASE-3": {"rev": "c"}})
+    assert m["cases"] == {"CASE-1": {"rev": "a"}, "CASE-2": {"rev": "b2"}, "CASE-3": {"rev": "c"}} and m["extra"] == 1 and m["updated_at"] != "x"
+    assert read["cases"]["CASE-2"] == {"rev": "b"}                                     # 引数は変更しない
+    assert sync.merge_manifest(None, {"CASE-1": {"rev": "a"}}) ["cases"] == {"CASE-1": {"rev": "a"}}
+    assert sync.merge_manifest({"cases": {"CASE-1": {"rev": "a"}}}, {})["cases"] == {"CASE-1": {"rev": "a"}}
+    for base in ({"cases": {}}, None, read):
+        for ents in ({}, {"CASE-1": {"rev": "z"}}, {"CASE-9": {"rev": "n"}}):
+            assert set((base or {}).get("cases", {})) <= set(sync.merge_manifest(base, ents)["cases"])
+    sync.refuse_entry_loss(read, m); sync.refuse_entry_loss(None, m); sync.refuse_entry_loss(read, read)
+    with pytest.raises(sync.ManifestWriteRefused, match=r"1 existing entry would be dropped \(CASE-2\)"):
+        sync.refuse_entry_loss(read, {"cases": {"CASE-1": {"rev": "a"}, "CASE-3": {}}})
+    # update_manifest の経路: マージ結果が減っていたら rcat しない（RcloneError の一種なので checkin は「manifest 更新失敗」で返す）
+    ws = conf.workspaces["acme"]
+    fake.manifest = {"cases": {"CASE-1": {"rev": "a"}, "CASE-2": {"rev": "b"}}}
+    monkeypatch.setattr(sync, "merge_manifest", lambda base, entries: {"cases": dict(entries)})
+    with pytest.raises(sync.ManifestWriteRefused, match="CASE-1, CASE-2"):
+        sync.update_manifest(conf, ws, {"CASE-3": {"rev": "c"}})
+    assert [c[1] for c in fake.calls] == ["cat"] and set(fake.manifest["cases"]) == {"CASE-1", "CASE-2"}
+    assert not (ws.index_dir / "manifest.cache.json").exists()
+
+
 def test_manifest_rebuild_holds_lock(conf, fake):
     """manifest_rebuild（dry でない）は列挙〜書き戻しをロックの中で行う。dry はロックを取らない。"""
     ws = conf.workspaces["acme"]

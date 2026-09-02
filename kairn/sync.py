@@ -294,15 +294,36 @@ def refresh_manifest(conf: Config, ws: Workspace, timeout: float = MANIFEST_TIME
     return m
 
 
+class ManifestWriteRefused(RcloneError):
+    """書き戻そうとした manifest に、読み込んだ manifest のエントリが欠けている（update_manifest の不変条件違反。書かずに止める）。"""
+
+
+def merge_manifest(base: dict | None, entries: dict[str, dict]) -> dict:
+    """読み込んだ manifest（None なら未作成）に案件エントリを重ねた新しい dict を返す（base は変更しない）。
+    既存のエントリは entries にある案件だけ置き換え、他は保つ。manifest_rebuild 以外でエントリを減らす経路はここに無い。"""
+    cases = dict((base or {}).get("cases") or {})
+    cases.update(entries)
+    return {**(base or {}), "cases": cases, "updated_at": now_iso()}
+
+
+def refuse_entry_loss(read: dict | None, merged: dict) -> None:
+    """書き戻す manifest のエントリ集合が読み込んだ集合を含まなければ ManifestWriteRefused（rcat の前に呼ぶ）。"""
+    lost = sorted(set((read or {}).get("cases") or {}) - set(merged.get("cases") or {}))
+    if lost:
+        raise ManifestWriteRefused(f"refusing to write manifest: {len(lost)} existing entr{'y' if len(lost) == 1 else 'ies'} would be dropped ({', '.join(lost[:5])}{', …' if len(lost) > 5 else ''})")
+
+
 def update_manifest(conf: Config, ws: Workspace, entries: dict[str, dict]) -> dict:
     """checkin 後: ホスト内ロック（manifest_lock）を取ってから Drive の manifest を読み（取得できなければ新規作成）、渡された案件の
     エントリを書き換えて rcat で書き戻す。読むのは必ずロック取得後（ロック前に読んだ値で書き戻すと、待っている間に他が書いた
     エントリを消す）。同一ホストの同時 checkin はこのロックで直列化され、別ホスト間は「後勝ち」（他案件のエントリには触れないので
-    影響は当該案件のみ）。ロック待ちの上限は MANIFEST_LOCK_TIMEOUT_SEC（超えたら ManifestLockTimeout）。キャッシュも更新する。"""
+    影響は当該案件のみ）。ロック待ちの上限は MANIFEST_LOCK_TIMEOUT_SEC（超えたら ManifestLockTimeout）。
+    書き戻す前に refuse_entry_loss で「読み込んだエントリが 1 つも減っていない」ことを確かめる（減っていれば書かずに
+    ManifestWriteRefused。既存エントリを消してよいのは manifest_rebuild だけ）。キャッシュも更新する。"""
     with manifest_lock(ws):
-        m = fetch_manifest(conf, ws) or {"cases": {}}
-        m["cases"].update(entries)
-        m["updated_at"] = now_iso()
+        read = fetch_manifest(conf, ws)
+        m = merge_manifest(read, entries)
+        refuse_entry_loss(read, m)
         write_manifest(conf, ws, m)
         save_manifest_cache(ws, m)
     return m
