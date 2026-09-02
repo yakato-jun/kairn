@@ -30,7 +30,7 @@
   - related（存在する案件はリンク）、elements（タグ。クリックで一覧の絞り込み）
 
 - **設定** `GET /ui/settings`（各ページのヘッダ右の「設定」リンク）
-  同期・退避規則 `rules` の現在値（`raw_data.min_size` / `raw_data.min_age` / `bag_to_zst` / `bwlimit`、`exclude` の一覧、
+  同期・退避規則 `rules` の現在値（`raw_data.min_size` / `raw_data.min_age` / `bag_to_zst` / `bwlimit` / `rclone_flags`、`exclude` の一覧、
   `raw_data.extensions` の一覧）と、CLI の `kairn rules …` と同じ操作のフォーム。設定ファイル（`~/.config/kairn/config.yaml`）は
   kairn が書き、人は手で編集しない。保存後は `?saved=<メッセージ>` 付きで同じページに戻る（303）。案件の event には記録しない。
 
@@ -46,7 +46,7 @@
 | この下書きを case.json に適用 | `/ui/<ws>/<case>/apply` `card`（下書き JSON。結果画面の hidden） | `related_unknown` を捨てて schema.json で再検証し、title / summary / elements / related / causal を置き換え＋ `{actor: human, action: decision, note: "applied extract draft"}`。不正な JSON・スキーマ不一致は 400 |
 
 | 更新確認（一覧） | `/ui/refresh` `ws`（空なら全ワークスペース） | `sync.refresh_manifest`（rclone cat 1 回、10 秒）でキャッシュを更新し 303 で `/ui?ws=…&refreshed=<ws: manifest N case(s) \| manifest unavailable>` へ。未知の ws は 404。event は書かない |
-| 設定: 単一値 | `/ui/settings/set` `key, value` | `config.set_rule`（`raw_data.min_size` は `sync.parse_size`、`raw_data.min_age` は `parse_age`、`bag_to_zst` は true/false、`bwlimit` は `parse_bwlimit` で検証。`off` はキーを消す）→ `Config.save()`。不正な値・未知の key は 400 で保存しない。event は書かない |
+| 設定: 単一値 | `/ui/settings/set` `key, value` | `config.set_rule`（`raw_data.min_size` は `sync.parse_size`、`raw_data.min_age` は `parse_age`、`bag_to_zst` は true/false、`bwlimit` は `parse_bwlimit` で検証。`off` はキーを消す。`rclone_flags` は `parse_rclone_flags`（空白区切り。`--` で始まるオプションと値だけ）で検証し、空文字はキーを消す）→ `Config.save()`。不正な値・未知の key は 400 で保存しない。event は書かない |
 | 設定: exclude の追加／削除 | `/ui/settings/add-exclude` / `remove-exclude` `pattern` | `rules.exclude` に足す（重複は no-op）／外す（無ければ 400）→ 保存 |
 | 設定: 生データ拡張子の追加／削除 | `/ui/settings/add-raw-ext` / `remove-raw-ext` `ext` | `rules.raw_data.extensions` に足す（先頭の `.` は外し小文字。重複は no-op）／外す（無ければ 400）→ 保存 |
 

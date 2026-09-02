@@ -9,7 +9,7 @@
 4. [完了] `ui`: 一覧・かんばん・時系列・版履歴・差し戻し・コメント・タスク追加・状態変更・鮮度・elements 絞り込み（/ui、MCP と同一プロセス）
 5. [完了] `sync`: rclone による checkout（`--update`）/ checkin / 生データ move（`raw_move`: `rules.raw_data`、所在を case.json.data[] と
    worklog.md の Data location（worklog.md が無ければ DATA.md）に記録）/ bag の zstd 圧縮（`bag2zst`）/ drive-index / 日次同期（`daily`: 各段の失敗を index/daily.log に記録して続行）。
-   CLI `bag2zst` / `raw-move` / `daily`、systemd user timer（`kairn install-service` が `kairn-daily@<ws>.timer` を生成、既定 12:30）。`rules.bwlimit` で帯域制限
+   CLI `bag2zst` / `raw-move` / `daily`、systemd user timer（`kairn install-service` が `kairn-daily@<ws>.timer` を生成、既定 12:30）。`rules.bwlimit` で帯域制限、`rules.rclone_flags` で rclone の追加引数（自前の OAuth client_id 前提の並列度。README「専用 OAuth クライアント」）
 6. [完了] skill・登録: skills/kairn/SKILL.md を実装済みの 10 ツールに合わせて最終化、`kairn install-skill [--home]`（~/.agents/skills/kairn と
    ~/.claude/skills/kairn を skills/kairn へのリンクに。既存は上書きしない）、各エージェントの MCP 登録手順（README）、opencode の agent
    `kairn-extract`（contrib/opencode/agents）、`kairn serve` の常駐 unit（当初は contrib/systemd の雛形。2026-09-02 に `kairn install-service` がコード内テンプレートから生成する方式へ置き換え、雛形は削除）。/worklog（従来 skill）の置き換えは
