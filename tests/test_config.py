@@ -97,7 +97,7 @@ def test_cli_checkout_dry_run_does_not_rebuild_index(conf, monkeypatch, capsys):
     CaseStore(ws.cases_dir).create_case("CASE-1", "t", "acme", actor="human")
     monkeypatch.setattr(cfg, "load", lambda path=None: conf)
     monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
-    monkeypatch.setattr(sync, "_run", lambda cmd, dry=False: subprocess.CompletedProcess(cmd, 0, "fake", ""))
+    monkeypatch.setattr(sync, "_run", lambda cmd, dry=False, progress=None: subprocess.CompletedProcess(cmd, 0, "fake", ""))
     monkeypatch.setattr("sys.argv", ["kairn", "checkout", "acme", "--dry-run"])
     cli.main()
     assert not (ws.index_dir / "kairn.sqlite").exists() and "index not rebuilt" in capsys.readouterr().out

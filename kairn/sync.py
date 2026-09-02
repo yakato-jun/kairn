@@ -8,6 +8,7 @@
                          ワークスペース全体（daily）は rclone copy（ローカルに無い案件ディレクトリを Drive から消さない。
                          上書きされる Drive 側の版は同じく _deleted/ へ）。成功時に各案件の case.json.last_checkin_at を更新
                          （open_case の checkout skip 判定に使う）
+- checkin_job(ws, case, agent): MCP の checkin ジョブ本体（checkin → checkin event）。kairn/jobs.py のスレッドで走る
 - merge_events(local_path, remote_lines): 行の文字列一致で重複除去した和集合を `t` で安定ソートし、内容が変わる時だけ書き戻す
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
 - bag2zst(ws[, case]):   *.bag / *.bag.active を zstd 圧縮（<name>.zst、mtime 引き継ぎ、元は削除）
@@ -17,6 +18,9 @@
 生データ判定は既存の _filters（テキスト層の除外）と同じ規則: (拡張子が raw_data.extensions に含まれる OR
 サイズが min_size 超) AND 更新から min_age 超。rclone には include パスとサイズパスの 2 回に分けて渡す
 （1 回の呼び出しでは --include と --min-size が AND になるため）。
+
+checkout / checkin は progress コールバック（1 行ずつ）を受け取れる。渡すと _run は subprocess.Popen で rclone の出力を
+行単位に読む（--stats 5s --stats-one-line の進捗行を含む）。MCP のジョブ（kairn/jobs.py）が最新行を進捗として保持する。
 """
 from __future__ import annotations
 
@@ -30,6 +34,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import Config, Workspace
@@ -58,10 +63,25 @@ def _bw(conf: Config) -> list[str]:
     return ["--bwlimit", str(bw)] if bw else []
 
 
-def _run(cmd: list[str], dry: bool = False) -> subprocess.CompletedProcess:
+ProgressFn = Callable[[str], None]
+STATS_ARGS = ["--stats", "5s", "--stats-one-line"]  # 進捗行（Transferred: … , ETA …）を 5 秒ごとに stderr へ
+
+
+def _run(cmd: list[str], dry: bool = False, progress: ProgressFn | None = None) -> subprocess.CompletedProcess:
+    """rclone を実行する。progress を渡すと subprocess.Popen で stderr（stdout も合流）を行単位に読み、1 行ずつ progress(line) に
+    流す（kairn/jobs.py が最新行を進捗として保持する）。progress 無しは従来どおり subprocess.run。終了コードが 0 / 9 以外なら RcloneError。"""
     if dry:
         cmd = cmd + ["--dry-run"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    if progress is None:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    else:
+        lines: list[str] = []
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as p:
+            assert p.stdout is not None
+            for line in p.stdout:
+                lines.append(line)
+                progress(line)
+        r = subprocess.CompletedProcess(cmd, p.returncode, "", "".join(lines))
     if r.returncode not in (0, 9):  # 9 = nothing transferred with --error-on-no-transfer (not used) / keep simple
         raise RcloneError((r.stderr or r.stdout).strip()[-800:])
     return r
@@ -128,11 +148,12 @@ def _local_case_dirs(ws: Workspace) -> list[str]:
     return sorted(p.name for p in ws.cases_dir.iterdir() if p.is_dir() and not p.is_symlink() and not p.name.startswith("."))
 
 
-def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False) -> str:
+def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False, progress: ProgressFn | None = None) -> str:
     """Drive → ローカル。events.jsonl は先に Drive 版を取り寄せてマージし（merge_case_events）、転送から除外する
     （--update の mtime 比較でマージ済みの行を失わないため）。他のファイルは rclone copy --update（ローカルの方が新しいファイルは
     上書きしない）。ワークスペース全体では、ローカルにある案件を先にマージ → 転送 → 転送で新しく現れた案件をマージする。
-    取得できない案件（Drive に無い・rclone 不在）はマージを飛ばして従来どおり転送する。dry ではマージしない（ローカルを書かない）。"""
+    取得できない案件（Drive に無い・rclone 不在）はマージを飛ばして従来どおり転送する。dry ではマージしない（ローカルを書かない）。
+    progress は転送本体（rclone copy）の出力を行単位に受け取る（MCP のジョブが進捗として表示する。kairn/jobs.py）。"""
     src = conf.drive_path(ws.name, "cases", *( [case] if case else [] ))
     dst = ws.cases_dir / case if case else ws.cases_dir
     dst.mkdir(parents=True, exist_ok=True)
@@ -146,19 +167,19 @@ def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
         before = _local_case_dirs(ws)
         merged += [c for c in before if merge_case_events(conf, ws, c)]
         exclude = ["--exclude", "/*/events.jsonl"]
-    r = _run(["rclone", "copy", src, str(dst), "--update", "--fast-list", "--transfers", "8", "--stats-one-line", "-v",
-              *exclude, *_filters(conf), *_bw(conf)], dry)
+    r = _run(["rclone", "copy", src, str(dst), "--update", "--fast-list", "--transfers", "8", *STATS_ARGS, "-v",
+              *exclude, *_filters(conf), *_bw(conf)], dry, progress)
     if not case and not dry:
         merged += [c for c in _local_case_dirs(ws) if c not in before and merge_case_events(conf, ws, c)]
     msg = (r.stderr or r.stdout).strip()[-400:]
     return f"{msg} [events merged: {len(merged)}]" if merged else msg
 
 
-def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False) -> str:
+def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = False, progress: ProgressFn | None = None) -> str:
     """ローカル → Drive。先に各案件の events.jsonl を Drive 版とマージしてから転送する（Drive にしか無い行を消さない）。
     case 指定は `rclone sync`（案件内の削除を追従）、ワークスペース全体は `rclone copy`
     （ローカルに無い案件ディレクトリは消してよい＝Drive から削除しない。README 原則 2）。どちらも上書きされる Drive 側の版は
-    `_deleted/<日付>/` に退避する（--backup-dir）。dry ではマージしない。"""
+    `_deleted/<日付>/` に退避する（--backup-dir）。dry ではマージしない。progress は転送本体の出力を行単位に受け取る（checkout と同じ）。"""
     src = ws.cases_dir / case if case else ws.cases_dir
     if not src.exists():
         raise RcloneError(f"nothing to check in: {src} does not exist")
@@ -167,13 +188,24 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     verb = "sync" if case else "copy"
     merged = [] if dry else [c for c in ([case] if case else _local_case_dirs(ws)) if merge_case_events(conf, ws, c)]
     r = _run(["rclone", verb, str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
-              "--stats-one-line", "-v", *_filters(conf), *_bw(conf)], dry)
+              *STATS_ARGS, "-v", *_filters(conf), *_bw(conf)], dry, progress)
     if not dry:
         store = CaseStore(ws.cases_dir)
         for cid in ([case] if case else store.list_case_ids()):
             store.mark_checkin(cid)
     msg = (r.stderr or r.stdout).strip()[-400:]
     return f"{msg} [events merged: {len(merged)}]" if merged else msg
+
+
+def checkin_job(conf: Config, ws: Workspace, case: str, agent: str, progress: ProgressFn | None = None) -> dict:
+    """MCP の checkin ジョブ本体（kairn/jobs.py のスレッドで走る）: checkin(case) → checkin event の追記。
+    checkin() が成功時に case.json.last_checkin_at / last_checkin_events を更新し、その後に event を 1 行足す
+    （store.SYNC_EVENT_ACTIONS: この 1 行は open_case の skip 判定で変更に数えない）。返り値は従来の checkin ツールの結果。"""
+    st = CaseStore(ws.cases_dir)
+    st.load_case(case)
+    msg = checkin(conf, ws, case, progress=progress)
+    st.append_event(case, {"actor": "ai", "agent": agent, "action": "checkin", "note": msg[-200:]})
+    return {"ok": True, "rclone": msg, "last_checkin_at": st.load_case(case).get("last_checkin_at")}
 
 
 def drive_index(conf: Config, ws: Workspace, dry: bool = False) -> Path:
