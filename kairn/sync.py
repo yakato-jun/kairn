@@ -13,7 +13,7 @@
 - manifest.json:         <remote>:<root>/<ws>/manifest.json = {"cases": {"<case>": {"rev", "checked_in_at", "from"}}, "updated_at"}。
                          open_case（kairn/server.py）は rclone cat 1 回（MANIFEST_TIMEOUT_SEC）で当該案件の rev を見て、ローカルの
                          case.json.rev と同じなら取り寄せを省略する。直近に取得した内容は index/manifest.cache.json に置き、
-                         list_cases / UI 一覧の印に使う。同時 checkin の競合は「後勝ち」（案件ごとの独立エントリなので
+                         list_cases / UI 一覧の印（drive_state）に使う。同時 checkin の競合は「後勝ち」（案件ごとの独立エントリなので
                          影響は当該案件のみ）
 - checkin_job(ws, case, agent): MCP の checkin ジョブ本体（checkin → checkin event）。kairn/jobs.py のスレッドで走る
 - merge_events(local_path, remote_lines): 行の文字列一致で重複除去した和集合を `t` で安定ソートし、内容が変わる時だけ書き戻す
@@ -228,6 +228,30 @@ def update_manifest(conf: Config, ws: Workspace, entries: dict[str, dict]) -> di
     write_manifest(conf, ws, m)
     save_manifest_cache(ws, m)
     return m
+
+
+DRIVE_STATES = ("synced", "drive_newer", "local_changes", "unknown")
+
+
+def drive_state(st: CaseStore, manifest: dict | None, case_id: str) -> dict:
+    """list_cases / UI 一覧の印。manifest（通常はキャッシュ）と case.json を比べる:
+    local_changes（last_checkin_at より新しいローカル変更がある。files に一覧。drive_differs は manifest の rev も違うか）、
+    synced（rev が一致）、drive_newer（rev が違う＝Drive に別の版がある）、unknown（manifest が無い／案件のエントリが無い／未 checkin）。"""
+    case = st.load_case(case_id)
+    entry = (manifest or {}).get("cases", {}).get(case_id) if manifest else None
+    entry = entry if isinstance(entry, dict) else None
+    out: dict = {"rev": case.get("rev"), "drive_rev": entry.get("rev") if entry else None,
+                 "checked_in_at": entry.get("checked_in_at") if entry else None, "from": entry.get("from") if entry else None}
+    changed = st.local_changes_since_checkin(case_id)
+    if changed:
+        out.update(state="local_changes", files=changed, drive_differs=bool(entry) and entry.get("rev") != case.get("rev"))
+    elif entry is None or not case.get("rev"):
+        out["state"] = "unknown"
+    elif entry.get("rev") == case["rev"]:
+        out["state"] = "synced"
+    else:
+        out["state"] = "drive_newer"
+    return out
 
 
 def _local_case_dirs(ws: Workspace) -> list[str]:

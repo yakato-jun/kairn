@@ -132,8 +132,10 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
 
     @mcp.tool()
     def list_cases(workspace: str | None = None, status: str = "open", query: str = "") -> list[dict[str, Any]]:
-        """案件一覧（進捗 done/全・最終イベント付き）。status: open|closed|suspended|all。query は id/title の部分一致。"""
+        """案件一覧（進捗 done/全・最終イベント・Drive との同期状態付き）。status: open|closed|suspended|all。query は id/title の部分一致。drive.state: synced|drive_newer|local_changes|unknown（直近に取得した manifest のキャッシュとの比較。checked はその取得時刻）。"""
+        from . import sync
         ws = _ws(workspace); st = _store(ws)
+        cache = sync.load_manifest_cache(ws)
         out = []
         for cid in st.list_case_ids():
             c = st.load_case(cid)
@@ -143,7 +145,8 @@ def create_server(conf: cfg.Config, default_agent: str = "unknown", jobs: JobTab
                 continue
             le = st.last_event(cid)
             out.append({"case": cid, "title": c.get("title"), "status": c["status"], "progress": st.progress(cid),
-                        "last_event": {k: le.get(k) for k in ("t", "actor", "agent", "action", "note")} if le else None})
+                        "last_event": {k: le.get(k) for k in ("t", "actor", "agent", "action", "note")} if le else None,
+                        "drive": {**sync.drive_state(st, cache, cid), "checked": (cache or {}).get("fetched_at")}})
         return out
 
     @mcp.tool()

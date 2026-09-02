@@ -113,6 +113,7 @@ def test_full_flow(conf, mocked_rclone, jobs, drive_manifest):
             r = await c.call_tool("list_cases", {})
             lc = r.structured_content["result"]
             assert lc[0]["case"] == "CASE-123" and lc[0]["progress"] == {"total": 2, "done": 1, "open": 1, "plan": 1}
+            assert lc[0]["drive"]["state"] == "unknown" and lc[0]["drive"]["checked"] is None   # manifest 未取得
             # human sendback via store (UI と同じ書き込み) -> open_case の human_feedback に出る
             st.append_event("CASE-123", {"actor": "human", "action": "sendback", "task": "T001", "note": "unit-6 でも確認"})
             r = await _open(c, jobs, "CASE-123")
@@ -474,6 +475,8 @@ def test_open_case_manifest_decides_fetch(conf, monkeypatch, jobs, drive_manifes
             assert drive_manifest.fetches == 1 and calls == [] and jobs.all() == []
             cache = sync.load_manifest_cache(ws)
             assert cache["cases"]["CASE-1"]["rev"] == rev and cache["fetched_at"]
+            lc = (await c.call_tool("list_cases", {})).structured_content["result"]                 # 一覧の印はキャッシュとの比較
+            assert lc[0]["drive"] == {"state": "synced", "rev": rev, "drive_rev": rev, "checked_in_at": "2026-09-01T00:00:00+09:00", "from": "host-a", "checked": cache["fetched_at"]}
             # rev 不一致・取り寄せが間に合わない → job_id と status、ローカル写し
             drive_manifest.set_rev("CASE-1", "newer")
             r = await c.call_tool("open_case", {"case": "CASE-1"})
@@ -488,6 +491,8 @@ def test_open_case_manifest_decides_fetch(conf, monkeypatch, jobs, drive_manifes
             d = r.structured_content["drive"]
             assert d["fetched"] is True and d["up_to_date"] is True and jobs.get(d["job_id"]).status == "done" and d["rev"] == rev
             assert calls == ["CASE-1", "CASE-1"]
+            lc = (await c.call_tool("list_cases", {})).structured_content["result"]
+            assert lc[0]["drive"]["state"] == "drive_newer" and lc[0]["drive"]["drive_rev"] == "newer"
             # manifest にエントリが無い → 未知として取り寄せる（安全側）
             drive_manifest.data = {"cases": {}}
             r = await c.call_tool("open_case", {"case": "CASE-1"})

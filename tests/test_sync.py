@@ -704,3 +704,23 @@ def test_manifest_fetch_failures_are_none(conf, monkeypatch):
     assert not (ws.index_dir / "manifest.cache.json").exists() and sync.load_manifest_cache(ws) is None
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, '{"cases": {"CASE-1": {"rev": "a"}}}', ""))
     assert sync.refresh_manifest(conf, ws)["cases"]["CASE-1"]["rev"] == "a" and sync.load_manifest_cache(ws)["fetched_at"]
+
+
+def test_drive_state(conf, fake):
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-1", "t", "acme", actor="human")
+    assert sync.drive_state(st, None, "CASE-1")["state"] == "unknown"                                   # manifest なし・未 checkin
+    st.mark_checkin("CASE-1"); rev = st.load_case("CASE-1")["rev"]
+    m = {"cases": {"CASE-1": {"rev": rev, "checked_in_at": "2026-09-01T00:00:00+09:00", "from": "host-a"}}}
+    assert sync.drive_state(st, m, "CASE-1") == {"state": "synced", "rev": rev, "drive_rev": rev, "checked_in_at": "2026-09-01T00:00:00+09:00", "from": "host-a"}
+    assert sync.drive_state(st, {"cases": {}}, "CASE-1")["state"] == "unknown"                            # エントリなし
+    m["cases"]["CASE-1"]["rev"] = "newer"
+    assert sync.drive_state(st, m, "CASE-1")["state"] == "drive_newer"
+    t = time.time() + 5
+    os.utime(ws.cases_dir / "CASE-1" / "worklog.md", (t, t))
+    d = sync.drive_state(st, m, "CASE-1")
+    assert d["state"] == "local_changes" and d["files"] == ["worklog.md"] and d["drive_differs"] is True
+    m["cases"]["CASE-1"]["rev"] = rev
+    assert sync.drive_state(st, m, "CASE-1")["drive_differs"] is False
+    os.utime(ws.cases_dir / "CASE-1" / "worklog.md", None)
