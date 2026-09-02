@@ -28,6 +28,9 @@
 サイズが min_size 超) AND 更新から min_age 超。rclone には include パスとサイズパスの 2 回に分けて渡す
 （1 回の呼び出しでは --include と --min-size が AND になるため）。
 
+rules.rclone_flags（既定は空。`kairn rules set rclone_flags "--transfers 8 …"`）は rclone を呼ぶすべての箇所（checkout / checkin /
+raw_move / drive_index / manifest の cat・rcat / events の copyto / ws の lsd・mkdir・lsf）で共通引数の後ろに付ける（_flags）。
+
 checkout / checkin は progress コールバック（1 行ずつ）を受け取れる。渡すと _run は subprocess.Popen で rclone の出力を
 行単位に読む（--stats 5s --stats-one-line の進捗行を含む）。MCP のジョブ（kairn/jobs.py）が最新行を進捗として保持する。
 """
@@ -70,6 +73,31 @@ def _bw(conf: Config) -> list[str]:
     """帯域制限（任意）。rules.bwlimit をそのまま rclone の --bwlimit に渡す。"""
     bw = conf.rules.get("bwlimit")
     return ["--bwlimit", str(bw)] if bw else []
+
+
+def parse_rclone_flags(v) -> list[str]:
+    """rules.rclone_flags の検証: 空白区切りの文字列（またはリスト）→ トークンのリスト。各オプションは `--` で始まるトークンで、
+    その直後に値を 1 つだけ置ける（'--transfers 8 --checkers 16 --drive-pacer-min-sleep 10ms' / '--transfers=8'）。
+    先頭が `--` でないトークン（'-v'、値の連続、先頭の値）は拒否（ValueError）。空は []。"""
+    tokens = [str(t) for t in v] if isinstance(v, (list, tuple)) else str(v).split()
+    out: list[str] = []
+    prev_flag = False   # 直前のトークンが `--` で始まるオプションだった（次のトークンは値でよい）
+    for t in tokens:
+        if t.startswith("--"):
+            if t == "--":
+                raise ValueError("invalid rclone flag '--' (expected e.g. --transfers 8 or --transfers=8)")
+            prev_flag = "=" not in t
+        elif t.startswith("-") or not prev_flag:
+            raise ValueError(f"invalid rclone flag token {t!r} (each option must start with -- and take at most one value: --transfers 8)")
+        else:
+            prev_flag = False
+        out.append(t)
+    return out
+
+
+def _flags(conf: Config) -> list[str]:
+    """rules.rclone_flags（既定は空）。rclone を呼ぶすべての箇所で共通引数の後ろに付ける（同じオプションは後ろが勝つ）。"""
+    return parse_rclone_flags(conf.rules.get("rclone_flags") or [])
 
 
 ProgressFn = Callable[[str], None]
@@ -134,7 +162,7 @@ def fetch_remote_events(conf: Config, ws: Workspace, case: str) -> list[str] | N
     with tempfile.TemporaryDirectory(prefix="kairn-events-") as td:
         tmp = Path(td) / "events.jsonl"
         try:
-            _run(["rclone", "copyto", src, str(tmp), *_bw(conf)])
+            _run(["rclone", "copyto", src, str(tmp), *_bw(conf), *_flags(conf)])
         except (RcloneError, OSError):  # OSError: rclone コマンド不在
             return None
         if not tmp.exists():
@@ -179,7 +207,7 @@ def fetch_manifest(conf: Config, ws: Workspace, timeout: float = MANIFEST_TIMEOU
     """Drive の manifest.json を rclone cat で 1 回読む。rclone 不在・タイムアウト・非ゼロ終了（未作成・オフライン）・
     JSON でない → None（呼び出し側は「manifest unavailable」として扱う）。"""
     try:
-        r = subprocess.run(["rclone", "cat", manifest_drive_path(conf, ws)], capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(["rclone", "cat", manifest_drive_path(conf, ws), *_flags(conf)], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:
@@ -191,7 +219,7 @@ def write_manifest(conf: Config, ws: Workspace, manifest: dict) -> None:
     """manifest.json を rclone rcat（stdin → Drive）で書き戻す。失敗は RcloneError。"""
     text = json.dumps(manifest, ensure_ascii=False, indent=1) + "\n"
     try:
-        r = subprocess.run(["rclone", "rcat", manifest_drive_path(conf, ws)], input=text, capture_output=True, text=True)
+        r = subprocess.run(["rclone", "rcat", manifest_drive_path(conf, ws), *_flags(conf)], input=text, capture_output=True, text=True)
     except OSError as e:  # rclone コマンド不在
         raise RcloneError(f"rclone rcat failed: {e}") from e
     if r.returncode != 0:
@@ -274,7 +302,7 @@ def manifest_rebuild(conf: Config, ws: Workspace, dry: bool = False) -> dict:
              errors: {case: reason}, local_skipped: [case]}"""
     base = conf.drive_path(ws.name, "cases")
     r = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--format", "pt", "--separator", "\t", "--max-depth", "2",
-                        "--include", "/*/case.json", base], capture_output=True, text=True)
+                        "--include", "/*/case.json", base, *_flags(conf)], capture_output=True, text=True)
     if r.returncode != 0:
         raise RcloneError((r.stderr or r.stdout).strip()[-800:])
     st = CaseStore(ws.cases_dir)
@@ -290,7 +318,7 @@ def manifest_rebuild(conf: Config, ws: Workspace, dry: bool = False) -> dict:
         except ValueError as e:
             out["errors"][cid] = str(e)
             continue
-        cat = subprocess.run(["rclone", "cat", f"{base}/{path}"], capture_output=True, text=True)
+        cat = subprocess.run(["rclone", "cat", f"{base}/{path}", *_flags(conf)], capture_output=True, text=True)
         if cat.returncode != 0:
             out["errors"][cid] = f"rclone cat failed: {(cat.stderr or cat.stdout).strip()[-200:]}"
             continue
@@ -310,7 +338,7 @@ def manifest_rebuild(conf: Config, ws: Workspace, dry: bool = False) -> dict:
             info["checked_in_at_assigned"] = True
         remote_changed = info["rev_assigned"] or info["checked_in_at_assigned"]
         if remote_changed and not dry:
-            w = subprocess.run(["rclone", "rcat", f"{base}/{path}"], input=json.dumps(case, ensure_ascii=False, indent=1) + "\n",
+            w = subprocess.run(["rclone", "rcat", f"{base}/{path}", *_flags(conf)], input=json.dumps(case, ensure_ascii=False, indent=1) + "\n",
                                capture_output=True, text=True)
             if w.returncode != 0:
                 out["errors"][cid] = f"rclone rcat failed: {(w.stderr or w.stdout).strip()[-200:]}"
@@ -361,7 +389,7 @@ def checkout(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
         merged = True
         exclude = ["--exclude", "/events.jsonl"]
     r = _run(["rclone", "copy", src, str(dst), "--update", "--fast-list", "--transfers", "8", *STATS_ARGS, "-v",
-              *exclude, *_filters(conf), *_bw(conf)], dry, progress)
+              *exclude, *_filters(conf), *_bw(conf), *_flags(conf)], dry, progress)
     msg = (r.stderr or r.stdout).strip()[-400:]
     return f"{msg} [events merged: 1]" if merged else msg
 
@@ -433,7 +461,7 @@ def checkin(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
                 stamped[cid] = before
     try:
         r = _run(["rclone", verb, str(src), dst, "--backup-dir", backup, "--fast-list", "--transfers", "8",
-                  *STATS_ARGS, "-v", *_filters(conf), *_bw(conf)], dry, progress)
+                  *STATS_ARGS, "-v", *_filters(conf), *_bw(conf), *_flags(conf)], dry, progress)
     except BaseException:
         for cid, (text, mtime) in stamped.items():
             f = ws.cases_dir / cid / "case.json"
@@ -467,7 +495,7 @@ def checkin_job(conf: Config, ws: Workspace, case: str, agent: str, progress: Pr
 def drive_index(conf: Config, ws: Workspace, dry: bool = False) -> Path:
     """remote 上の全ファイル一覧を index/drive-index.txt に保存。dry では一覧を取得するだけで書き換えない。"""
     out = ws.index_dir / "drive-index.txt"
-    r = _run(["rclone", "lsf", "-R", "--files-only", "--format", "pst", "--separator", "\t", "--fast-list", conf.drive_path(ws.name)])
+    r = _run(["rclone", "lsf", "-R", "--files-only", "--format", "pst", "--separator", "\t", "--fast-list", conf.drive_path(ws.name), *_flags(conf)])
     if not dry:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(r.stdout, encoding="utf-8")
@@ -491,16 +519,16 @@ def grep_drive_index(ws: Workspace, pattern: str, limit: int = 50) -> list[dict]
 
 
 def ws_exists_on_drive(conf: Config, ws_name: str) -> bool:
-    r = subprocess.run(["rclone", "lsd", conf.drive_path(ws_name)], capture_output=True, text=True)
+    r = subprocess.run(["rclone", "lsd", conf.drive_path(ws_name), *_flags(conf)], capture_output=True, text=True)
     return r.returncode == 0
 
 
 def create_ws_on_drive(conf: Config, ws_name: str) -> None:
-    _run(["rclone", "mkdir", conf.drive_path(ws_name, "cases")])
+    _run(["rclone", "mkdir", conf.drive_path(ws_name, "cases"), *_flags(conf)])
 
 
 def list_ws_on_drive(conf: Config) -> list[str]:
-    r = subprocess.run(["rclone", "lsf", "--dirs-only", f"{conf.remote}:{conf.drive_root}"], capture_output=True, text=True)
+    r = subprocess.run(["rclone", "lsf", "--dirs-only", f"{conf.remote}:{conf.drive_root}", *_flags(conf)], capture_output=True, text=True)
     return [x.rstrip("/") for x in r.stdout.split()] if r.returncode == 0 else []
 
 
@@ -682,9 +710,9 @@ def _raw_filter_sets(conf: Config, rr: dict) -> list[list[str]]:
     return sets
 
 
-def _lsf_local(src: Path, filt: list[str]) -> dict[str, int]:
-    """rclone lsf（同じフィルタ）でローカル側の移動対象を列挙 → {相対パス: bytes}"""
-    r = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--format", "ps", "--separator", "\t", str(src), *filt],
+def _lsf_local(src: Path, filt: list[str], flags: list[str] = ()) -> dict[str, int]:
+    """rclone lsf（同じフィルタ）でローカル側の移動対象を列挙 → {相対パス: bytes}。flags は rules.rclone_flags（move と同じものを付ける）。"""
+    r = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--format", "ps", "--separator", "\t", str(src), *filt, *flags],
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RcloneError((r.stderr or r.stdout).strip()[-800:])
@@ -767,7 +795,7 @@ def raw_move(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
         try:
             planned: dict[str, int] = {}
             for filt in sets:
-                for rel, size in _lsf_local(d, filt).items():
+                for rel, size in _lsf_local(d, filt, _flags(conf)).items():
                     p = d / rel
                     if is_raw(p, rr):  # rclone の判定と一致することを確認（不一致は移動しない）
                         planned[rel] = size or p.stat().st_size
@@ -779,7 +807,7 @@ def raw_move(conf: Config, ws: Workspace, case: str | None = None, dry: bool = F
             for filt in sets:
                 try:
                     _run(["rclone", "move", str(d), drive, "--fast-list", "--transfers", "4", "--stats-one-line", "-v",
-                          *filt, *_bw(conf)], dry)
+                          *filt, *_bw(conf), *_flags(conf)], dry)
                 except Exception as e:
                     failure = e
                     break

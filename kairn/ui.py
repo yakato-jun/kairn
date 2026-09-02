@@ -254,7 +254,10 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
         rows = (_set_form("raw_data.min_size", v["raw_data.min_size"], "これを超えるファイルはテキスト層の同期から外れ、min_age 後に raw-move の対象（rclone の表記: 10M, 1G）")
                 + _set_form("raw_data.min_age", v["raw_data.min_age"], "更新からこの期間を過ぎた生データだけ raw-move で Drive へ移動（14d, 12h, 2w）")
                 + _set_form("bag_to_zst", v["bag_to_zst"], "*.bag / *.bag.active を zstd 圧縮してから扱う（true / false）")
-                + _set_form("bwlimit", v["bwlimit"], "rclone の --bwlimit にそのまま渡す（4M、\"08:00,4M 20:00,off\"。off で制限なし）"))
+                + _set_form("bwlimit", v["bwlimit"], "rclone の --bwlimit にそのまま渡す（4M、\"08:00,4M 20:00,off\"。off で制限なし）")
+                + _set_form("rclone_flags", " ".join(v["rclone_flags"]) or None,
+                            "rclone を呼ぶすべての箇所に付ける追加引数（空白区切り。-- で始まるオプションと値だけ。空で既定に戻す）。"
+                            "例: --transfers 8 --checkers 16 --drive-pacer-min-sleep 10ms --drive-pacer-burst 200（自前の OAuth client_id が前提。README「専用 OAuth クライアント」）")),
 
         def _list(title: str, items: list[str], add: str, remove: str, name: str, hint: str) -> str:
             lis = "".join(f"<li><code>{_esc(x)}</code> <form class='inline' method=post action='{P}/settings/{remove}' accept-charset='utf-8'>"
@@ -277,7 +280,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
         try:
             if op == "set":
                 key = str(form.get("key", "")); out = cfg.set_rule(conf, key, str(form.get("value", "")))
-                msg = f"{key} = {'(none)' if out is None else out}"
+                msg = f"{key} = {'(none)' if out is None or out == [] else ' '.join(out) if isinstance(out, list) else out}"
             elif op == "add-exclude":
                 pat = str(form.get("pattern", "")); msg = f"exclude += {pat}" if cfg.add_exclude(conf, pat) else f"exclude already has {pat}"
             elif op == "remove-exclude":

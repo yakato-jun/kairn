@@ -17,7 +17,8 @@
   kairn extract <case> [--ws <ws>] [--agent claude|codex|opencode|antigravity] [--json]
                                          # 子エージェントで case.json の下書きを作る（書き込まない。適用は UI）
   kairn rules show                       # 同期・退避規則（rules）の現在値
-  kairn rules set <key> <value>          # raw_data.min_size | raw_data.min_age | bag_to_zst | bwlimit（値を検証。不正なら拒否）
+  kairn rules set <key> <value>          # raw_data.min_size | raw_data.min_age | bag_to_zst | bwlimit | rclone_flags（値を検証。不正なら拒否）
+                                         # rclone_flags は空白区切り（"--transfers 8 --checkers 16"。-- で始まるオプションと値だけ。"" で空に戻す）
   kairn rules add-exclude <pattern> | remove-exclude <pattern>   # 同期しないパターン（rclone のフィルタ規則）
   kairn rules add-raw-ext <ext> | remove-raw-ext <ext>           # 生データ扱いの拡張子
   kairn serve [--port 8765]              # MCP + UI
@@ -255,8 +256,18 @@ def rules_lines(conf: cfg.Config) -> list[str]:
             f"raw_data.min_age:    {v['raw_data.min_age'] or '(none)'}",
             f"bag_to_zst:          {'true' if v['bag_to_zst'] else 'false'}",
             f"bwlimit:             {v['bwlimit'] or '(none)'}",
+            f"rclone_flags:        {' '.join(v['rclone_flags']) or '(none)'}",
             f"raw_data.extensions: {' '.join(v['raw_data.extensions']) or '(none)'}",
             "exclude:"] + [f"  {pat}" for pat in v["exclude"]]
+
+
+def _shown(out: object) -> str:
+    """set_rule の返り値の表示: None / 空リスト → (none)、bool → true/false、リスト → 空白区切り。"""
+    if out is None or out == []:
+        return "(none)"
+    if isinstance(out, bool):
+        return str(out).lower()
+    return " ".join(out) if isinstance(out, list) else str(out)
 
 
 def cmd_rules(a):
@@ -265,8 +276,7 @@ def cmd_rules(a):
         if a.sub == "show":
             print("\n".join(rules_lines(conf))); return
         if a.sub == "set":
-            out = cfg.set_rule(conf, a.key, a.value)
-            print(f"{a.key} = {'(none)' if out is None else str(out).lower() if isinstance(out, bool) else out}")
+            print(f"{a.key} = {_shown(cfg.set_rule(conf, a.key, a.value))}")
         elif a.sub == "add-exclude":
             print(f"exclude += {a.pattern}" if cfg.add_exclude(conf, a.pattern) else f"exclude already has {a.pattern}")
         elif a.sub == "remove-exclude":
@@ -346,6 +356,14 @@ def cmd_ensure(a):
     sys.exit(service.ensure(conf, timeout=a.timeout))
 
 
+def _argv(argv: list[str]) -> list[str]:
+    """`kairn rules set rclone_flags --fast-list` のように値が `-` で始まる（空白を含まない）と argparse がオプションと誤読するので、
+    `rules set rclone_flags` の直後に `--` を補う（既にあれば何もしない）。"""
+    if argv[:3] == ["rules", "set", "rclone_flags"] and "--" not in argv[3:]:
+        return argv[:3] + ["--"] + argv[3:]
+    return argv
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="kairn", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -376,7 +394,7 @@ def main() -> None:
     s = sub.add_parser("install-skill", help="symlink skills/kairn into ~/.agents/skills and ~/.claude/skills (existing entries are kept)"); s.add_argument("--home", default="~", help="HOME to install into (default: ~)"); s.set_defaults(f=cmd_install_skill)
     s = sub.add_parser("install-service", help="generate systemd user units (kairn-serve.service, kairn-daily@<ws>.timer) and enable them"); s.add_argument("--yes", action="store_true", help="非対話（既定値: 127.0.0.1:8765、設定の全ワークスペースを 12:30、enable --now、linger なし。既存 unit は上書き）"); s.add_argument("--print", action="store_true", help="書き込む unit の内容を表示するだけ（ファイルもコマンドも実行しない）"); s.set_defaults(f=cmd_install_service)
     s = sub.add_parser("ensure", help="start kairn serve (detached) if /mcp does not answer, and wait for it"); s.add_argument("--timeout", type=float, default=15.0, metavar="SEC"); s.set_defaults(f=cmd_ensure)
-    a = ap.parse_args()
+    a = ap.parse_args(_argv(sys.argv[1:]))
     cfg.assert_data_not_tracked()
     a.f(a)
 

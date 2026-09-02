@@ -71,6 +71,8 @@ class FakeRun:
                 return subprocess.CompletedProcess(cmd, 3, "", "fake rclone copyto: object not found")
             Path(cmd[3]).write_text("".join(l + "\n" for l in self.remote_events[case]), encoding="utf-8")
             return subprocess.CompletedProcess(cmd, 0, "", "fake rclone copyto ok")
+        if prog == "rclone" and sub == "lsf" and "--separator" not in cmd:   # list_ws_on_drive（--dirs-only）: 空
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         if prog == "rclone" and sub == "lsf":
             src = Path(cmd[cmd.index("--separator") + 2])
             include = any(x.startswith("+ *.{") for x in cmd)
@@ -818,3 +820,89 @@ def test_lsf_time_to_iso():
     iso = sync._lsf_time_to_iso("2026-08-15 09:30:00.123456789")
     assert iso is not None and iso.startswith("2026-08-15T09:30:00") and ("+" in iso[19:] or "-" in iso[19:])
     assert sync._lsf_time_to_iso("garbage") is None
+
+
+# ---------- rules.rclone_flags: rclone を呼ぶすべての箇所で共通引数の後ろに付く ----------
+
+FLAGS = ["--transfers", "8", "--checkers", "16", "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200"]
+
+
+def _tail_flags(cmd: list[str]) -> list[str]:
+    """rclone コマンドの末尾（--dry-run があればその前）が FLAGS か。"""
+    body = cmd[:-1] if cmd[-1] == "--dry-run" else cmd
+    return body[-len(FLAGS):]
+
+
+def test_rclone_flags_appended_to_every_rclone_command(conf, fake, monkeypatch):
+    """checkout（copyto + copy）/ checkin（copyto + sync|copy + manifest cat・rcat）/ raw_move（lsf + move）/ drive_index（lsf）/
+    manifest（fetch・write・rebuild の lsf・cat・rcat）/ ws（lsd・mkdir・lsf）の全 rclone 呼び出しの末尾に rules.rclone_flags が付く。
+    既定（未設定）では何も付かない。"""
+    ws = conf.workspaces["acme"]
+    st = CaseStore(ws.cases_dir)
+    st.create_case("CASE-123", "t", "acme", actor="human")
+    _touch(ws.cases_dir / "CASE-123" / "run.bag", 10, 20 * DAY)
+    fake.manifest = {"cases": {}, "updated_at": "x"}
+    fake.remote_cases = {"CASE-9": {"id": "CASE-9", "title": "t"}}
+    conf.rules["rclone_flags"] = list(FLAGS)
+    sync.checkout(conf, ws, "CASE-123")
+    sync.checkin(conf, ws, "CASE-123")
+    sync.checkin(conf, ws)
+    sync.raw_move(conf, ws, "CASE-123")
+    sync.drive_index(conf, ws)
+    sync.fetch_manifest(conf, ws); sync.write_manifest(conf, ws, {"cases": {}})
+    sync.fetch_remote_events(conf, ws, "CASE-123")
+    sync.manifest_rebuild(conf, ws)
+    sync.ws_exists_on_drive(conf, "acme"); sync.create_ws_on_drive(conf, "acme"); sync.list_ws_on_drive(conf)
+    subs = {c[1] for c in fake.calls}
+    assert {"copyto", "copy", "sync", "cat", "rcat", "lsf", "move", "lsd", "mkdir"} <= subs
+    for c in fake.calls:
+        assert c[0] == "rclone" and _tail_flags(c) == FLAGS, c
+    # --dry-run は flags の後ろ（_run が最後に足す）
+    fake.calls.clear()
+    sync.checkin(conf, ws, "CASE-123", dry=True)
+    assert fake.calls[-1][-1] == "--dry-run" and _tail_flags(fake.calls[-1]) == FLAGS
+    # 既定は何も付かない
+    fake.calls.clear(); conf.rules.pop("rclone_flags")
+    sync.checkout(conf, ws, "CASE-123"); sync.drive_index(conf, ws)
+    assert all("--checkers" not in c and "--drive-pacer-burst" not in c for c in fake.calls)
+    # 設定ファイルに不正な値が入っていたら rclone を呼ぶ前に ValueError（黙って渡さない）
+    conf.rules["rclone_flags"] = ["-v"]
+    with pytest.raises(ValueError, match="invalid rclone flag"):
+        sync.drive_index(conf, ws)
+
+
+def test_rclone_flags_on_progress_path_uses_popen(conf, fake, monkeypatch):
+    """progress 付き（MCP のジョブ経路）は subprocess.Popen。そこにも flags が付く。"""
+    from tests.test_jobs import FakePopen
+    FakePopen.calls = []; FakePopen.rc = 0
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    ws = conf.workspaces["acme"]
+    CaseStore(ws.cases_dir).create_case("CASE-123", "t", "acme", actor="human")
+    conf.rules["rclone_flags"] = list(FLAGS)
+    sync.checkout(conf, ws, "CASE-123", progress=lambda line: None)
+    sync.checkin(conf, ws, "CASE-123", progress=lambda line: None)
+    assert [c[1] for c in FakePopen.calls] == ["copy", "sync"]
+    assert all(_tail_flags(c) == FLAGS for c in FakePopen.calls)
+
+
+def test_parse_rclone_flags():
+    ok = "--transfers 8 --checkers 16 --drive-pacer-min-sleep 10ms --drive-pacer-burst 200"
+    assert sync.parse_rclone_flags(ok) == ok.split()
+    assert sync.parse_rclone_flags("  --fast-list   --transfers=8 --checkers 16 ") == ["--fast-list", "--transfers=8", "--checkers", "16"]
+    assert sync.parse_rclone_flags("") == [] and sync.parse_rclone_flags([]) == []
+    assert sync.parse_rclone_flags(["--transfers", "8"]) == ["--transfers", "8"]
+    for bad in ("-v", "--transfers 8 16", "8 --transfers", "--", "--transfers=8 16", "--transfers -1", "rm -rf"):
+        with pytest.raises(ValueError, match="invalid rclone flag"):
+            sync.parse_rclone_flags(bad)
+
+
+@pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
+def test_recommended_rclone_flags_accepted_by_real_rclone(tmp_path, monkeypatch):
+    """README の推奨値（--drive-pacer-* を含む）を実 rclone がローカル間 copy でも受け付ける（クラウド接続なし。RCLONE_CONFIG は空ファイル）。"""
+    monkeypatch.setenv("RCLONE_CONFIG", str(tmp_path / "rclone-empty.conf"))
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _touch(src / "a.txt", 3)
+    flags = sync.parse_rclone_flags("--transfers 8 --checkers 16 --drive-pacer-min-sleep 10ms --drive-pacer-burst 200")
+    r = subprocess.run(["rclone", "copy", str(src), str(dst), *flags], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (dst / "a.txt").exists()

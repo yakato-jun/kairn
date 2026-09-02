@@ -31,6 +31,10 @@ rules:
     min_age: 14d                 # 更新からこの期間を過ぎたものだけ移動（rclone の表記: h / d / w）
   bag_to_zst: true               # *.bag / *.bag.active は zstd 圧縮（<name>.zst）してから扱う
   # bwlimit: "08:00,4M 20:00,off"   # 任意。rclone の --bwlimit にそのまま渡す（時間帯別の帯域制限）
+  # rclone_flags:                  # 任意（既定は空）。rclone を呼ぶすべての箇所で共通引数の後ろに付ける追加引数（-- で始まるオプションと値だけ）。
+  #   [--transfers, "8", --checkers, "16", --drive-pacer-min-sleep, 10ms, --drive-pacer-burst, "200"]
+  #                                # ↑ 推奨例。rclone 共有の client_id では Drive API が絞られるので、自前の OAuth client_id
+  #                                #   （README「専用 OAuth クライアント」）を設定してから使う。kairn rules set rclone_flags "--transfers 8 …"
 
 # ワークスペース（顧客・会社ごとに 1 つ）。repos は `kairn attach <ws> [<repo>...]` が書く。
 # kairn は、ここに載っていないパスに対しては何もしない。

@@ -8,7 +8,9 @@
               リポジトリ側には何も作らない（案件は DATA_ROOT/<name>/cases/ にだけある）
   serve:      {host: 127.0.0.1, port: 8765}               kairn install-service が書く。kairn ensure が /mcp の応答確認と起動に使う
   rules:      同期・退避規則（既定値あり）。kairn rules set / add-exclude / remove-exclude / add-raw-ext / remove-raw-ext
-              （または UI の /ui/settings）が書く（set_rule / add_exclude / … → Config.save()。他のキーは壊さない）
+              （または UI の /ui/settings）が書く（set_rule / add_exclude / … → Config.save()。他のキーは壊さない）。
+              rules.rclone_flags（文字列のリスト。既定は空）は rclone を呼ぶすべての箇所で共通引数の後ろに付ける追加引数
+              （自前の OAuth client_id を前提に --transfers / --drive-pacer-* 等で Drive API の並列度を上げる。sync._flags）
 
 規則:
 - drive.remote が無ければ起動しない。設定済みの remote 以外は決して使わない。
@@ -140,7 +142,7 @@ class Config:
 # rules の編集（kairn rules … / UI の設定ページ）。値は検証し、不正なら ValueError（保存しない）
 # ---------------------------------------------------------------------------
 
-RULE_KEYS = ("raw_data.min_size", "raw_data.min_age", "bag_to_zst", "bwlimit")
+RULE_KEYS = ("raw_data.min_size", "raw_data.min_age", "bag_to_zst", "bwlimit", "rclone_flags")
 _TRUE = ("true", "yes", "on", "1")
 _FALSE = ("false", "no", "off", "0")
 
@@ -154,21 +156,32 @@ def _rules_mut(conf: Config) -> dict:
 
 
 def rules_view(conf: Config) -> dict:
-    """表示用: {raw_data.min_size, raw_data.min_age, bag_to_zst, bwlimit, exclude: [...], raw_data.extensions: [...]}"""
+    """表示用: {raw_data.min_size, raw_data.min_age, bag_to_zst, bwlimit, rclone_flags: [...], exclude: [...], raw_data.extensions: [...]}"""
     raw = conf.rules.get("raw_data") or {}
     return {"raw_data.min_size": raw.get("min_size"), "raw_data.min_age": raw.get("min_age"),
             "bag_to_zst": bool(conf.rules.get("bag_to_zst", True)), "bwlimit": conf.rules.get("bwlimit"),
+            "rclone_flags": [str(x) for x in (conf.rules.get("rclone_flags") or [])],
             "exclude": list(conf.rules.get("exclude") or []), "raw_data.extensions": list(raw.get("extensions") or [])}
 
 
 def set_rule(conf: Config, key: str, value: str) -> object:
     """rules の単一値を検証して書き、保存する。返り値は保存した値。
     raw_data.min_size: rclone の SizeSuffix（50M 等）、raw_data.min_age: Duration（14d 等）、bag_to_zst: true/false、
-    bwlimit: rclone の --bwlimit 表記（'off' は制限なし＝キーを消す）。"""
+    bwlimit: rclone の --bwlimit 表記（'off' は制限なし＝キーを消す）、
+    rclone_flags: 空白区切りの rclone 引数（sync.parse_rclone_flags で検証。`--` で始まるトークンだけ。空文字はキーを消す＝既定の空）。"""
     from . import sync  # 循環 import を避ける（sync が config を読む）
     if key not in RULE_KEYS:
         raise ValueError(f"unknown rule {key!r} (expected one of {', '.join(RULE_KEYS)})")
     v = str(value).strip()
+    if key == "rclone_flags":
+        out = sync.parse_rclone_flags(v)
+        rules = _rules_mut(conf)
+        if out:
+            rules["rclone_flags"] = out
+        else:
+            rules.pop("rclone_flags", None)
+        conf.save()
+        return out
     if not v:
         raise ValueError(f"{key}: value is required")
     rules = _rules_mut(conf)

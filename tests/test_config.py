@@ -229,22 +229,27 @@ def test_rules_edit_functions_validate_and_save(tmp_path):
     assert cfg.set_rule(conf, "raw_data.min_age", "7d") == "7d"
     assert cfg.set_rule(conf, "bag_to_zst", "false") is False and cfg.set_rule(conf, "bag_to_zst", "YES") is True
     assert cfg.set_rule(conf, "bwlimit", "08:00,4M   20:00,off") == "08:00,4M 20:00,off"
+    assert cfg.set_rule(conf, "rclone_flags", " --transfers 8  --checkers 16 ") == ["--transfers", "8", "--checkers", "16"]
     assert cfg.add_exclude(conf, "logs/**") is True and cfg.add_exclude(conf, "logs/**") is False    # 重複は no-op
     assert cfg.add_raw_ext(conf, ".MCAP") is True and cfg.add_raw_ext(conf, "mcap") is False        # 先頭の . を外し小文字
     re_ = cfg.load(p)
     assert re_.rules["raw_data"]["min_size"] == "10M" and re_.rules["raw_data"]["min_age"] == "7d" and re_.rules["bag_to_zst"] is True
     assert re_.rules["bwlimit"] == "08:00,4M 20:00,off" and re_.rules["exclude"][-1] == "logs/**" and re_.rules["raw_data"]["extensions"][-1] == "mcap"
+    assert re_.rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"] and sync._flags(re_) == ["--transfers", "8", "--checkers", "16"]
     assert re_.rules["exclude"][:-1] == cfg.DEFAULT_RULES["exclude"]                             # 既存の項目はそのまま
     assert re_.extract_agent == "codex" and re_.extract_timeout == 42 and re_.serve_port == 9000     # 他のキーは壊さない
     assert list(re_.workspaces) == ["acme"] and re_.workspaces["acme"].description == "d"
     assert sync._filters(re_)[-2:] == ["--max-size", "10M"] and "--exclude" in sync._filters(re_) and sync._bw(re_) == ["--bwlimit", "08:00,4M 20:00,off"]
     cfg.remove_exclude(conf, "logs/**"); cfg.remove_raw_ext(conf, "mcap")
     assert cfg.set_rule(conf, "bwlimit", "off") is None                                             # off = 制限なし（キーを消す）
+    assert cfg.set_rule(conf, "rclone_flags", "") == []                                              # 空 = 既定（キーを消す）
     re_ = cfg.load(p)
     assert "logs/**" not in re_.rules["exclude"] and "mcap" not in re_.rules["raw_data"]["extensions"] and "bwlimit" not in re_.rules
+    assert "rclone_flags" not in re_.rules and sync._flags(re_) == []
     assert cfg.DEFAULT_RULES == defaults_before                                                      # 既定値の入れ子を壊していない
     view = cfg.rules_view(re_)
     assert view["raw_data.min_size"] == "10M" and view["bwlimit"] is None and view["bag_to_zst"] is True and "*.pyc" in view["exclude"]
+    assert view["rclone_flags"] == []
 
 
 @pytest.mark.parametrize("fn, args, msg", [
@@ -254,6 +259,10 @@ def test_rules_edit_functions_validate_and_save(tmp_path):
     ("set_rule", ("bwlimit", "4M,08:00"), "invalid bwlimit"),
     ("set_rule", ("bwlimit", ""), "value is required"),
     ("set_rule", ("exclude", "x"), "unknown rule"),
+    ("set_rule", ("rclone_flags", "-v"), "invalid rclone flag"),
+    ("set_rule", ("rclone_flags", "--transfers 8 16"), "invalid rclone flag"),
+    ("set_rule", ("rclone_flags", "8 --transfers"), "invalid rclone flag"),
+    ("set_rule", ("rclone_flags", "rm -rf"), "invalid rclone flag"),
     ("add_exclude", ("",), "non-empty"),
     ("add_exclude", ("a b",), "without whitespace"),
     ("remove_exclude", ("nope/**",), "is not set"),
@@ -293,9 +302,20 @@ def test_cli_rules_show_set_add_remove(conf, monkeypatch, capsys):
         return capsys.readouterr().out
     out = run("show")
     assert "raw_data.min_size:   50M" in out and "bag_to_zst:          true" in out and "bwlimit:             (none)" in out and "  target/**" in out
+    assert "rclone_flags:        (none)" in out
     assert "raw_data.min_size = 10M" in run("set", "raw_data.min_size", "10M") and cfg.load(conf.path).rules["raw_data"]["min_size"] == "10M"
     assert "bag_to_zst = false" in run("set", "bag_to_zst", "false") and cfg.load(conf.path).rules["bag_to_zst"] is False
     assert "bwlimit = 4M" in run("set", "bwlimit", "4M") and cfg.load(conf.path).rules["bwlimit"] == "4M"
+    assert "rclone_flags = --transfers 8 --checkers 16" in run("set", "rclone_flags", "--transfers 8 --checkers 16")
+    assert cfg.load(conf.path).rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"]
+    assert "rclone_flags:        --transfers 8 --checkers 16" in run("show")
+    assert "rclone_flags = --fast-list" in run("set", "rclone_flags", "--fast-list")                 # 単一トークンも argparse に食われない
+    assert "rclone_flags = --transfers 8" in run("set", "rclone_flags", "--", "--transfers 8")       # 明示の -- も可
+    assert "rclone_flags = --transfers 8 --checkers 16" in run("set", "rclone_flags", "--transfers 8 --checkers 16")
+    with pytest.raises(SystemExit, match="invalid rclone flag"):
+        run("set", "rclone_flags", "-v")
+    assert cfg.load(conf.path).rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"]   # 拒否時は保存しない
+    assert "rclone_flags = (none)" in run("set", "rclone_flags", "") and "rclone_flags" not in cfg.load(conf.path).rules
     assert "exclude += logs/**" in run("add-exclude", "logs/**") and "logs/**" in cfg.load(conf.path).rules["exclude"]
     assert "already has" in run("add-exclude", "logs/**")
     assert "exclude -= logs/**" in run("remove-exclude", "logs/**") and "logs/**" not in cfg.load(conf.path).rules["exclude"]

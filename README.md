@@ -77,7 +77,7 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 kairn manifest rebuild <ws> [--dry-run]   # 既存 Drive データの移行: Drive の cases/*/case.json に rev を付与し manifest.json を作り直す（新方式導入時に一度）
 kairn extract <case> [--ws <ws>] [--agent …] [--json]   # 子エージェントで case.json の下書き（書き込まない）
 kairn rules show                          # 同期・退避規則（rules）の現在値
-kairn rules set <key> <value>             # raw_data.min_size | raw_data.min_age | bag_to_zst | bwlimit（値を検証し、不正なら拒否）
+kairn rules set <key> <value>             # raw_data.min_size | raw_data.min_age | bag_to_zst | bwlimit | rclone_flags（値を検証し、不正なら拒否）
 kairn rules add-exclude <pattern> | remove-exclude <pattern>   # 同期しないパターン（rclone のフィルタ規則）を足す／外す
 kairn rules add-raw-ext <ext> | remove-raw-ext <ext>           # 生データ扱いの拡張子を足す／外す
 kairn serve [--host 127.0.0.1] [--port 8765]            # MCP（/mcp）＋ UI（/ui）
@@ -249,6 +249,13 @@ kairn daily <ws> [--dry-run]              # bag2zst → checkin → raw-move →
 - `open_case` の checkout skip 判定は人／AI の実質的な変更だけを見る: `events.jsonl` が checkin 時点（`case.json.last_checkin_events` 行）以後に kairn 自身の `checkin` event で伸びただけなら変更と数えない。
 - `daily --dry-run` は rclone に `--dry-run` を渡し、`drive-index.txt` と索引（`kairn.sqlite`）を書き換えない。
 - 帯域制限は `rules.bwlimit`（例 `"08:00,4M 20:00,off"`。rclone の `--bwlimit` にそのまま渡す）。
+- **rclone の追加引数 `rules.rclone_flags`**（既定は空）: rclone を呼ぶすべての箇所（checkout / checkin / raw-move / drive-index / manifest の
+  読み書き / events の取り寄せ / ws の lsd・mkdir・lsf）で共通引数の後ろに付ける（同じオプションは後ろが勝つ）。
+  `kairn rules set rclone_flags "--transfers 8 --checkers 16 --drive-pacer-min-sleep 10ms --drive-pacer-burst 200"` が推奨例
+  （`--` で始まるオプションとその値だけ受け付ける。`kairn rules set rclone_flags ""` で空に戻す。`kairn rules show` / UI の設定ページで確認・編集）。
+  Google Drive はファイルごとに API 呼び出しが要り、rclone 共有の client_id では API レートが絞られるため、小ファイル多数の案件で転送が
+  極端に遅い（実測: 1.3 MiB・多数の小ファイルで約 5 分）。**上の値は自前の OAuth client_id（後述「専用 OAuth クライアント（推奨）」）が
+  前提**で、共有 client_id のまま並列度だけ上げると rate limit のリトライで却って遅くなる。
 - **テキスト層の上限と除外**（大量のログ・CSV を持つ案件向け）。`checkout` / `checkin`（MCP の `open_case` / `checkin` も）が転送するのは
   `rules.exclude` に当たらず、`rules.raw_data.extensions` の拡張子でなく、**`rules.raw_data.min_size`（既定 `50M`）以下**のファイルだけ
   （rclone の `--exclude` / `--max-size`。`kairn/sync.py` `_filters`）。それを超えるものは生データ層で、`raw-move` が `min_age`（既定 `14d`）後に Drive へ移動する。

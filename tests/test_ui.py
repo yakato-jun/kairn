@@ -188,6 +188,16 @@ def test_settings_page_shows_and_edits_rules(conf):
     assert c.post("/ui/settings/remove-raw-ext", data={"ext": "mcap"}, follow_redirects=False).status_code == 303
     assert c.post("/ui/settings/set", data={"key": "bwlimit", "value": "4M"}, follow_redirects=False).status_code == 303
     assert cfg.load(conf.path).rules["bwlimit"] == "4M" and conf.rules["bwlimit"] == "4M"     # 実行中のプロセスの conf にも反映
+    # rclone_flags: 表示・保存・拒否・空で既定に戻す
+    assert "rclone_flags" in c.get("/ui/settings").text and "--drive-pacer-burst 200" in c.get("/ui/settings").text   # 推奨例のヒント
+    r = c.post("/ui/settings/set", data={"key": "rclone_flags", "value": "--transfers 8 --checkers 16"}, follow_redirects=False)
+    assert r.status_code == 303 and "rclone_flags%20%3D%20--transfers%208%20--checkers%2016" in r.headers["location"]
+    assert cfg.load(conf.path).rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"] and conf.rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"]
+    assert "<code>--transfers 8 --checkers 16</code>" in c.get("/ui/settings").text
+    assert c.post("/ui/settings/set", data={"key": "rclone_flags", "value": "-v"}, follow_redirects=False).status_code == 400
+    assert cfg.load(conf.path).rules["rclone_flags"] == ["--transfers", "8", "--checkers", "16"]
+    r = c.post("/ui/settings/set", data={"key": "rclone_flags", "value": ""}, follow_redirects=False)
+    assert r.status_code == 303 and "rclone_flags" not in cfg.load(conf.path).rules
     assert c.post("/ui/settings/unknown", data={}, follow_redirects=False).status_code == 404
     # CSRF: 他サイトからの POST は 403（既存の same_origin）
     r = c.post("/ui/settings/set", data={"key": "bwlimit", "value": "off"}, headers={"Origin": "http://evil.example"}, follow_redirects=False)
