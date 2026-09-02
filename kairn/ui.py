@@ -191,7 +191,7 @@ def ui_routes(conf: cfg.Config, prefix: str = "/ui", jobs: JobTable | None = Non
         kanban = "".join(f"<div class='col'><h3>{k} ({len(v)})</h3>{''.join(v)}</div>" for k, v in cols.items())
         evs = "".join(
             f"<div class='ev {_esc(e.get('actor', 'ai'))}'><small>{_esc(e.get('t', ''))[:16]}</small> <b>{_esc(e.get('actor', ''))}</b>"
-            f"{(' <small>' + _esc(e['agent']) + '</small>') if e.get('agent') else ''} {_esc(e.get('action', ''))} {_esc(e.get('task') or '')} — {_esc(e.get('note', ''))}"
+            f"{(' <small>' + _esc(e['agent']) + '</small>') if e.get('agent') else ''} {_esc(e.get('action', ''))} {_esc(_event_target(e))} — {_esc(e.get('note', ''))}"
             + (f" <small>ev: {_esc('; '.join(_evidence(x) for x in e['evidence']))}</small>" if e.get("evidence") else "") + "</div>"
             for e in reversed(events[-100:]))
         plans = "".join(
@@ -408,6 +408,13 @@ def same_origin(req: Request) -> bool:
         if v and urlsplit(v).netloc != host:
             return False
     return True
+
+
+def _event_target(e: dict) -> str:
+    """時系列の action の後ろに出す対象: task（T012）か、ステータス変更（action: status）なら「<from> → <to>」（旧形式の from/to 無しは空）。"""
+    if e.get("action") == "status" and e.get("to"):
+        return f"{e.get('from') or '?'} → {e['to']}"
+    return e.get("task") or ""
 
 
 def _evidence(e: object) -> str:

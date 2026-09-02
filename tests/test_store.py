@@ -1,5 +1,5 @@
 import pytest
-from kairn.store import CaseStore
+from kairn.store import CaseNotFound, CaseStore
 
 
 @pytest.fixture
@@ -150,3 +150,25 @@ def test_append_access_log(tmp_path):
     assert l1.split("\t")[1:] == ["CASE-1", "agent-a"] and l2.split("\t")[1:] == ["CASE-2", "agent-b"]
     with pytest.raises(ValueError):
         append_access_log(log, "../x", "agent-a")
+
+
+def test_set_case_status_writes_from_to_event_and_noops_on_same_status(store):
+    """set_case_status: event は {action: status, from, to, note}。同じステータスへの変更は case.json も events も触らず changed=False。"""
+    store.create_case("CASE-1", "t", "acme", actor="human")
+    n = len(store.events("CASE-1"))
+    r = store.set_case_status("CASE-1", "closed", actor="human", note="done for now")
+    assert r["changed"] is True and r["previous_status"] == "open" and r["case"]["status"] == "closed"
+    ev = r["event"]
+    assert ev["action"] == "status" and ev["from"] == "open" and ev["to"] == "closed" and ev["note"] == "done for now" and ev["actor"] == "human"
+    assert store.events("CASE-1")[-1] == ev and store.load_case("CASE-1")["status"] == "closed"
+    before = store.load_case("CASE-1")
+    r = store.set_case_status("CASE-1", "closed", actor="ai", agent="x", note="again")
+    assert r == {"case": before, "changed": False, "previous_status": "closed", "event": None}
+    assert len(store.events("CASE-1")) == n + 1 and store.load_case("CASE-1") == before
+    r = store.set_case_status("CASE-1", "open", actor="ai", agent="claude-code", note="人: 再開して")
+    assert r["changed"] and r["event"]["from"] == "closed" and r["event"]["to"] == "open" and r["event"]["agent"] == "claude-code"
+    with pytest.raises(ValueError, match="invalid case status"):
+        store.set_case_status("CASE-1", "archived", actor="human")
+    assert store.load_case("CASE-1")["status"] == "open" and len(store.events("CASE-1")) == n + 2
+    with pytest.raises(CaseNotFound):
+        store.set_case_status("CASE-404", "closed", actor="human")

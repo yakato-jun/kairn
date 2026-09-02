@@ -58,6 +58,16 @@ def test_forms_utf8_percent_encoding(conf):
     r = c.post("/ui/acme/CASE-123/status", data={"status": "suspended", "note": "保留"}, follow_redirects=False)
     assert r.status_code == 303 and st.load_case("CASE-123")["status"] == "suspended"
     assert "CASE-123" not in c.get("/ui").text and "CASE-123" in c.get("/ui?status=all").text
+    # 時系列にステータス変更イベントが actor・from → to・note 付きで出る
+    ev = st.events("CASE-123")[-1]
+    assert ev["action"] == "status" and ev["actor"] == "human" and ev["from"] == "open" and ev["to"] == "suspended" and ev["note"] == "保留"
+    page = c.get("/ui/acme/CASE-123").text
+    assert "status open → suspended — 保留" in page
+    # 同じステータスを選び直しても event は増えない
+    n = len(st.events("CASE-123"))
+    assert c.post("/ui/acme/CASE-123/status", data={"status": "suspended", "note": "again"}, follow_redirects=False).status_code == 303
+    assert len(st.events("CASE-123")) == n
+    assert c.post("/ui/acme/CASE-123/status", data={"status": "archived", "note": ""}, follow_redirects=False).status_code == 400
 
 
 def test_freshness_marks_stale_open_tasks(conf):

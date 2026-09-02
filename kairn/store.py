@@ -268,13 +268,20 @@ class CaseStore:
         return [e for e in self.events(case_id)[n:] if e.get("action") not in SYNC_EVENT_ACTIONS]
 
     def set_case_status(self, case_id: str, status: str, actor: str, agent: str = "", note: str = "") -> dict:
+        """案件のステータス（open | closed | suspended）を変える。閉じる・保留する・再開するのは人の判断（docs/decisions.md 19）:
+        actor="human" は人の操作（UI / CLI）、actor="ai" は人の発言を note に添えた代行（MCP set_case_status）。
+        event: {action: "status", from: <前>, to: <後>, note}。同じステータスなら case.json も events も触らず changed=False。
+        返り値: {case, changed, previous_status, event（変えなければ None）}。不正なステータスは ValueError。"""
         if status not in CASE_STATUSES:
-            raise ValueError(f"invalid case status: {status}")
+            raise ValueError(f"invalid case status: {status} (allowed: {', '.join(sorted(CASE_STATUSES))})")
         case = self.load_case(case_id)
+        prev = case.get("status")
+        if prev == status:
+            return {"case": case, "changed": False, "previous_status": prev, "event": None}
         case["status"] = status
         self.save_case(case)
-        self.append_event(case_id, {"actor": actor, "agent": agent, "action": "status", "note": f"{status}: {note}".strip(": ")})
-        return case
+        ev = self.append_event(case_id, {"actor": actor, "agent": agent, "action": "status", "from": prev, "to": status, "note": note})
+        return {"case": case, "changed": True, "previous_status": prev, "event": ev}
 
     # ---------- plans ----------
     def _plan_file(self, case_id: str, version: int) -> Path:
