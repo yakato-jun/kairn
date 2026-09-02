@@ -89,6 +89,9 @@ kairn detach [<repo path>]                # 所属を外す（glob: 由来なら
 kairn status                              # 設定・cwd の所属・各ワークスペースの案件数と所属リポジトリ（remote が共有 client_id の Drive なら警告）
 kairn cases [<ws>] [--all]                # 案件一覧（既定は open のみ）
 kairn new <case id> "<title>" [--ws <ws>] # 案件を作る（case.json）
+kairn close <ws> <case> [--note "…"]      # 案件を閉じる（status: closed。actor=human の status event を記録。既に closed なら "already closed" で終了コード 0）
+kairn suspend <ws> <case> [--note "…"]    # 案件を保留にする（status: suspended）
+kairn reopen <ws> <case> [--note "…"]     # 案件を再開する（status: open）。閉じる・保留・再開は人の判断（AI は MCP set_case_status で人の発言を添えて代行するだけ）
 kairn checkout <ws> [<case>] [--dry-run]  # Drive → ローカル（rclone copy --update）＋索引更新（--dry-run では索引を書き換えない）。同期実行（タイムアウト無し）。案件省略時は Drive の版マーカー（cases/*/.rev/）を 1 回読み、rev がローカルと違う案件だけ
 kairn checkin <ws> [<case>] [--dry-run]   # ローカル → Drive（案件単位は rclone sync、ワークスペース全体は rclone copy。rev / last_checkin_at を書き、案件フォルダの .rev/<rev> を置く）。同期実行（タイムアウト無し）
 kairn index <ws> [--full]                 # 索引（SQLite FTS5）の差分再生成（--full で全部）

@@ -7,6 +7,8 @@
   kairn status
   kairn cases [<ws>] [--all]
   kairn new <case id> "<title>" [--ws <ws>]
+  kairn close <ws> <case> [--note "…"] | suspend <ws> <case> [--note "…"] | reopen <ws> <case> [--note "…"]
+                                         # 案件のステータスを closed / suspended / open に（actor=human の status event）。既にそのステータスなら "already …" で終了コード 0
   kairn checkout <ws> [<case>] [--dry-run] | checkin <ws> [<case>] [--dry-run] | index <ws> [--full] | drive-index <ws>
                                          # checkout / checkin は同期実行（終わるまで待つ。タイムアウト無し）。大きな初回投入は MCP ではなくここで行う
                                          # checkout <ws>（案件指定なし）は Drive の版マーカー（cases/*/.rev/）を 1 回読み、rev が違う案件だけ取り寄せる
@@ -159,6 +161,27 @@ def cmd_new(a):
     from .store import CaseStore
     c = CaseStore(ws.cases_dir).create_case(a.id, a.title, ws.name, actor="human")
     print(f"created {ws.cases_dir / c['id']}")
+
+
+CASE_STATUS_COMMANDS = {"close": "closed", "suspend": "suspended", "reopen": "open"}
+
+
+def cmd_case_status(a):
+    """kairn close | suspend | reopen <ws> <case> [--note]: 人の操作として set_case_status(actor="human")。結果を 1 行表示。"""
+    conf = cfg.load(); ws = _ws(conf, a.ws)
+    from .store import CaseNotFound, CaseStore
+    st = CaseStore(ws.cases_dir)
+    status = CASE_STATUS_COMMANDS[a.cmd]
+    try:
+        r = st.set_case_status(a.case, status, actor="human", note=a.note or "")
+    except CaseNotFound:
+        raise SystemExit(f"kairn: unknown case {a.case!r} in workspace {ws.name!r}") from None
+    except ValueError as e:
+        raise SystemExit(f"kairn: {e}") from None
+    if not r["changed"]:
+        print(f"{a.case} already {status}"); return
+    remain = len(st.open_tasks(a.case)) if status == "closed" else 0
+    print(f"{a.case}: {r['previous_status']} -> {status}" + (f" ({remain} open task(s) remain)" if remain else ""))
 
 
 def cmd_sync(a):
@@ -389,6 +412,8 @@ def main() -> None:
     s = sub.add_parser("status"); s.set_defaults(f=cmd_status)
     s = sub.add_parser("cases"); s.add_argument("ws", nargs="?"); s.add_argument("--all", action="store_true"); s.set_defaults(f=cmd_cases)
     s = sub.add_parser("new"); s.add_argument("id"); s.add_argument("title"); s.add_argument("--ws"); s.set_defaults(f=cmd_new)
+    for name, status in CASE_STATUS_COMMANDS.items():
+        s = sub.add_parser(name, help=f"set the case status to {status} (a human decision; records a status event with actor=human)"); s.add_argument("ws"); s.add_argument("case"); s.add_argument("--note", default="", help="理由（status event の note）"); s.set_defaults(f=cmd_case_status)
     for name in ("checkout", "checkin", "bag2zst", "raw-move"):
         s = sub.add_parser(name); s.add_argument("ws", nargs="?"); s.add_argument("case", nargs="?"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("index", help="rebuild the local search index (changed files only; --full for everything)"); s.add_argument("ws", nargs="?"); s.add_argument("--full", action="store_true"); s.set_defaults(f=cmd_sync)
