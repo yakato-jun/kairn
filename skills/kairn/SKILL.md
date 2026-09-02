@@ -5,7 +5,7 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 
 # kairn 運用手順（Claude Code / Codex / OpenCode 共通）
 
-判断の規則は MCP サーバー `kairn`（10 ツール）が強制する。ここでは「いつ何を呼ぶか」だけを定める。
+判断の規則は MCP サーバー `kairn`（11 ツール）が強制する。ここでは「いつ何を呼ぶか」だけを定める。
 ツールの引数・返り値の詳細は kairn リポジトリの `docs/mcp-tools.md`。
 
 ## 案件を開く
@@ -15,8 +15,12 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 1. 案件名が分かっていれば `open_case(case)`。分からなければ `find_cases(query)`（理由付きの候補）か
    `list_cases()`（`status`: open|closed|suspended|all、`query` で id/title 絞り込み）で候補を出し、**人に選んでもらう**。
 2. `open_case` の返り値は **`human_feedback`（人からの差し戻し sendback・コメント comment）を最初に読む**。
-   次に `open_tasks`、`plan`、`recent_events`、`worklog_tail`、`related`。`drive` に `fetched: false` が
-   あれば Drive からの取り寄せが skip / 失敗した理由が入っている（ローカル写しで続行している）。
+   次に `open_tasks`、`plan`、`recent_events`、`worklog_tail`、`related`。
+   - `drive` は Drive からの取り寄せの状態。`drive.job_id` があれば取り寄せがジョブとして走っている（返り値は**取り寄せ前の
+     ローカル内容**）。他の環境で作業した後など最新が要るときは `job_status(job_id)` が `done` になってからもう一度
+     `open_case` する（`failed` なら `error` を人に伝えてローカル写しで続行）。ローカルだけで作業を続けるなら待たなくてよい。
+   - `drive.skipped` は未 checkin のローカル変更があるため取り寄せなかった（ローカル写しで続行）。
+   - 「unknown case … job_id …」のエラーは Drive にしか無い案件を取り寄せ中。`job_status` が `done` になってから `open_case` し直す。
 3. 計画が無い案件は `plan(case, objective, tasks, reason)` で v1 を作る（`tasks: [{title, owner?: ai|human}]`）。
 4. 案件ディレクトリ（worklog.md・作業ファイル）はリポジトリの外、kairn の `workspaces/<ws>/cases/<case>/` にある。
    `open_case` の返り値 `paths.case_dir` / `paths.worklog`（絶対パス）で読み書きする。リポジトリ内の `tmp/` 等を探さない。
@@ -44,13 +48,18 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 
 ## 終わるとき
 1. worklog.md を更新（Current State / Decision Log / Notes / Data location）。
-2. `checkin(case)` で Drive に戻す（`case.json.last_checkin_at` が更新される）。
+2. `checkin(case)` で Drive に戻す。**ジョブとして走る**ので返り値は `{job_id, status, note}`。`job_status(job_id)` を
+   `status` が `done` になるまで見て（数十秒〜数分。`progress` に rclone の転送状況、`elapsed_sec` に経過秒）、
+   `done` を確認してから作業を終える（`result.last_checkin_at` が更新された時刻）。**`failed` なら `error` の理由を人に報告する**
+   （Drive には戻っていない。`kairn checkin <ws> <case>` を CLI で実行してもらう等の判断は人）。
+   同じ案件の checkin が既に走っていれば同じ `job_id` が返る（新しく起動しない）。
 - `checkin(case)` は rclone sync で Drive 側の案件を上書きする（Drive 側の新しい版は `_deleted/<日付>/` に退避）。
   `events.jsonl` だけは Drive 版とマージ（行の和集合）されるので、他環境の event は消えない。
   **他の環境で作業した後は、先に `open_case`（Drive から取り寄せる）か `kairn checkout` をしてから作業する**。
 - `open_case` は `events.jsonl` に何も書かない（閲覧記録はローカルの `index/access.log`）。何度開いても Drive との差分にならない。
 
 ## してはいけないこと
+- `checkin` の `job_status` が `done` になる前に「Drive に戻した」と報告する（`failed` を黙って流す）。
 - ファイルを直接編集してタスク状態・計画・イベントを変える（`case.json` / `plan/` / `events.jsonl` は必ず MCP 経由）。
 - ワークスペースをまたいで案件を参照する（人の明示指定があるときだけ `workspace=` を渡す）。
 - `extract_card` の下書きを確認なしに case.json や worklog に書き込む。
