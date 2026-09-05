@@ -229,6 +229,20 @@ def test_ensure_starts_detached_and_waits(env, capsys):
     assert kw["stdout"].name == str(log) and log.exists() and "kairn ensure" in log.read_text()
 
 
+def test_ensure_starts_detached_windows(env, monkeypatch):
+    monkeypatch.setattr("sys.platform", "win32")
+    conf = env["conf"]; conf.serve_host, conf.serve_port = "127.0.0.1", 9100
+    started = []
+
+    def fake_popen(argv, **kw):
+        started.append((argv, kw)); return _Proc()
+
+    rc = service.ensure(conf, alive=lambda h, p: True if started else False, popen=fake_popen, sleep=lambda s: None, cmd=[KAIRN])
+    assert rc == 0
+    (argv, kw), = started
+    assert "creationflags" in kw and "start_new_session" not in kw
+
+
 def test_ensure_times_out_and_reports_early_exit(env, capsys):
     rc = service.ensure(env["conf"], alive=lambda h, p: False, popen=lambda *a, **k: _Proc(), sleep=lambda s: None, timeout=0.05, cmd=[KAIRN])
     assert rc == 1 and "no answer" in capsys.readouterr().out

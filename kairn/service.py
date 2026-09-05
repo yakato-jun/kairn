@@ -55,8 +55,13 @@ def unit_dir() -> Path:
 
 
 def state_dir() -> Path:
-    """ワークスペース非依存の状態置き場（$XDG_STATE_HOME/kairn、既定 ~/.local/state/kairn）。serve.log はここ。"""
-    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    """ワークスペース非依存の状態置き場（$XDG_STATE_HOME/kairn、Windows は %LOCALAPPDATA%/kairn、既定 ~/.local/state/kairn）。serve.log はここ。"""
+    if os.environ.get("XDG_STATE_HOME"):
+        base = os.environ["XDG_STATE_HOME"]
+    elif sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "kairn"
+    else:
+        base = os.path.expanduser("~/.local/state")
     return Path(base) / "kairn"
 
 
@@ -357,7 +362,12 @@ def ensure(conf: cfg.Config, *, timeout: float = 15.0, cmd: list[str] | None = N
     with open(log_path, "ab") as log:
         log.write(f"\n--- kairn ensure {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(argv)}\n".encode())
         log.flush()
-        proc = popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": subprocess.STDOUT}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        else:
+            kwargs["start_new_session"] = True
+        proc = popen(argv, **kwargs)
     out(f"started: {' '.join(argv)} (pid {proc.pid}, log {log_path})")
     deadline = time.monotonic() + timeout
     while True:

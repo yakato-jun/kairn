@@ -77,8 +77,10 @@ def test_end_to_end(tmp_path, env, fake_rclone):
     r = _cli(env, "status"); assert r.returncode == 0 and "acme" in r.stdout and str(repo) in r.stdout and "link" not in r.stdout, r.stderr
     case_dir = tmp_path / "data" / "acme" / "cases" / "CASE-123"
     (case_dir / "worklog.md").write_text("# t\n## Objective\n起動時に widget driver の init が終わらない\n## Notes\nUART 460800 で送信量が超過する\n", encoding="utf-8")
-    # console script も動く（.venv/bin/kairn）
+    # console script も動く（.venv/bin/kairn / .venv/Scripts/kairn.exe）
     script = Path(PY).parent / "kairn"
+    if sys.platform == "win32" and not script.exists():
+        script = script.with_suffix(".exe")
     if script.exists():
         r = subprocess.run([str(script), "cases", "acme"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
         assert r.returncode == 0 and "CASE-123" in r.stdout, r.stderr

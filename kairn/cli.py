@@ -349,8 +349,11 @@ def install_skill(home: Path) -> list[str]:
         elif dst.exists():
             out.append(f"exists: {dst} ({'dir' if dst.is_dir() else 'file'}; not overwritten)")
         else:
-            dst.symlink_to(src, target_is_directory=True)
-            out.append(f"linked {dst} -> {src}")
+            try:
+                dst.symlink_to(src, target_is_directory=True)
+                out.append(f"linked {dst} -> {src}")
+            except OSError as e:
+                out.append(f"failed to symlink {dst} -> {src}: {e} (on Windows, enable Developer Mode or run as Administrator)")
     return out
 
 

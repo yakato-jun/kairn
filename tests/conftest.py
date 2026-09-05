@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -228,8 +229,11 @@ def fake_rclone(tmp_path: Path) -> Path:
     bin_dir = tmp_path / "bin"; bin_dir.mkdir()
     store = tmp_path / "drive"; store.mkdir()
     script = bin_dir / "rclone"
-    script.write_text(FAKE_RCLONE % {"store": str(store), "log": str(tmp_path / "rclone.log")})
+    script.write_text(FAKE_RCLONE % {"store": str(store), "log": str(tmp_path / "rclone.log")}, encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    # Windows 用バッチファイルラッパー
+    bat = bin_dir / "rclone.bat"
+    bat.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
     return bin_dir
 
 
