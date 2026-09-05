@@ -19,6 +19,8 @@
                          取り寄せ対象）。open_case（kairn/server.py）は drive_rev で当該案件の rev を見て、ローカルの case.json.rev と
                          同じなら取り寄せを省略する。直近に得た版は index/drive_revs.cache.json に置き、list_cases / UI 一覧の印
                          （drive_state）に使う。既存の Drive 案件にマーカーを付けるのは kairn drive-markers <ws>（drive_markers）
+- drive_case(ws, case):   Drive に同じ案件 ID があるか（rclone lsf <case>/、REV_LSF_TIMEOUT_SEC）。MCP create_case が作る前に見る
+                         （マーカーの無い案件・案件化前のディレクトリも見つけるため .rev/ ではなく案件フォルダそのものを読む）
 - checkin_job(ws, case, agent): MCP の checkin ジョブ本体（checkin → checkin event）。kairn/jobs.py のスレッドで走る
 - merge_events(local_path, remote_lines): 行の文字列一致で重複除去した和集合を `t` で安定ソートし、内容が変わる時だけ書き戻す
 - drive_index(ws):       remote 上の全ファイル一覧を index/drive-index.txt に保存
@@ -296,6 +298,25 @@ def drive_rev(conf: Config, ws: Workspace, case: str, timeout: float = REV_LSF_T
         return {"available": False, "rev": None, "markers": [], "error": (r.stderr or r.stdout).strip()[-200:]}
     markers = sorted(x.strip().rstrip("/") for x in r.stdout.splitlines() if x.strip() and not x.strip().endswith("/"))
     return {"available": True, "rev": markers[0] if len(markers) == 1 else None, "markers": markers}
+
+
+def drive_case(conf: Config, ws: Workspace, case: str, timeout: float = REV_LSF_TIMEOUT_SEC) -> dict:
+    """Drive に同じ案件 ID があるか（MCP create_case の衝突判定）: rclone lsf <ws>/cases/<case>/ の直下の名前を読む。
+    返り値: {available, exists, has_case_json, names}。available=False は rclone 不在・タイムアウト・（ディレクトリ不在以外の）失敗
+    （Drive の状態は不明＝衝突を確認できていない）。.rev/ ではなく案件フォルダそのものを見る（マーカーの無い案件・案件化前の
+    ディレクトリも見つける）。終了コード 3（directory not found）は available=True・exists=False。
+    exists=True で has_case_json=False は案件化前のディレクトリ（worklog だけ等。checkin の rclone sync で退避される側）。"""
+    try:
+        r = subprocess.run(["rclone", "lsf", conf.drive_path(ws.name, "cases", case) + "/", *_flags(conf)],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"available": False, "exists": False, "has_case_json": False, "names": [], "error": f"{type(e).__name__}: {e}"[:200]}
+    if r.returncode == 3:
+        return {"available": True, "exists": False, "has_case_json": False, "names": []}
+    if r.returncode != 0:
+        return {"available": False, "exists": False, "has_case_json": False, "names": [], "error": (r.stderr or r.stdout).strip()[-200:]}
+    names = sorted(x.strip().rstrip("/") for x in r.stdout.splitlines() if x.strip())
+    return {"available": True, "exists": bool(names), "has_case_json": "case.json" in names, "names": names}
 
 
 def load_drive_revs_cache(ws: Workspace) -> dict | None:

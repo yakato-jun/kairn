@@ -5,7 +5,7 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 
 # kairn 運用手順（Claude Code / Codex / OpenCode 共通）
 
-判断の規則は MCP サーバー `kairn`（13 ツール）が強制する。ここでは「いつ何を呼ぶか」だけを定める。
+判断の規則は MCP サーバー `kairn`（14 ツール）が強制する。ここでは「いつ何を呼ぶか」だけを定める。
 ツールの引数・返り値の詳細は kairn リポジトリの `docs/mcp-tools.md`。
 
 ## 案件を開く
@@ -29,11 +29,20 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
        他の環境で作業した可能性があるなら人に伝える。
      - `drive.skipped` … 未 checkin のローカル変更があるため取り寄せなかった（ローカル写しで続行。checkin すれば解ける）。
    - 「unknown case …」のエラーは取り寄せを終えても案件が無い（Drive にも無い）とき。`find_cases` / `list_cases` で人に選んでもらう。
-3. 計画が無い案件は `plan(case, objective, tasks, reason)` で v1 を作る（`tasks: [{title, owner?: ai|human}]`）。
-4. 案件ディレクトリ（worklog.md・作業ファイル）はリポジトリの外、kairn の `workspaces/<ws>/cases/<case>/` にある。
+3. **どの案件でもない作業を始めるときは `create_case(case, title)` で作る**。先に `find_cases` / `list_cases` で
+   既存が無いことを確かめる（既にある案件で続けられるなら作らない。似た案件があるなら人に確認する）。
+   - `case` は英数字で始まる ID（英数字と `.` `_` `-`、100 字まで）。そのワークスペースの既存案件の付け方に合わせる
+     （`list_cases()` で見る）。`title` は後から一覧で見分けられる日本語の一文にする。
+   - 登録ワークスペースが複数ある環境では `workspace` を渡す（新しい案件 ID からは決まらない）。
+   - 他 ws の案件を参考に立てた案件なら `related=["<ws>/<case>"]` を渡す（出典。後から足すのは `link_case`）。
+   - Drive に同じ ID の案件・ディレクトリがあると拒否される: 別の ID にするか、既存案件なら `open_case` で開く。
+     「the drive could not be checked」が `note` に出た場合は衝突を確認できていないので、人に一言伝える。
+   - 作った案件は**ローカルだけにある**。Drive に載るのは `checkin` のとき。続けて `plan` で v1 を作る。
+4. 計画が無い案件は `plan(case, objective, tasks, reason)` で v1 を作る（`tasks: [{title, owner?: ai|human}]`）。
+5. 案件ディレクトリ（worklog.md・作業ファイル）はリポジトリの外、kairn の `workspaces/<ws>/cases/<case>/` にある。
    `open_case` の返り値 `paths.case_dir` / `paths.worklog`（絶対パス）で読み書きする。リポジトリ内の `tmp/` 等を探さない。
    その領域を読み書きできない（許可の外）と言われたら、`kairn install-skill` が表示する許可設定手順を人に伝える。
-5. 案件フォルダ内に git worktree（`git worktree add <case_dir>/<name> …`）を作って作業してよい。直下に `.git` ファイル
+6. 案件フォルダ内に git worktree（`git worktree add <case_dir>/<name> …`）を作って作業してよい。直下に `.git` ファイル
    （worktree）か `.kairn-nosync`（空ファイル）があるディレクトリは配下ごと同期・索引・退避の対象外。通常の clone は
    `.git/` だけが除かれソース本体は同期されるので、clone ではなく worktree を使うか `.kairn-nosync` を置く。
    成果物（worklog.md、調査メモ、ログの抜粋）は作業領域の中ではなく案件直下に書く。
@@ -97,6 +106,9 @@ description: 案件（case）単位の作業ログ運用。案件を開く・計
 ## してはいけないこと
 - `checkin` の `job_status` が `done` になる前に「Drive に戻した」と報告する（`failed` を黙って流す）。
 - ファイルを直接編集してタスク状態・計画・イベントを変える（`case.json` / `plan/` / `events.jsonl` は必ず MCP 経由）。
+- 案件ディレクトリや `case.json` を自分で作る、CLI の `kairn new` を叩く（案件を作るのは `create_case`。
+  CLI で作ると「人が作った案件」として記録され、誰が作ったか分からなくなる）。
+- 既存の案件を探さずに新しい案件を作る（同じ作業の案件が二重になる）。
 - 他ワークスペースの案件を `from_case` 無しで開く・検索する、または `workspaces/` を直接 grep する（記録に残らない）。
 - 他ワークスペースの案件 ID・顧客固有の情報を自案件の worklog・タスク・成果物にそのまま書く（一般化し、出典は `link_case` で `related` に）。
 - `extract_card` の下書きを確認なしに case.json や worklog に書き込む。

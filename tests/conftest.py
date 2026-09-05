@@ -46,14 +46,17 @@ def bump_mtime(path: Path) -> None:
 
 
 class FakeDrive:
-    """sync.drive_rev / sync.drive_revs の代役（メモリ内。rclone を呼ばない）。markers: {case: [rev, …]} が Drive の cases/<case>/.rev/ の中身。
-    unavailable なら照会失敗（drive_rev は available=False、drive_revs は None）。"""
+    """sync.drive_rev / sync.drive_revs / sync.drive_case の代役（メモリ内。rclone を呼ばない）。markers: {case: [rev, …]} が Drive の
+    cases/<case>/.rev/ の中身、dirs: {case: [名前, …]} が Drive の cases/<case>/ 直下（create_case の衝突判定が見る）。
+    unavailable なら照会失敗（drive_rev / drive_case は available=False、drive_revs は None）。"""
 
     def __init__(self):
         self.markers: dict[str, list[str]] = {}
+        self.dirs: dict[str, list[str]] = {}
         self.unavailable = False
         self.lookups = 0    # drive_rev（1 案件）の回数
         self.listings = 0   # drive_revs（全案件）の回数
+        self.case_lookups = 0   # drive_case（1 案件のフォルダ）の回数
 
     def lookup(self, conf, ws, case, timeout=sync.REV_LSF_TIMEOUT_SEC):
         self.lookups += 1
@@ -68,12 +71,23 @@ class FakeDrive:
             return None
         return {c: (m[0] if len(m) == 1 else None) for c, m in self.markers.items() if m}
 
+    def case_lookup(self, conf, ws, case, timeout=sync.REV_LSF_TIMEOUT_SEC):
+        self.case_lookups += 1
+        if self.unavailable:
+            return {"available": False, "exists": False, "has_case_json": False, "names": [], "error": "fake drive: offline"}
+        names = sorted(self.dirs.get(case, []))
+        return {"available": True, "exists": bool(names), "has_case_json": "case.json" in names, "names": names}
+
     def rev(self, case: str):
         m = self.markers.get(case, [])
         return m[0] if len(m) == 1 else None
 
     def set_rev(self, case: str, rev: str):
         self.markers[case] = [rev]
+
+    def set_case(self, case: str, names=("case.json", "worklog.md")):
+        """Drive の cases/<case>/ 直下にファイルがあることにする（create_case の衝突判定用）。"""
+        self.dirs[case] = list(names)
 
     def sync_from_local(self, ws, case: str):
         """checkin の rclone sync が案件フォルダの .rev/ を Drive へ運んだことにする（rclone を偽装したテストで使う）。"""
@@ -83,10 +97,11 @@ class FakeDrive:
 
 @pytest.fixture
 def fake_drive(monkeypatch) -> FakeDrive:
-    """Drive の版マーカーをメモリ内で偽装する（sync.drive_rev / sync.drive_revs を差し替え）。"""
+    """Drive の版マーカーと案件フォルダの有無をメモリ内で偽装する（sync.drive_rev / sync.drive_revs / sync.drive_case を差し替え）。"""
     fd = FakeDrive()
     monkeypatch.setattr(sync, "drive_rev", fd.lookup)
     monkeypatch.setattr(sync, "drive_revs", fd.listing)
+    monkeypatch.setattr(sync, "drive_case", fd.case_lookup)
     return fd
 
 

@@ -1,4 +1,4 @@
-"""MCP サーバー（mcp 2.x）: in-process の Client で 13 ツールを呼ぶ。rclone は monkeypatch、Drive の版マーカー（cases/<case>/.rev/）はメモリ内の偽物（fake_drive）。
+"""MCP サーバー（mcp 2.x）: in-process の Client で 14 ツールを呼ぶ。rclone は monkeypatch、Drive の版マーカー（cases/<case>/.rev/）はメモリ内の偽物（fake_drive）。
 checkin と open_case の取り寄せはジョブ（スレッド）なので、結果を見る前に job.wait() で完了を待つ（_checkin / _open）。
 open_case は Drive のマーカーの rev がローカルと違うときだけ取り寄せる: 取り寄せを起こしたいテストは fake_drive.set_rev(case, "…") で rev をずらす。"""
 from __future__ import annotations
@@ -16,7 +16,7 @@ from kairn.jobs import JobTable
 from kairn.store import CaseStore
 from tests.conftest import bump_mtime
 
-TOOLS = {"open_case", "list_cases", "plan", "update_task", "log_event", "set_case_status", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status", "link_case"}
+TOOLS = {"open_case", "list_cases", "create_case", "plan", "update_task", "log_event", "set_case_status", "search", "find_cases", "checkin", "drive_index", "extract_card", "job_status", "link_case"}
 
 
 @pytest.fixture
@@ -1130,6 +1130,93 @@ def test_open_case_expands_related_across_workspaces(conf2, fake_drive):
     run(main)
     with pytest.raises(ValueError):
         a.create_case("CASE-3", "t", "acme", actor="human", related=["a/b/c"])
+
+
+def test_create_case(conf, fake_drive):
+    """create_case: case.json / worklog.md / opened event（actor=ai, agent）を作る。作る前に Drive を 1 回見て、同じ ID の案件フォルダが
+    あれば作らない（case.json あり＝別案件、無し＝案件化前のデータ。どちらも ToolError）。Drive を確認できなければ作り、note で知らせる。
+    ローカルに既にある案件・空の title・不正な案件 ID は ToolError。作った直後に plan / open_case が使える。"""
+    ws = conf.workspaces["acme"]; st = CaseStore(ws.cases_dir)
+    mcp = srv.create_server(conf, default_agent="test-agent")
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            r = await c.call_tool("create_case", {"case": "mock-nav-turn", "title": "waypoint で旋回しない", "agent": "fable"})
+            assert not r.is_error, r.content
+            out = r.structured_content
+            assert out["case"] == "mock-nav-turn" and out["workspace"] == "acme" and out["created"] is True and out["related"] == []
+            assert out["drive"] == {"available": True, "exists": False, "has_case_json": False, "names": []} and fake_drive.case_lookups == 1
+            assert out["paths"]["case_dir"] == str(ws.cases_dir / "mock-nav-turn") and "checkin" in out["note"]
+            case = st.load_case("mock-nav-turn")
+            assert case["title"] == "waypoint で旋回しない" and case["status"] == "open" and case["workspace"] == "acme" and case["current_plan"] == 0
+            assert (ws.cases_dir / "mock-nav-turn" / "worklog.md").read_text(encoding="utf-8").startswith("# waypoint で旋回しない")
+            ev = st.events("mock-nav-turn")
+            assert len(ev) == 1 and ev[0]["action"] == "opened" and ev[0]["actor"] == "ai" and ev[0]["agent"] == "fable"
+            # 作った直後に計画を出せる／開ける
+            r = await c.call_tool("plan", {"case": "mock-nav-turn", "objective": "原因を切り分ける", "tasks": [{"title": "ログを見る"}], "reason": "初版"})
+            assert not r.is_error, r.content
+            fake_drive.set_rev("mock-nav-turn", "x")   # 取り寄せを起こさない（ローカル rev と違うと checkout ジョブが走る）
+            fake_drive.unavailable = True
+            r = await c.call_tool("open_case", {"case": "mock-nav-turn"})
+            assert not r.is_error and r.structured_content["available"] is True and len(r.structured_content["open_tasks"]) == 1
+            fake_drive.unavailable = False
+            # ローカルに既にある
+            r = await c.call_tool("create_case", {"case": "mock-nav-turn", "title": "同じ ID"})
+            assert r.is_error and "already exists in workspace" in r.content[0].text and "open_case" in r.content[0].text
+            # 空の title・不正な案件 ID
+            for args, msg in [({"case": "CASE-NEW", "title": "  "}, "title is required"),
+                              ({"case": "../etc", "title": "t"}, "invalid case id")]:
+                r = await c.call_tool("create_case", args)
+                assert r.is_error and msg in r.content[0].text, (args, r.content)
+            assert st.list_case_ids() == ["mock-nav-turn"]
+            # Drive に同じ ID の案件がある（case.json あり）→ 作らない
+            fake_drive.set_case("CASE-ON-DRIVE")
+            r = await c.call_tool("create_case", {"case": "CASE-ON-DRIVE", "title": "t"})
+            assert r.is_error and "already exists on the drive" in r.content[0].text and "open_case" in r.content[0].text
+            # Drive に案件化前のディレクトリだけある → 作らない（次の checkin で _deleted/ に退避されてしまうため）
+            fake_drive.set_case("legacy-dir", ["worklog.md", "data"])
+            r = await c.call_tool("create_case", {"case": "legacy-dir", "title": "t"})
+            assert r.is_error and "without a case.json" in r.content[0].text and "worklog.md" in r.content[0].text
+            assert st.list_case_ids() == ["mock-nav-turn"]
+            # Drive を確認できない → 作るが note で知らせる
+            fake_drive.unavailable = True
+            r = await c.call_tool("create_case", {"case": "CASE-OFFLINE", "title": "オフラインで作る"})
+            assert not r.is_error, r.content
+            assert r.structured_content["drive"]["available"] is False and "could not be checked" in r.structured_content["note"]
+            assert st.load_case("CASE-OFFLINE")["title"] == "オフラインで作る"
+    run(main)
+
+
+def test_create_case_with_related(conf2, fake_drive):
+    """create_case の related: 実在を検証して case.json.related に入れ、他 ws の案件なら xref（tool=create_case）を 1 行。
+    不正・非実在なら案件を作らない。ワークスペースが決まらなければ ToolError。"""
+    a, b = _seed_two_workspaces(conf2)
+    acme, beta = conf2.workspaces["acme"], conf2.workspaces["beta"]
+    mcp = srv.create_server(conf2, default_agent="test-agent")
+
+    async def main():
+        async with Client(mcp, raise_exceptions=True) as c:
+            # 登録 ws が 2 つ＝新しい案件からは決まらない（既存案件と違い ID から引けない）
+            r = await c.call_tool("create_case", {"case": "CASE-NEW", "title": "t"})
+            assert r.is_error and "workspace is required" in r.content[0].text
+            # 不正・非実在の related では作らない
+            for bad, msg in [("a/b/c", "invalid related reference"), ("CASE-404", "unknown case 'CASE-404'"),
+                             ("gamma/CASE-1", "unknown workspace 'gamma'")]:
+                r = await c.call_tool("create_case", {"case": "CASE-NEW", "title": "t", "workspace": "acme", "related": bad})
+                assert r.is_error and msg in r.content[0].text, (bad, r.content)
+            assert not (acme.cases_dir / "CASE-NEW").exists()
+            # 同 ws と他 ws を混ぜる → related に入り、他 ws の分だけ xref
+            r = await c.call_tool("create_case", {"case": "CASE-NEW", "title": "新しい案件", "workspace": "acme",
+                                                  "related": ["CASE-1", "beta/CASE-9"], "agent": "claude"})
+            assert not r.is_error, r.content
+            assert r.structured_content["related"] == ["CASE-1", "beta/CASE-9"]
+            assert a.load_case("CASE-NEW")["related"] == ["CASE-1", "beta/CASE-9"]
+            x = [e for e in a.events("CASE-NEW") if e["action"] == "xref"]
+            assert len(x) == 1 and x[0]["workspace"] == "beta" and x[0]["case"] == "CASE-9" and x[0]["tool"] == "create_case" and x[0]["agent"] == "claude"
+            assert [e["action"] for e in a.events("CASE-NEW")] == ["opened", "xref"]
+            assert not (beta.index_dir / "access.log").exists()          # 閲覧ではない
+            assert [e for e in b.events("CASE-9") if e["action"] == "xref"] == []   # 相手側には書かない
+    run(main)
 
 
 def test_link_case_appends_related_and_records_xref(conf2, fake_drive):

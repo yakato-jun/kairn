@@ -157,7 +157,9 @@ bag2zst・全文索引の対象外になる（`kairn/sync.py` `WORKAREA_MARKERS`
 ```
 `action`: opened | plan | started | progress | done | dropped | sendback | comment | decision | checkin | status | extract | xref | related
 （`checkout` は旧版が `open_case` のたびに書いていた action。読めるが、もう書かない）
-`xref`（跨ぎ参照。`CaseStore.append_xref`）は**参照元**の案件の events に書く: `{actor: ai, agent, action: xref, workspace: <対象 ws>, case: <対象案件>, tool: open_case | search | find_cases}`
+`opened`（案件の作成。`CaseStore.create_case`）は案件の最初の 1 行（`note: "case created: <title>"`）。人が作った場合（UI 無し。CLI `kairn new`）は
+`actor: human`、AI が MCP `create_case` で作った場合は `actor: ai` と `agent`（誰が作った案件かを後から追える）。
+`xref`（跨ぎ参照。`CaseStore.append_xref`）は**参照元**の案件の events に書く: `{actor: ai, agent, action: xref, workspace: <対象 ws>, case: <対象案件>, tool: open_case | search | find_cases | link_case | create_case}`
 （`case` は他の event と違い**参照した相手**の案件 ID）。同じ対象（workspace, case）への参照は同じ日（JST）に 1 回だけ（ツールの違いは数えない）。
 参照された側の events には書かない（対象 ws の `index/access.log` に `cross_from=` 付きで 1 行。ローカルのみ）。
 `related`（`case.json.related` の変更。`CaseStore.link_related` / `unlink_related`）: 追記は `{actor, agent, action: related, added: [<ref>, …], note}`、
@@ -174,6 +176,7 @@ CLI `kairn close | suspend | reopen`）は `actor: human`、MCP `set_case_status
   （通常の閲覧行は 3 列。`search` / `find_cases` は他 ws のヒット案件ごとに 1 行）。ローカルのみ、同期しない。
 - 参照元の案件の `events.jsonl`: 上の `xref` event（同期される。UI の時系列に「他 ws 参照: <ws>/<case>」で出る）。
 記録されるのは MCP ツールに `from_case="<ws>/<case>"` が渡されたときだけ。`related` の展開（`open_case` の返り値）は参照に数えない。
+`related` に他 ws の案件を入れる経路（MCP `link_case` / `create_case`）は閲覧ではないので `access.log` には書かず、`xref` event だけを残す。
 
 ## 証拠（evidence）の型
 `type` は commit / pr / file / test / url。`note` は actor=human のみ（AI の証拠にはならない）。型ごとの必須キー:

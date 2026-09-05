@@ -45,6 +45,7 @@ from .store import CaseNotFound, CaseStore, append_access_log, now_iso, parse_re
 
 INSTRUCTIONS = (
     "kairn: 案件（case）単位の作業ログ。案件を開くときは open_case（無ければ find_cases / list_cases で選ぶ。選ぶのは人）。"
+    "探しても無い作業を始めるときは create_case で作る（ID と題名を決めて呼ぶ。Drive に同じ ID があれば拒否される）。"
     "作業したら log_event / update_task（done は証拠必須）。方針が変わったら plan で計画を出し直す（載せなかった open タスクは superseded になる）。"
     "終わったら checkin（ジョブとして走る。job_status で done を確認する）。"
     "自ワークスペースに無ければ他ワークスペースも検索してよい（find_cases / search の scope=auto が既定）。開いている案件の文脈は "
@@ -174,6 +175,32 @@ def create_server(conf: cfg.Config | cfg.ConfigHolder, default_agent: str = "unk
                 seen.add(key)
                 _record_xref(origin, conf.workspaces[r["workspace"]], r["case"], tool, agent)
 
+    def _check_related(conf: cfg.Config, ws: cfg.Workspace, related: str | list[str] | None, required: bool = False) -> list[str]:
+        """related 引数（"<case>" | "<ws>/<case>" の文字列またはリスト）を検証してリストにする（link_case / create_case 共通）。
+        形は validate_related、実在は同 ws なら自分の cases_dir、他 ws なら登録済み ws の cases_dir で見る。
+        不正な形・未知の ws・ローカルに無い案件は ToolError（1 つでも不正なら呼び出し側は何も書かない）。
+        required=False で省略（None・空）なら []。"""
+        if related is None:
+            refs: list[str] = []
+        else:
+            refs = [related] if isinstance(related, str) else list(related)
+        if not refs:
+            if required:
+                raise ToolError("related is required: \"<case>\" or \"<ws>/<case>\" (a string or a list of them)")
+            return []
+        try:
+            validate_related(refs)
+        except ValueError as e:
+            raise ToolError(str(e)) from None
+        for ref in refs:   # 実在の検証（形は上で済み）: 同 ws は自分の cases_dir、他 ws は登録済みの ws の cases_dir
+            ws_name, target_case = parse_related(ref)
+            if ws_name is not None and ws_name not in conf.workspaces:
+                raise ToolError(f"related {ref!r}: unknown workspace {ws_name!r} (known: {list(conf.workspaces)})")
+            target = conf.workspaces[ws_name] if ws_name else ws
+            if not (target.cases_dir / target_case / "case.json").exists():
+                raise ToolError(f"related {ref!r}: unknown case {target_case!r} in workspace {target.name!r} (the case must exist locally)")
+        return refs
+
     def _expand_related(conf: cfg.Config, ws: cfg.Workspace, related: list) -> list[dict[str, Any]]:
         """case.json.related を展開する: 各要素を {ref, workspace, case, cross_workspace, exists, title, status} に。
         他ワークスペースの案件（"<ws>/<case>"）も title と status だけ返す。実在しない・形が不正な要素は exists=false（title / status は null）。"""
@@ -264,6 +291,41 @@ def create_server(conf: cfg.Config | cfg.ConfigHolder, default_agent: str = "unk
         return out
 
     @mcp.tool()
+    def create_case(case: str, title: str, workspace: str | None = None, related: str | list[str] | None = None,
+                    agent: str = "") -> dict[str, Any]:
+        """案件を新しく作る（case.json / worklog.md の雛形 / opened event）。既存の案件が無いことを find_cases・list_cases で確かめてから呼ぶ。case: 案件 ID（英数字で始まり、英数字と . _ - のみ、100 字まで）。title: 案件名（空は拒否）。related: 出典として最初から入れる関連案件（"<case>" | "<ws>/<case>" の文字列またはリスト。実在を検証し、他 ws なら xref も記録する）。作る前に Drive に同じ ID の案件フォルダが無いか確かめ、あれば作らずエラーにする（open_case で取り寄せて開くこと）。Drive を確認できなければ作り、drive.available=false で知らせる。作った案件はローカルだけにある: Drive に載るのは checkin のとき。返り値 {case, title, workspace, created, related, drive, paths, note}。"""
+        from . import sync
+        conf = holder.current(); ws = _ws(conf, workspace, case); st = _store(ws)
+        if not isinstance(title, str) or not title.strip():
+            raise ToolError("title is required (a short name for the case; it becomes the worklog heading)")
+        refs = _check_related(conf, ws, related)
+        if (ws.cases_dir / case / "case.json").exists():
+            raise ToolError(f"case {case!r} already exists in workspace {ws.name!r}: open it with open_case (do not create it again)")
+        drive = sync.drive_case(conf, ws, case)
+        if drive["available"] and drive["exists"]:
+            if drive["has_case_json"]:
+                raise ToolError(f"case {case!r} already exists on the drive in workspace {ws.name!r}: open it with open_case "
+                                "(it will be fetched), or use a different case id. creating it here would overwrite the drive copy at the next checkin")
+            raise ToolError(f"the drive already has a folder cases/{case} in workspace {ws.name!r} without a case.json "
+                            f"(data from before this case was registered: {drive['names'][:10]}). the next checkin would move it to _deleted/: "
+                            "use a different case id, or ask a person to check it out and register it with the CLI (kairn new)")
+        try:
+            c = st.create_case(case, title.strip(), ws.name, actor="ai", agent=_agent(agent), related=refs)
+        except Exception as e:
+            raise _fail(e) from e
+        for ref in refs:   # 他 ws の案件を出典に入れた＝跨ぎ参照（link_case と同じ記録）
+            ws_name, target_case = parse_related(ref)
+            if ws_name and ws_name != ws.name:
+                st.append_xref(case, ws_name, target_case, "create_case", _agent(agent))
+        note = "created locally; it reaches the drive at the next checkin"
+        if not drive["available"]:
+            note += (f". the drive could not be checked ({drive.get('error') or 'rclone lsf failed'}): "
+                     "if a case with this id exists there, the next checkin would overwrite it")
+        return {"case": case, "title": c["title"], "workspace": ws.name, "created": True, "related": c["related"],
+                "drive": drive, "paths": {"case_dir": str(ws.cases_dir / case), "worklog": str(ws.cases_dir / case / "worklog.md")},
+                "note": note}
+
+    @mcp.tool()
     def plan(case: str, objective: str, tasks: list[dict[str, Any]], reason: str,
              workspace: str | None = None, agent: str = "") -> dict[str, Any]:
         """計画の新版を作る。tasks: [{title, owner?: ai|human, carried_from?: "T012"}]。新版に無い open タスクは superseded になる。版番号は自動。"""
@@ -315,20 +377,7 @@ def create_server(conf: cfg.Config | cfg.ConfigHolder, default_agent: str = "unk
     def link_case(case: str, related: str | list[str], note: str = "", workspace: str | None = None, agent: str = "") -> dict[str, Any]:
         """案件の related に関係する案件を足す（出典の記録）。related: "<case>"（同 ws）か "<ws>/<case>"（他 ws）の文字列またはそのリスト。他 ws の案件から得た内容を worklog・成果物に一般化して書いたときは、出典として必ずこれで "<ws>/<case>" を残す。重複なく追記（既存は保持）し、event {action: related, added} を 1 行。全部含まれていれば changed=false（何も書かない）。他 ws の案件を足したときは xref も記録する。不正な形・存在しない案件は ToolError。削除は人が UI で行う（ツールは無い）。返り値 {case, related, added, changed}。"""
         conf = holder.current(); ws = _ws(conf, workspace, case); st = _store(ws)
-        refs = [related] if isinstance(related, str) else list(related)
-        if not refs:
-            raise ToolError("related is required: \"<case>\" or \"<ws>/<case>\" (a string or a list of them)")
-        try:
-            validate_related(refs)
-        except ValueError as e:
-            raise ToolError(str(e)) from None
-        for ref in refs:   # 実在の検証（形は上で済み）: 同 ws は自分の cases_dir、他 ws は登録済みの ws の cases_dir
-            ws_name, target_case = parse_related(ref)
-            if ws_name is not None and ws_name not in conf.workspaces:
-                raise ToolError(f"related {ref!r}: unknown workspace {ws_name!r} (known: {list(conf.workspaces)})")
-            target = conf.workspaces[ws_name] if ws_name else ws
-            if not (target.cases_dir / target_case / "case.json").exists():
-                raise ToolError(f"related {ref!r}: unknown case {target_case!r} in workspace {target.name!r} (the case must exist locally)")
+        refs = _check_related(conf, ws, related, required=True)
         try:
             r = st.link_related(case, refs, actor="ai", agent=_agent(agent), note=note)
         except Exception as e:
