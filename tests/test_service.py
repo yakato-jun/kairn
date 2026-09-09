@@ -15,8 +15,11 @@ KAIRN = "/opt/acme/bin/kairn"
 
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch, conf):
-    """XDG を一時ディレクトリへ、argv[0] を偽の実行パスへ、systemctl/loginctl の呼び出しを記録するモックへ。"""
+    """XDG を一時ディレクトリへ、argv[0] を偽の実行パスへ、systemctl/loginctl の呼び出しを記録するモックへ。
+    sys.platform は linux に固定する（systemd 系のテストなので、実行 OS が Windows でも install() が
+    systemd 経路を通るようにする。Windows 固有の挙動は sys.platform を "win32" にする専用テストで確認する）。"""
     (tmp_path / "xdg").mkdir(); (tmp_path / "state").mkdir()
+    monkeypatch.setattr("sys.platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(service, "self_command", lambda: [KAIRN])
@@ -191,6 +194,103 @@ def test_interview_defaults_without_workspaces(conf, monkeypatch):
     conf.workspaces = {}
     opts = service.interview(conf, yes=True)
     assert opts.workspaces == [] and opts.host == "127.0.0.1" and opts.port == 8765 and opts.enable_now and not opts.linger
+
+
+# ---- install-service（Windows / タスクスケジューラ） --------------------------------------------------
+
+@pytest.fixture
+def win_env(tmp_path: Path, monkeypatch, conf):
+    """sys.platform を win32 に固定し、schtasks の呼び出しを記録するモックへ。"""
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(service, "self_command", lambda: [KAIRN])
+    monkeypatch.setattr(service, "have_schtasks", lambda: True)
+    monkeypatch.setattr(service, "interactive", lambda: False)
+    monkeypatch.setattr(cfg, "load", lambda path=None: conf)
+    monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
+    calls: list[list[str]] = []
+    existing: set[str] = set()
+
+    def fake_run(argv):
+        calls.append(list(argv))
+        if argv[:2] == ["schtasks", "/Query"]:
+            return (0, "") if argv[3] in existing else (1, "ERROR: The system cannot find the file specified.")
+        if argv[:2] == ["schtasks", "/Create"]:
+            existing.add(argv[3])
+            return 0, ""
+        return 0, ""
+    monkeypatch.setattr(service, "run_cmd", fake_run)
+    return {"calls": calls, "existing": existing, "conf": conf}
+
+
+def test_interview_skips_linger_on_windows(conf, monkeypatch):
+    monkeypatch.setattr("sys.platform", "win32")
+    opts = service.interview(conf, yes=True)
+    assert opts.enable_now and not opts.linger  # Windows にログオフ中も動く linger 相当は無い
+
+
+def test_render_windows_tasks_embeds_exec_path_port_and_workspaces():
+    opts = service.ServiceOptions(host="127.0.0.1", port=9999, workspaces=["acme", "personal"], daily_time="3:05")
+    tasks = service.render_windows_tasks(opts, [KAIRN])
+    assert set(tasks) == {"kairn-serve", "kairn-daily-acme", "kairn-daily-personal"}
+    serve = tasks["kairn-serve"]
+    assert serve[:2] == ["/TR", f"{KAIRN} serve --host 127.0.0.1 --port 9999"]
+    assert "/SC" in serve and serve[serve.index("/SC") + 1] == "ONLOGON" and "/RL" in serve and "LIMITED" in serve
+    daily = tasks["kairn-daily-acme"]
+    assert daily[:2] == ["/TR", f"{KAIRN} daily acme"]
+    assert daily[daily.index("/SC") + 1] == "DAILY" and daily[daily.index("/ST") + 1] == "03:05"
+    with pytest.raises(ValueError):
+        service.render_windows_tasks(service.ServiceOptions(daily_time="25:00", workspaces=["acme"]), [KAIRN])
+
+
+def test_install_windows_yes_creates_tasks_and_enables(win_env, monkeypatch, capsys):
+    rc = _main(monkeypatch, "install-service", "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "registered: kairn-serve" in out and "registered: kairn-daily-acme" in out
+    creates = [c for c in win_env["calls"] if c[:2] == ["schtasks", "/Create"]]
+    assert ["schtasks", "/Create", "/TN", "kairn-serve", "/TR", f"{KAIRN} serve --host 127.0.0.1 --port 8765",
+            "/SC", "ONLOGON", "/RL", "LIMITED", "/F"] in creates
+    assert ["schtasks", "/Run", "/TN", "kairn-serve"] in win_env["calls"]     # enable_now
+    saved = cfg._parse(yaml.safe_load(win_env["conf"].path.read_text(encoding="utf-8")), win_env["conf"].path)
+    assert (saved.serve_host, saved.serve_port) == ("127.0.0.1", 8765)
+    # 同じ内容で再実行: --yes なので確認なしで上書き
+    rc = _main(monkeypatch, "install-service", "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0 and "overwrote: kairn-serve" in out
+
+
+def test_install_windows_existing_task_refused_without_yes_and_overwritten_with_yes(win_env, monkeypatch, capsys):
+    win_env["existing"].add("kairn-serve")
+    rc = _main(monkeypatch, "install-service")                 # 非対話・--yes なし → 拒否、何も変更しない
+    out = capsys.readouterr().out
+    assert rc == 1 and "上書きしません" in out
+    assert not any(c[:2] == ["schtasks", "/Create"] for c in win_env["calls"])
+    # install() を直接呼ぶ（interview の対話プロンプトを介さない）: 対話で n → 中止
+    monkeypatch.setattr(service, "interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    rc = service.install(win_env["conf"], service.ServiceOptions(workspaces=["acme"]), yes=False, cmd=[KAIRN])
+    assert rc == 1 and "中止" in capsys.readouterr().out
+    # --yes → 上書き
+    monkeypatch.setattr(service, "interactive", lambda: False)
+    rc = _main(monkeypatch, "install-service", "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0 and "overwrote: kairn-serve" in out
+
+
+def test_install_windows_without_schtasks_explains(win_env, monkeypatch, capsys):
+    monkeypatch.setattr(service, "have_schtasks", lambda: False)
+    rc = _main(monkeypatch, "install-service", "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and "schtasks が見つかりません" in out
+    assert win_env["calls"] == []
+
+
+def test_install_windows_create_failure_returns_its_code(win_env, monkeypatch, capsys):
+    monkeypatch.setattr(service, "run_cmd", lambda argv: (1, "Access is denied.") if argv[:2] == ["schtasks", "/Create"] else (1, ""))
+    rc = service.install(win_env["conf"], service.ServiceOptions(workspaces=[]), yes=True, cmd=[KAIRN])
+    out = capsys.readouterr().out
+    assert rc == 1 and "Access is denied." in out
+    assert "管理者として実行してください" in out and "Start-Process powershell -Verb RunAs" in out
 
 
 # ---- ensure ------------------------------------------------------------------------------------

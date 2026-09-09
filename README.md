@@ -70,10 +70,24 @@ uv sync --locked --group dev
 .\.venv\Scripts\kairn.exe --help
 ```
 
-通常利用は `uv tool install --editable . --python 3.13` でも導入できる。rclone（同期）と zstd（bag 圧縮）は別途インストールし、PATH に置く。
-`setup` / `attach` / `serve` / `ensure` は Windows でも使える。`install-service` は systemd 専用のため Windows では使わず、
-まず `kairn serve` で起動する（終了は Ctrl+C）。`kairn ensure` は未起動時にバックグラウンド起動し、ログは `%LOCALAPPDATA%\kairn\serve.log`
-（`XDG_STATE_HOME` を指定した場合はそちら）に書く。ログイン時の自動起動・日次同期のタスクスケジューラ登録は自動化していない。
+通常利用は `uv tool install --editable . --python 3.13` でも導入できる（`uv` が無ければ、システムの Python に
+`pip install -e .` でもこの PC 全体から `kairn` コマンドが使えるようになる）。rclone（同期）と zstd（bag 圧縮）は
+別途インストールし、PATH に置く。`setup` / `attach` / `serve` / `ensure` は Windows でも使える。
+
+`install-service` は Windows ではタスクスケジューラにログオン時トリガーのタスク（`kairn-serve`）と日次同期のタスク
+（`kairn-daily-<ws>`、`/RL LIMITED`）を登録する。**タスクの登録自体に管理者権限が要ることがある**（グループポリシーや
+EDR（エンドポイント保護）製品がタスクスケジューラへの書き込みを非管理者に許していない環境がある。実機で確認したところ、
+`/RL LIMITED` を付けても非管理者では `schtasks /Create` が `Access is denied` になるケースがあった）。失敗したら
+`install-skill` と同じ要領で、その1回だけ管理者として実行する（登録後の `kairn serve` / `daily` の実行自体には管理者権限は要らない）:
+
+```powershell
+Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile', '-Command', 'kairn install-service --yes'
+```
+
+ログオフ中・未ログオンの自動実行はできない（systemd の linger に相当する仕組みが Windows のタスクスケジューラの
+ログオン時トリガーには無い。ログオフ中も動かしたい場合は Windows サービス化が要るが、これは別途 NSSM 等の追加ツールが要り
+未対応）。`kairn ensure` は未起動時にバックグラウンド起動し、ログは `%LOCALAPPDATA%\kairn\serve.log`
+（`XDG_STATE_HOME` を指定した場合はそちら）に書く。
 
 設定は既定で `%USERPROFILE%\.config\kairn\config.yaml`、データはリポジトリ直下の `workspaces`。`KAIRN_CONFIG` / `KAIRN_DATA_ROOT` で変更できる。
 `install-skill` はシンボリックリンク権限がない場合にスキルをコピーする。コピーは自動更新されないので、更新時はコピー先の内容を確認して手動で反映する。

@@ -389,8 +389,12 @@ def cmd_install_service(a):
     from . import service
     if a.print:
         opts = service.interview(conf, yes=True)
-        for name, body in service.render_units(opts, service.self_command()).items():
-            print(f"# ==== {service.unit_dir() / name}\n{body}")
+        if sys.platform == "win32":
+            for name, args in service.render_windows_tasks(opts, service.self_command()).items():
+                print(f"# ==== {name}\nschtasks /Create /TN {name} {' '.join(args)} /F")
+        else:
+            for name, body in service.render_units(opts, service.self_command()).items():
+                print(f"# ==== {service.unit_dir() / name}\n{body}")
         return
     opts = service.interview(conf, yes=a.yes)
     sys.exit(service.install(conf, opts, yes=a.yes))
