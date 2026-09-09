@@ -13,6 +13,16 @@ from kairn.jobs import JobTable
 from kairn.store import CaseStore
 
 
+def test_latest_uses_submission_order_when_clock_ties(monkeypatch):
+    table = JobTable()
+    monkeypatch.setattr(table, "_start", lambda job, fn: None)
+    first, _ = table.submit("checkout", "acme", "CASE-1", lambda progress: None)
+    first.status = "failed"
+    second, _ = table.submit("checkout", "acme", "CASE-1", lambda progress: None)
+    second._created_mono = first._created_mono
+    assert table.latest("checkout", "acme", "CASE-1") is second
+
+
 class FakePopen:
     """subprocess.Popen の代役: 引数を記録し、与えた行を stdout として順に流す。rc で終了コードを決める。"""
     calls: list[list[str]] = []
@@ -39,7 +49,7 @@ class FakePopen:
 def fake_popen(monkeypatch):
     FakePopen.calls = []
     FakePopen.rc = 0
-    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(sync.process, "popen", FakePopen)
     return FakePopen
 
 
@@ -60,7 +70,7 @@ def test_run_with_progress_reads_lines_via_popen(fake_popen):
 
 def test_run_without_progress_still_uses_subprocess_run(monkeypatch, fake_popen):
     calls = []
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: calls.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "out", ""))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: calls.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "out", ""))
     sync._run(["rclone", "lsf", "x"])
     assert calls == [["rclone", "lsf", "x"]] and fake_popen.calls == []
 
@@ -68,7 +78,7 @@ def test_run_without_progress_still_uses_subprocess_run(monkeypatch, fake_popen)
 def test_checkin_and_checkout_pass_progress_and_stats(conf, fake_popen, monkeypatch):
     """checkin / checkout に progress を渡すと転送本体は Popen で走り、--stats 5s --stats-one-line が付く。events の copyto は従来どおり run。
     転送前に案件フォルダの .rev/<rev> が置かれ、転送のフィルタは .rev/ を含める。"""
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 3, "", "object not found"))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 3, "", "object not found"))
     ws = conf.workspaces["acme"]
     CaseStore(ws.cases_dir).create_case("CASE-123", "t", "acme", actor="human")
     got = []
@@ -178,7 +188,7 @@ def test_finished_jobs_are_pruned_by_count_and_age(monkeypatch):
 # ---------- checkin ジョブ本体（sync.checkin_job）: mark_checkin とイベント記録はジョブ側 ----------
 
 def test_checkin_job_marks_checkin_and_appends_event(conf, fake_popen, monkeypatch):
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 3, "", "object not found"))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 3, "", "object not found"))
     ws = conf.workspaces["acme"]
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-123", "t", "acme", actor="human")

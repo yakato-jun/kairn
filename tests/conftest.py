@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,18 @@ from kairn import sync
 def _state_home(tmp_path: Path, monkeypatch):
     """ワークスペース非依存の状態置き場（serve.log 等）を一時ディレクトリに向ける（実 ~/.local/state/kairn に触れない）。"""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
+@pytest.fixture
+def requires_symlinks(tmp_path):
+    link = tmp_path / "symlink-probe"
+    try:
+        link.symlink_to(tmp_path, target_is_directory=True)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege unavailable (enable Developer Mode)")
+        raise
+    link.unlink()
 
 
 @pytest.fixture
@@ -110,12 +123,15 @@ FAKE_RCLONE = r'''#!/usr/bin/env python3
 lsf（-R / --files-only / --include）・copy / sync（--update、--include、.rev/ 限定の --filter）・copyto・cat・rcat・deletefile。
 それ以外は成功を返すだけ。クラウドには接続しない。"""
 import fnmatch, os, re, shutil, sys
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 STORE = %(store)r
 LOG = %(log)r
 VALUED = {"--include", "--exclude", "--filter", "--format", "--separator", "--max-depth", "--transfers", "--checkers", "--stats",
           "--bwlimit", "--backup-dir", "--max-size", "--min-size", "--min-age", "--drive-pacer-min-sleep", "--drive-pacer-burst"}
 args = sys.argv[1:]
-with open(LOG, "a") as fh:
+with open(LOG, "a", encoding="utf-8") as fh:
     fh.write(" ".join(args) + "\n")
 sub, rest = args[0], args[1:]
 opts, pos = {}, []
@@ -131,6 +147,8 @@ while i < len(rest):
 
 
 def path(p):
+    if os.path.isabs(p):
+        return p
     m = re.match(r"^([A-Za-z0-9_-]+):(.*)$", p)
     return os.path.join(STORE, m.group(2)) if m else p
 
@@ -228,8 +246,11 @@ def fake_rclone(tmp_path: Path) -> Path:
     bin_dir = tmp_path / "bin"; bin_dir.mkdir()
     store = tmp_path / "drive"; store.mkdir()
     script = bin_dir / "rclone"
-    script.write_text(FAKE_RCLONE % {"store": str(store), "log": str(tmp_path / "rclone.log")})
+    script.write_text(FAKE_RCLONE % {"store": str(store), "log": str(tmp_path / "rclone.log")}, encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    # Windows 用バッチファイルラッパー
+    bat = bin_dir / "rclone.bat"
+    bat.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
     return bin_dir
 
 

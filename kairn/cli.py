@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -343,14 +344,21 @@ def install_skill(home: Path) -> list[str]:
         base.mkdir(parents=True, exist_ok=True)
         dst = base / "kairn"
         if dst.is_symlink():
-            target = Path(os.readlink(dst))
+            raw = os.readlink(dst)
+            target = Path(raw[4:] if raw.startswith("\\\\?\\") else raw)  # Windows のディレクトリ symlink は \\?\ 拡張長パスで返る
             state = "already linked" if dst.resolve() == src.resolve() else f"symlink to {target}, not {src}; fix by hand"
             out.append(f"exists: {dst} ({state})")
         elif dst.exists():
             out.append(f"exists: {dst} ({'dir' if dst.is_dir() else 'file'}; not overwritten)")
         else:
-            dst.symlink_to(src, target_is_directory=True)
-            out.append(f"linked {dst} -> {src}")
+            try:
+                dst.symlink_to(src, target_is_directory=True)
+                out.append(f"linked {dst} -> {src}")
+            except OSError as e:
+                if getattr(e, "winerror", None) != 1314:
+                    raise
+                shutil.copytree(src, dst)
+                out.append(f"copied {src} -> {dst} (symlink privilege unavailable; updates must be copied manually)")
     return out
 
 
@@ -381,8 +389,12 @@ def cmd_install_service(a):
     from . import service
     if a.print:
         opts = service.interview(conf, yes=True)
-        for name, body in service.render_units(opts, service.self_command()).items():
-            print(f"# ==== {service.unit_dir() / name}\n{body}")
+        if sys.platform == "win32":
+            for name, args in service.render_windows_tasks(opts, service.self_command()).items():
+                print(f"# ==== {name}\nschtasks /Create /TN {name} {' '.join(args)} /F")
+        else:
+            for name, body in service.render_units(opts, service.self_command()).items():
+                print(f"# ==== {service.unit_dir() / name}\n{body}")
         return
     opts = service.interview(conf, yes=a.yes)
     sys.exit(service.install(conf, opts, yes=a.yes))

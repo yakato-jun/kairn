@@ -36,6 +36,8 @@ from pathlib import Path
 
 import yaml
 
+from . import process
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = Path(os.environ.get("KAIRN_DATA_ROOT", ROOT / "workspaces"))
 USER_CONFIG_PATH = Path(os.environ.get("KAIRN_CONFIG", os.path.expanduser("~/.config/kairn/config.yaml")))
@@ -422,7 +424,7 @@ def _git_top(path: Path) -> str | None:
     probe = path if path.is_dir() else path.parent
     if not probe.exists():
         return None
-    top = subprocess.run(["git", "-C", str(probe), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    top = process.run(["git", "-C", str(probe), "rev-parse", "--show-toplevel"], capture_output=True, text=True, encoding="utf-8")
     return top.stdout.strip() if top.returncode == 0 else None
 
 
@@ -431,13 +433,14 @@ def _tracked_in_git(path: Path, top: str | None = None) -> bool:
     top = top or _git_top(path)
     if not top:
         return False
-    r = subprocess.run(["git", "-C", top, "ls-files", "--", str(path)], capture_output=True, text=True)
+    r = process.run(["git", "-C", top, "ls-files", "--", str(path)], capture_output=True, text=True, encoding="utf-8")
     return r.returncode == 0 and bool(r.stdout.strip())
 
 
 def _ignored_in_git(path: Path, top: str) -> bool:
     """path が .gitignore 等で無視されているか（git check-ignore -q）。"""
-    return subprocess.run(["git", "-C", top, "check-ignore", "-q", "--", str(path)], capture_output=True, text=True).returncode == 0
+    # データ領域は未作成でもディレクトリとして照会する（末尾 / の ignore 規則）。
+    return process.run(["git", "-C", top, "check-ignore", "-q", "--", path.as_posix().rstrip("/") + "/"], capture_output=True, text=True, encoding="utf-8").returncode == 0
 
 
 def assert_data_not_tracked(data_root: Path | None = None) -> None:
@@ -456,7 +459,7 @@ def assert_data_not_tracked(data_root: Path | None = None) -> None:
 
 
 def rclone_remotes() -> list[str]:
-    r = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True)
+    r = process.run(["rclone", "listremotes"], capture_output=True, text=True, encoding="utf-8")
     return [x.rstrip(":") for x in r.stdout.split()] if r.returncode == 0 else []
 
 
@@ -470,7 +473,7 @@ def shared_client_id_warning(remote: str) -> str | None:
     それ以外（client_id あり、drive 以外、rclone 不在・失敗・remote 不明）は None。秘密の値は保持も出力もしない:
     見るのは `type` と `client_id` の 2 キーだけで、`token` / `client_secret` の行は読まずに捨てる。"""
     try:
-        r = subprocess.run(["rclone", "config", "show", remote], capture_output=True, text=True, timeout=10)
+        r = process.run(["rclone", "config", "show", remote], capture_output=True, text=True, encoding="utf-8", timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:

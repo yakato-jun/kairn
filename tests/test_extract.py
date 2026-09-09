@@ -157,7 +157,7 @@ def test_render_prompt_has_siblings_and_vocabulary(conf):
 # ---------- extract_card（subprocess をモック） ----------
 
 class FakeRun:
-    """adapters.subprocess.run の代わり。呼ばれた cmd / cwd / env を記録し、設定した結果を返す。"""
+    """adapters.process.run の代わり。呼ばれた cmd / cwd / env を記録し、設定した結果を返す。"""
 
     def __init__(self, stdout="", returncode=0, timeout=False, out_file=None, missing=False):
         self.stdout, self.returncode, self.timeout, self.out_file, self.missing = stdout, returncode, timeout, out_file, missing
@@ -166,7 +166,7 @@ class FakeRun:
     def __call__(self, cmd, **kw):
         cwd = Path(kw["cwd"]) if kw.get("cwd") else None
         # cwd（一時ディレクトリの写し）は実行後に消えるので、その時点の親ディレクトリ配下の一覧を取っておく
-        tree = sorted(str(p.relative_to(cwd.parent)) for p in cwd.parent.rglob("*")) if cwd and cwd.exists() else None
+        tree = sorted(p.relative_to(cwd.parent).as_posix() for p in cwd.parent.rglob("*")) if cwd and cwd.exists() else None
         self.calls.append({"cmd": cmd, **kw, "tree": tree})
         if self.missing:
             raise FileNotFoundError(cmd[0])
@@ -184,7 +184,7 @@ def _claude_stdout(card: dict) -> str:
 def test_extract_card_success_records_event_and_writes_nothing(conf, monkeypatch):
     st = _seed(conf); ws = conf.workspaces["acme"]
     fake = FakeRun(stdout=_claude_stdout(good_card()))
-    monkeypatch.setattr(adapters.subprocess, "run", fake)
+    monkeypatch.setattr(adapters.process, "run", fake)
     monkeypatch.setenv("SECRET_TOKEN", "s")
     before = st.load_case("CASE-123")
     r = extract.extract_card(conf, ws, "CASE-123", timeout=42)
@@ -213,7 +213,7 @@ def test_extract_card_failures(conf, monkeypatch):
         (FakeRun(missing=True), "command not found: claude", None),
     ]
     for fake, err, code in cases:
-        monkeypatch.setattr(adapters.subprocess, "run", fake)
+        monkeypatch.setattr(adapters.process, "run", fake)
         r = extract.extract_card(conf, ws, "CASE-123", timeout=5)
         assert r["ok"] is False and r["card"] is None and err in r["error"], (err, r)
         ev = st.events("CASE-123")[-1]
@@ -229,7 +229,7 @@ def test_extract_card_failures(conf, monkeypatch):
 def test_extract_card_codex_reads_out_file(conf, monkeypatch):
     st = _seed(conf); ws = conf.workspaces["acme"]
     fake = FakeRun(stdout=json.dumps({"type": "turn.completed"}), out_file=json.dumps(good_card(title="from -o"), ensure_ascii=False))
-    monkeypatch.setattr(adapters.subprocess, "run", fake)
+    monkeypatch.setattr(adapters.process, "run", fake)
     r = extract.extract_card(conf, ws, "CASE-123", agent="codex")
     assert r["ok"] and r["card"]["title"] == "from -o" and r["agent"] == "codex"
     cmd = fake.calls[0]["cmd"]
@@ -259,7 +259,7 @@ def test_extract_card_uses_config_timeout(conf, monkeypatch):
     _seed(conf); ws = conf.workspaces["acme"]
     conf.extract_timeout = 77
     fake = FakeRun(stdout=_claude_stdout(good_card()))
-    monkeypatch.setattr(adapters.subprocess, "run", fake)
+    monkeypatch.setattr(adapters.process, "run", fake)
     r = extract.extract_card(conf, ws, "CASE-123")
     assert r["ok"] and fake.calls[-1]["timeout"] == 77
     assert CaseStore(ws.cases_dir).events("CASE-123")[-1]["timeout_sec"] == 77
@@ -267,7 +267,7 @@ def test_extract_card_uses_config_timeout(conf, monkeypatch):
 
 # ---------- M-3: 子エージェントの cwd は一時ディレクトリの写し（自案件＋兄弟の case.json だけ） ----------
 
-def test_extract_cwd_is_staged_copy_with_siblings_case_json_only(conf, monkeypatch, tmp_path):
+def test_extract_cwd_is_staged_copy_with_siblings_case_json_only(conf, monkeypatch, tmp_path, requires_symlinks):
     st = _seed(conf); ws = conf.workspaces["acme"]
     case = st.case_dir("CASE-123")
     (case / "sub").mkdir(); (case / "sub" / "0901_notes.md").write_text("x", encoding="utf-8")
@@ -279,7 +279,7 @@ def test_extract_cwd_is_staged_copy_with_siblings_case_json_only(conf, monkeypat
     (ws.data_dir / "index").mkdir(parents=True); (ws.data_dir / "index" / "drive-index.txt").write_text("i", encoding="utf-8")
     other = tmp_path / "data" / "other-ws" / "cases" / "CASE-777"; other.mkdir(parents=True); (other / "worklog.md").write_text("other ws", encoding="utf-8")
     fake = FakeRun(stdout=_claude_stdout(good_card()))
-    monkeypatch.setattr(adapters.subprocess, "run", fake)
+    monkeypatch.setattr(adapters.process, "run", fake)
     r = extract.extract_card(conf, ws, "CASE-123")
     assert r["ok"]
     call = fake.calls[0]
@@ -296,7 +296,7 @@ def test_extract_cwd_is_staged_copy_with_siblings_case_json_only(conf, monkeypat
 
 def test_extract_card_splits_unknown_related(conf, monkeypatch):
     st = _seed(conf); ws = conf.workspaces["acme"]
-    monkeypatch.setattr(adapters.subprocess, "run", FakeRun(stdout=_claude_stdout(good_card(related=["CASE-100", "CASE-999", "CASE-100"]))))
+    monkeypatch.setattr(adapters.process, "run", FakeRun(stdout=_claude_stdout(good_card(related=["CASE-100", "CASE-999", "CASE-100"]))))
     r = extract.extract_card(conf, ws, "CASE-123")
     assert r["ok"] and r["card"]["related"] == ["CASE-100", "CASE-100"] and r["card"]["related_unknown"] == ["CASE-999"]
     # apply では related_unknown を捨て、related に含めない

@@ -64,7 +64,7 @@ class Index:
         known = dict(self.db.execute("SELECT path, mtime FROM files"))
         seen = set()
         for md in self._md_files():
-            rel = str(md.relative_to(self.cases_dir)); seen.add(rel)
+            rel = md.relative_to(self.cases_dir).as_posix(); seen.add(rel)
             try:
                 mtime = md.stat().st_mtime
             except OSError:  # 消えた・読めない

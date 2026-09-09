@@ -21,6 +21,34 @@ ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
 
 
+def test_ensure_real_detached_server(tmp_path, env):
+    from kairn import config as cfg, service
+
+    conf = cfg.load(Path(env["KAIRN_CONFIG"]))
+    conf.serve_port = _free_port()
+    started = []
+
+    def launch(argv, **kwargs):
+        proc = subprocess.Popen(argv, env=env, cwd=ROOT, **kwargs)
+        started.append(proc)
+        return proc
+
+    log = tmp_path / "serve.log"
+    try:
+        assert service.ensure(conf, cmd=[PY, "-m", "kairn.cli"], popen=launch, log_path=log) == 0, log.read_text(encoding="utf-8")
+        assert _get(f"http://127.0.0.1:{conf.serve_port}/ui")[0] == 200
+        assert service.ensure(conf, popen=launch, log_path=log) == 0
+        assert len(started) == 1 and started[0].poll() is None
+    finally:
+        for proc in started:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -77,8 +105,10 @@ def test_end_to_end(tmp_path, env, fake_rclone):
     r = _cli(env, "status"); assert r.returncode == 0 and "acme" in r.stdout and str(repo) in r.stdout and "link" not in r.stdout, r.stderr
     case_dir = tmp_path / "data" / "acme" / "cases" / "CASE-123"
     (case_dir / "worklog.md").write_text("# t\n## Objective\n起動時に widget driver の init が終わらない\n## Notes\nUART 460800 で送信量が超過する\n", encoding="utf-8")
-    # console script も動く（.venv/bin/kairn）
+    # console script も動く（.venv/bin/kairn / .venv/Scripts/kairn.exe）
     script = Path(PY).parent / "kairn"
+    if sys.platform == "win32" and not script.exists():
+        script = script.with_suffix(".exe")
     if script.exists():
         r = subprocess.run([str(script), "cases", "acme"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
         assert r.returncode == 0 and "CASE-123" in r.stdout, r.stderr
@@ -118,6 +148,7 @@ def test_end_to_end(tmp_path, env, fake_rclone):
                 assert _post(f"{base}/ui/acme/CASE-123/sendback", {"task": "T002", "note": "unit-6 でも確認"}) == 303
                 r = await c.call_tool("open_case", {"case": "CASE-123"})
                 oc = r.structured_content
+                assert "job_id" in oc["drive"], oc["drive"]
                 assert not r.is_error and oc["human_feedback"][-1]["note"] == "unit-6 でも確認" and oc["human_feedback"][-1]["task"] == "T002"
                 assert oc["drive"]["job_id"] and oc["drive"]["fetched"] is True and oc["drive"]["drive_rev"] == "stale"   # Drive のマーカーの rev が違う → 取り寄せ（偽 rclone は即成功）
                 assert (await _job(c, oc["drive"]["job_id"]))["status"] == "done"
@@ -151,7 +182,7 @@ def test_end_to_end(tmp_path, env, fake_rclone):
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
-    log = (tmp_path / "rclone.log").read_text()
+    log = (tmp_path / "rclone.log").read_text(encoding="utf-8")
     assert "copy my-drive:ws/acme/cases/CASE-123" in log and "sync " in log and "my-drive:ws/acme/cases/CASE-123" in log
     assert "lsf my-drive:ws/acme/cases/CASE-123/.rev/" in log and "manifest" not in log and "cat " not in log
-    assert "checkin" in [l.split('"action": "')[1].split('"')[0] for l in (case_dir / "events.jsonl").read_text().splitlines() if '"action"' in l]
+    assert "checkin" in [l.split('"action": "')[1].split('"')[0] for l in (case_dir / "events.jsonl").read_text(encoding="utf-8").splitlines() if '"action"' in l]

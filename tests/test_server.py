@@ -175,7 +175,7 @@ def test_open_case_continues_when_drive_fails(conf, monkeypatch, jobs, fake_driv
     run(main)
 
 
-def test_search_survives_broken_symlink(conf, monkeypatch):
+def test_search_survives_broken_symlink(conf, monkeypatch, requires_symlinks):
     """再現した不具合: cases 配下の壊れたリンク（*.md）で索引再構築が例外 → search がエラー文字列を返していた。"""
     import os
     ws = conf.workspaces["acme"]
@@ -945,8 +945,8 @@ def test_mcp_checkin_uses_rclone_flags_set_after_start(conf, monkeypatch, jobs):
 
         def __exit__(self, *a):
             return False
-    monkeypatch.setattr(sync.subprocess, "run", fake_run)
-    monkeypatch.setattr(sync.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(sync.process, "run", fake_run)
+    monkeypatch.setattr(sync.process, "popen", FakePopen)
     mcp = srv.create_server(holder, jobs=jobs)
 
     def transfer_cmds():
