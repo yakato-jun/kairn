@@ -155,8 +155,9 @@ class JobTable:
         """同じ (kind, workspace, case) のうち最後に登録されたジョブ（状態を問わない）。無ければ None。"""
         with self._lock:
             self._prune_locked()
-            hits = [j for j in self._jobs.values() if (j.kind, j.workspace, j.case) == (kind, workspace, case)]
-            return max(hits, key=lambda j: j._created_mono) if hits else None
+            # Windows では連続登録の monotonic 値が同じになり得る。ロック内での登録順で選ぶ。
+            return next((j for j in reversed(self._jobs.values())
+                         if (j.kind, j.workspace, j.case) == (kind, workspace, case)), None)
 
     def running_snapshot(self) -> list[Job]:
         """running のジョブ（ロックを取らない）。停止シグナルのハンドラから呼ぶ用: ハンドラはメインスレッドで走るので、

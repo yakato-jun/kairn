@@ -60,6 +60,34 @@ kairn install-service                          # systemd user service（常駐�
 - 削除: `uv tool uninstall kairn`
 - 開発（テスト）: `uv sync --group dev && .venv/bin/pytest`。`.venv/bin/kairn` も同じ CLI だが、常駐 unit には `install-service` を実行した側の `kairn` のパスが入る
 
+### Windows（PowerShell）
+
+Python 3.11 以上と uv を用意し、リポジトリのルートで次を実行する。
+
+```powershell
+uv sync --locked --group dev
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\kairn.exe --help
+```
+
+通常利用は `uv tool install --editable . --python 3.13` でも導入できる。rclone（同期）と zstd（bag 圧縮）は別途インストールし、PATH に置く。
+`setup` / `attach` / `serve` / `ensure` は Windows でも使える。`install-service` は systemd 専用のため Windows では使わず、
+まず `kairn serve` で起動する（終了は Ctrl+C）。`kairn ensure` は未起動時にバックグラウンド起動し、ログは `%LOCALAPPDATA%\kairn\serve.log`
+（`XDG_STATE_HOME` を指定した場合はそちら）に書く。ログイン時の自動起動・日次同期のタスクスケジューラ登録は自動化していない。
+
+設定は既定で `%USERPROFILE%\.config\kairn\config.yaml`、データはリポジトリ直下の `workspaces`。`KAIRN_CONFIG` / `KAIRN_DATA_ROOT` で変更できる。
+`install-skill` はシンボリックリンク権限がない場合にスキルをコピーする。コピーは自動更新されないので、更新時はコピー先の内容を確認して手動で反映する。
+リンクを使いたい場合は Windows の開発者モードを有効にする（設定 → プライバシーとセキュリティ → For developers → Developer Mode）か、
+`SeCreateSymbolicLinkPrivilege` を持つ管理者として実行する。後者は `install-skill` を実行するその1回だけ管理者権限が要り
+（symlink 作成後は通常のファイルシステム上のリンクとして残るため、以降の `serve` / `daily` 等の通常運用では不要）:
+
+```powershell
+Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile', '-Command', 'kairn install-skill'
+```
+
+（別ユーザーとして起動するため UAC の確認ダイアログが出る。`--home` で対象 HOME を明示できる。）
+リンク権限が必要なテスト、および未導入の rclone / zstd の実コマンドテストは理由付きでスキップする。
+
 ### 専用 OAuth クライアント（推奨）
 
 rclone の Google Drive バックエンドはファイルごとに Drive API を呼ぶ。`rclone config create … drive` だけで作った remote は

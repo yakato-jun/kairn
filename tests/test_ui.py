@@ -77,7 +77,7 @@ def test_freshness_marks_stale_open_tasks(conf):
     # T001 の最終イベントを 10 日前に偽装（events.jsonl を書き換え）
     f = conf.workspaces["acme"].cases_dir / "CASE-123" / "events.jsonl"
     old = (store_mod.datetime.now(store_mod.JST) - timedelta(days=STALE_DAYS + 3)).isoformat(timespec="seconds")
-    f.write_text(f.read_text().replace(st.events("CASE-123")[-1]["t"], old))
+    f.write_text(f.read_text(encoding="utf-8").replace(st.events("CASE-123")[-1]["t"], old), encoding="utf-8")
     plan = st.current_plan("CASE-123")
     for t in plan["tasks"]:
         t["created_at"] = old

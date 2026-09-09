@@ -297,7 +297,7 @@ class CaseStore:
                 continue
             if p.name == "events.jsonl" and isinstance(n, int) and not self.substantive_events_after(case_id, n):
                 continue
-            changed.append(str(p.relative_to(d)))
+            changed.append(p.relative_to(d).as_posix())
         return changed
 
     def substantive_events_after(self, case_id: str, n: int) -> list[dict]:

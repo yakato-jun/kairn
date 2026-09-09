@@ -93,7 +93,7 @@ def test_install_service_yes_writes_units_and_enables(env, monkeypatch, capsys):
     assert rc == 0, out
     units = env["units"]
     assert sorted(p.name for p in units.iterdir()) == ["kairn-daily@.service", "kairn-daily@acme.timer", "kairn-serve.service"]
-    assert f"ExecStart={KAIRN} serve --host 127.0.0.1 --port 8765" in (units / "kairn-serve.service").read_text()
+    assert f"ExecStart={KAIRN} serve --host 127.0.0.1 --port 8765" in (units / "kairn-serve.service").read_text(encoding="utf-8")
     assert env["calls"] == [
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", "kairn-serve.service", "kairn-daily@acme.timer"],
@@ -126,9 +126,9 @@ def test_install_service_interactive_answers(env, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0, out
     assert "ネットワークに公開されます" in out
-    serve = (env["units"] / "kairn-serve.service").read_text()
+    serve = (env["units"] / "kairn-serve.service").read_text(encoding="utf-8")
     assert "--host 127.0.0.1 --port 9000" in serve
-    assert "OnCalendar=*-*-* 06:15:00" in (env["units"] / "kairn-daily@acme.timer").read_text()
+    assert "OnCalendar=*-*-* 06:15:00" in (env["units"] / "kairn-daily@acme.timer").read_text(encoding="utf-8")
     assert ["systemctl", "--user", "enable", "kairn-serve.service", "kairn-daily@acme.timer"] in env["calls"]
     assert ["loginctl", "enable-linger", "someone"] in env["calls"]
     assert "管理者認証" in out
@@ -157,7 +157,7 @@ def test_install_service_existing_unit_refused_without_yes_and_overwritten_with_
     rc = _main(monkeypatch, "install-service")                 # 非対話（端末でない）・--yes なし → 拒否、何も書かない
     out = capsys.readouterr().out
     assert rc == 1 and "上書きしません" in out and "+ExecStart=" in out and "-ExecStart=/somewhere/else/kairn serve" in out
-    assert (units / "kairn-serve.service").read_text().startswith("[Service]") and not (units / "kairn-daily@.service").exists()
+    assert (units / "kairn-serve.service").read_text(encoding="utf-8").startswith("[Service]") and not (units / "kairn-daily@.service").exists()
     assert env["calls"] == []
     # 対話で n → 中止
     monkeypatch.setattr(service, "interactive", lambda: True)
@@ -169,7 +169,7 @@ def test_install_service_existing_unit_refused_without_yes_and_overwritten_with_
     monkeypatch.setattr(service, "interactive", lambda: False)
     rc = _main(monkeypatch, "install-service", "--yes")
     out = capsys.readouterr().out
-    assert rc == 0 and "overwrote:" in out and f"ExecStart={KAIRN} serve" in (units / "kairn-serve.service").read_text()
+    assert rc == 0 and "overwrote:" in out and f"ExecStart={KAIRN} serve" in (units / "kairn-serve.service").read_text(encoding="utf-8")
 
 
 def test_install_service_without_systemctl_writes_units_and_explains(env, monkeypatch, capsys):
@@ -212,7 +212,8 @@ def test_ensure_does_nothing_when_alive(env, capsys):
     assert rc == 0 and started == [] and "is running" in capsys.readouterr().out
 
 
-def test_ensure_starts_detached_and_waits(env, capsys):
+def test_ensure_starts_detached_and_waits(env, capsys, monkeypatch):
+    monkeypatch.setattr("sys.platform", "linux")
     conf = env["conf"]; conf.serve_host, conf.serve_port = "127.0.0.1", 9100
     probes = iter([False, False, False, True])
     started = []
@@ -226,7 +227,7 @@ def test_ensure_starts_detached_and_waits(env, capsys):
     assert argv == [KAIRN, "serve", "--host", "127.0.0.1", "--port", "9100"]
     assert kw["start_new_session"] is True and kw["stdin"] is subprocess.DEVNULL and kw["stderr"] is subprocess.STDOUT
     log = env["state"] / "serve.log"
-    assert kw["stdout"].name == str(log) and log.exists() and "kairn ensure" in log.read_text()
+    assert kw["stdout"].name == str(log) and log.exists() and "kairn ensure" in log.read_text(encoding="utf-8")
 
 
 def test_ensure_starts_detached_windows(env, monkeypatch):

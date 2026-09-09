@@ -60,6 +60,7 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
+from . import process
 from .config import Config, Workspace
 from .store import REV_DIR, CaseStore, _atomic_write, now_iso, parse_iso, validate_case_id
 
@@ -172,10 +173,10 @@ def _run(cmd: list[str], dry: bool = False, progress: ProgressFn | None = None) 
     if dry:
         cmd = cmd + ["--dry-run"]
     if progress is None:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = process.run(cmd, capture_output=True, text=True, encoding="utf-8")
     else:
         lines: list[str] = []
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as p:
+        with process.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8") as p:
             assert p.stdout is not None
             for line in p.stdout:
                 lines.append(line)
@@ -274,8 +275,8 @@ def drive_revs(conf: Config, ws: Workspace, timeout: float = DRIVE_REVS_TIMEOUT_
     """ワークスペース全案件の Drive 側の版: rclone lsf -R（1 プロセス）で cases/*/.rev/* の名前だけを読む → {case: rev | None(不定)}。
     マーカーの無い案件は載らない。rclone 不在・タイムアウト・非ゼロ終了（オフライン等）→ None（呼び出し側は「drive unavailable」）。"""
     try:
-        r = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--include", f"/cases/*/{REV_DIR}/*", conf.drive_path(ws.name), *_flags(conf)],
-                           capture_output=True, text=True, timeout=timeout)
+        r = process.run(["rclone", "lsf", "-R", "--files-only", "--include", f"/cases/*/{REV_DIR}/*", conf.drive_path(ws.name), *_flags(conf)],
+                           capture_output=True, text=True, encoding="utf-8", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:
@@ -289,7 +290,7 @@ def drive_rev(conf: Config, ws: Workspace, case: str, timeout: float = REV_LSF_T
     .rev/ が無い（終了コード 3: directory not found）は available=True・markers=[]（マーカー無し＝取り寄せ対象）。
     markers が 2 個以上なら rev は None（不定＝取り寄せ対象）。"""
     try:
-        r = subprocess.run(["rclone", "lsf", rev_dir_path(conf, ws, case) + "/", *_flags(conf)], capture_output=True, text=True, timeout=timeout)
+        r = process.run(["rclone", "lsf", rev_dir_path(conf, ws, case) + "/", *_flags(conf)], capture_output=True, text=True, encoding="utf-8", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"available": False, "rev": None, "markers": [], "error": f"{type(e).__name__}: {e}"[:200]}
     if r.returncode == 3:
@@ -307,8 +308,8 @@ def drive_case(conf: Config, ws: Workspace, case: str, timeout: float = REV_LSF_
     ディレクトリも見つける）。終了コード 3（directory not found）は available=True・exists=False。
     exists=True で has_case_json=False は案件化前のディレクトリ（worklog だけ等。checkin の rclone sync で退避される側）。"""
     try:
-        r = subprocess.run(["rclone", "lsf", conf.drive_path(ws.name, "cases", case) + "/", *_flags(conf)],
-                           capture_output=True, text=True, timeout=timeout)
+        r = process.run(["rclone", "lsf", conf.drive_path(ws.name, "cases", case) + "/", *_flags(conf)],
+                           capture_output=True, text=True, encoding="utf-8", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"available": False, "exists": False, "has_case_json": False, "names": [], "error": f"{type(e).__name__}: {e}"[:200]}
     if r.returncode == 3:
@@ -419,8 +420,8 @@ def drive_markers(conf: Config, ws: Workspace, dry: bool = False, remove_manifes
     out: dict = {"dry": dry, "marked": {}, "mismatch": {}, "drive_no_rev": [], "local_absent": [], "errors": {}, "manifest_removed": None}
     with tempfile.TemporaryDirectory(prefix="kairn-markers-") as td:
         tmp = Path(td)
-        r = subprocess.run(["rclone", "copy", conf.drive_path(ws.name), str(tmp / "drive"), "--include", "/cases/*/case.json", *_flags(conf)],
-                           capture_output=True, text=True)
+        r = process.run(["rclone", "copy", conf.drive_path(ws.name), str(tmp / "drive"), "--include", "/cases/*/case.json", *_flags(conf)],
+                           capture_output=True, text=True, encoding="utf-8")
         if r.returncode != 0:
             raise RcloneError((r.stderr or r.stdout).strip()[-800:])
         cases_dir = tmp / "drive" / "cases"
@@ -455,7 +456,7 @@ def drive_markers(conf: Config, ws: Workspace, dry: bool = False, remove_manifes
     if remove_manifest:
         out["manifest_removed"] = False
         if not dry:
-            r = subprocess.run(["rclone", "deletefile", conf.drive_path(ws.name, MANIFEST_NAME), *_flags(conf)], capture_output=True, text=True)
+            r = process.run(["rclone", "deletefile", conf.drive_path(ws.name, MANIFEST_NAME), *_flags(conf)], capture_output=True, text=True, encoding="utf-8")
             out["manifest_removed"] = r.returncode == 0
             if r.returncode not in (0, 3, 4):
                 raise RcloneError(f"rclone deletefile {conf.drive_path(ws.name, MANIFEST_NAME)} failed: {(r.stderr or r.stdout).strip()[-400:]}")
@@ -613,7 +614,7 @@ def grep_drive_index(ws: Workspace, pattern: str, limit: int = 50) -> list[dict]
 
 
 def ws_exists_on_drive(conf: Config, ws_name: str) -> bool:
-    r = subprocess.run(["rclone", "lsd", conf.drive_path(ws_name), *_flags(conf)], capture_output=True, text=True)
+    r = process.run(["rclone", "lsd", conf.drive_path(ws_name), *_flags(conf)], capture_output=True, text=True, encoding="utf-8")
     return r.returncode == 0
 
 
@@ -622,7 +623,7 @@ def create_ws_on_drive(conf: Config, ws_name: str) -> None:
 
 
 def list_ws_on_drive(conf: Config) -> list[str]:
-    r = subprocess.run(["rclone", "lsf", "--dirs-only", f"{conf.remote}:{conf.drive_root}", *_flags(conf)], capture_output=True, text=True)
+    r = process.run(["rclone", "lsf", "--dirs-only", f"{conf.remote}:{conf.drive_root}", *_flags(conf)], capture_output=True, text=True, encoding="utf-8")
     return [x.rstrip("/") for x in r.stdout.split()] if r.returncode == 0 else []
 
 
@@ -754,10 +755,10 @@ def compress_bag(src: Path) -> Path:
     part = dst.with_name(dst.name + ".part")
     st = src.stat()
     try:
-        r = subprocess.run(["zstd", "-T0", "-6", "-q", "-f", "-o", str(part), str(src)], capture_output=True, text=True)
+        r = process.run(["zstd", "-T0", "-6", "-q", "-f", "-o", str(part), str(src)], capture_output=True, text=True, encoding="utf-8")
         if r.returncode != 0:
             raise RuntimeError(f"zstd failed for {src}: {(r.stderr or r.stdout).strip()[-400:]}")
-        t = subprocess.run(["zstd", "-t", "-q", str(part)], capture_output=True, text=True)
+        t = process.run(["zstd", "-t", "-q", str(part)], capture_output=True, text=True, encoding="utf-8")
         if t.returncode != 0:
             raise RuntimeError(f"zstd -t failed for {part}: {(t.stderr or t.stdout).strip()[-400:]}")
         os.replace(part, dst)
@@ -779,14 +780,14 @@ def bag2zst(conf: Config, ws: Workspace, case: str | None = None, dry: bool = Fa
     exclude = [str(x) for x in conf.rules.get("exclude", [])]
     for d in _case_dirs(ws, case):
         for src in bag_candidates(d, exclude=exclude):
-            rel = str(src.relative_to(ws.cases_dir))
+            rel = src.relative_to(ws.cases_dir).as_posix()
             if dry:
                 out["done"].append({"src": rel, "dst": rel + ".zst", "bytes": src.stat().st_size, "dry": True})
                 continue
             try:
                 size = src.stat().st_size
                 dst = compress_bag(src)
-                out["done"].append({"src": rel, "dst": str(dst.relative_to(ws.cases_dir)), "bytes": size, "zst_bytes": dst.stat().st_size})
+                out["done"].append({"src": rel, "dst": dst.relative_to(ws.cases_dir).as_posix(), "bytes": size, "zst_bytes": dst.stat().st_size})
             except Exception as e:  # 1 件の失敗で残りを止めない
                 out["errors"].append({"src": rel, "error": str(e)})
     return out
@@ -811,8 +812,8 @@ def _raw_filter_sets(conf: Config, rr: dict, root: Path | None = None) -> list[l
 
 def _lsf_local(src: Path, filt: list[str], flags: list[str] = ()) -> dict[str, int]:
     """rclone lsf（同じフィルタ）でローカル側の移動対象を列挙 → {相対パス: bytes}。flags は rules.rclone_flags（move と同じものを付ける）。"""
-    r = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--format", "ps", "--separator", "\t", str(src), *filt, *flags],
-                       capture_output=True, text=True)
+    r = process.run(["rclone", "lsf", "-R", "--files-only", "--format", "ps", "--separator", "\t", str(src), *filt, *flags],
+                       capture_output=True, text=True, encoding="utf-8")
     if r.returncode != 0:
         raise RcloneError((r.stderr or r.stdout).strip()[-800:])
     out: dict[str, int] = {}

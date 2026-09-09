@@ -105,7 +105,7 @@ class FakeRun:
                 if not sync.is_raw(p, {**self.rules, "min_size": self.rules["min_size"] if min_size else None,
                                        "extensions": self.rules["extensions"] if include else []}):
                     continue
-                rows.append(f"{p.relative_to(src)}\t{p.stat().st_size}")
+                rows.append(f"{p.relative_to(src).as_posix()}\t{p.stat().st_size}")
             return subprocess.CompletedProcess(cmd, 0, "\n".join(rows) + ("\n" if rows else ""), "")
         if prog == "rclone" and sub == "move":
             self.moves += 1
@@ -128,7 +128,7 @@ class FakeRun:
 def fake(conf, monkeypatch):
     rr = sync.raw_rules(conf)
     f = FakeRun(rr)
-    monkeypatch.setattr(subprocess, "run", f)
+    monkeypatch.setattr(sync.process, "run", f)
     return f
 
 
@@ -149,7 +149,7 @@ def test_parse_size_and_age():
         sync.parse_age("14days")
 
 
-def test_is_raw(conf, tmp_path):
+def test_is_raw(conf, tmp_path, requires_symlinks):
     rr = sync.raw_rules(conf)  # extensions=[bag,...], min_size=50M, min_age=14d
     assert rr["min_size"] == 50 * 1024 ** 2 and rr["min_age"] == 14 * DAY
     old = 20 * DAY
@@ -221,6 +221,7 @@ def test_bag2zst_real_compress_keeps_mtime(conf, tmp_path):
 
 
 def test_bag2zst_failure_removes_part_and_keeps_source(conf, tmp_path, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda cmd, **kwargs: cmd)
     ws = conf.workspaces["acme"]
     src = _touch(ws.cases_dir / "CASE-123" / "run.bag", 100, 3600)
 
@@ -231,7 +232,7 @@ def test_bag2zst_failure_removes_part_and_keeps_source(conf, tmp_path, monkeypat
         if cmd[0] == "zstd" and "-t" in cmd:
             return subprocess.CompletedProcess(cmd, 1, "", "corrupt")
         raise AssertionError(cmd)
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(sync.process, "run", run)
     r = sync.bag2zst(conf, ws)
     assert r["done"] == [] and len(r["errors"]) == 1 and "zstd -t failed" in r["errors"][0]["error"]
     assert src.exists() and not (src.with_name("run.bag.zst")).exists() and not (src.with_name("run.bag.zst.part")).exists()
@@ -433,7 +434,7 @@ def test_exclude_patterns_match_root_and_nested(conf, tmp_path, monkeypatch):
         _touch(src / rel, 5)
     r = subprocess.run(["rclone", "copy", str(src), str(dst), *sync._filters(conf)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    got = sorted(str(p.relative_to(dst)) for p in dst.rglob("*") if p.is_file())
+    got = sorted(p.relative_to(dst).as_posix() for p in dst.rglob("*") if p.is_file())
     assert got == ["keep.txt", "sub/keep.md", "targets/keep.txt"]
 
 
@@ -458,7 +459,7 @@ def test_raw_filter_sets_with_real_rclone(conf, tmp_path, monkeypatch):
         dst = tmp_path / f"dst{i}"
         r = subprocess.run(["rclone", "copy", str(src), str(dst), *filt], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
-        got.append(sorted(str(p.relative_to(dst)) for p in dst.rglob("*") if p.is_file()))
+        got.append(sorted(p.relative_to(dst).as_posix() for p in dst.rglob("*") if p.is_file()))
     assert got == [["a.bag", "sub/b.bag.active"], ["big.log"]]
 
 
@@ -490,10 +491,10 @@ def test_data_location_goes_to_worklog_if_present_else_data_md(conf, fake):
     (ws.cases_dir / "0815_legacy" / "worklog.md").write_text("# legacy\n\n## Notes\nx\n", encoding="utf-8")
     r = sync.raw_move(conf, ws)
     assert r["files"] == 2
-    assert not (ws.cases_dir / "CASE-1" / "worklog.md").exists() and "## Data location\n- " in (ws.cases_dir / "CASE-1" / "DATA.md").read_text()
+    assert not (ws.cases_dir / "CASE-1" / "worklog.md").exists() and "## Data location\n- " in (ws.cases_dir / "CASE-1" / "DATA.md").read_text(encoding="utf-8")
     assert st.load_case("CASE-1")["data"][0]["files"] == 1 and st.events("CASE-1")[-1]["actor"] == "kairn"
     assert not (ws.cases_dir / "0815_legacy" / "DATA.md").exists()
-    assert "## Data location\n- " in (ws.cases_dir / "0815_legacy" / "worklog.md").read_text()
+    assert "## Data location\n- " in (ws.cases_dir / "0815_legacy" / "worklog.md").read_text(encoding="utf-8")
     assert not (ws.cases_dir / "0815_legacy" / "case.json").exists()
 
 
@@ -557,11 +558,11 @@ def test_checkout_case_fetches_merges_then_copies(conf, monkeypatch):
     CaseStore(ws.cases_dir).create_case("CASE-123", "t", "acme", actor="human")
     remote = [_ev("2026-08-01T00:00:00+09:00", "from another environment")]
     f = FakeRun(sync.raw_rules(conf), remote_events={"CASE-123": remote})
-    monkeypatch.setattr(subprocess, "run", f)
+    monkeypatch.setattr(sync.process, "run", f)
     msg = sync.checkout(conf, ws, "CASE-123")
     assert [c[1] for c in f.calls] == ["copyto", "copy"]
     copyto, copy = f.calls
-    assert copyto[2] == "my-drive:ws/acme/cases/CASE-123/events.jsonl" and copyto[3].endswith("/events.jsonl")
+    assert copyto[2] == "my-drive:ws/acme/cases/CASE-123/events.jsonl" and Path(copyto[3]).name == "events.jsonl"
     assert not Path(copyto[3]).exists()  # 一時ファイルは消えている
     assert copy[:4] == ["rclone", "copy", "my-drive:ws/acme/cases/CASE-123", str(ws.cases_dir / "CASE-123")]
     assert "--update" in copy and "/events.jsonl" in _excludes(copy)
@@ -577,19 +578,19 @@ def test_checkout_case_without_remote_events_falls_back(conf, monkeypatch):
     ev = ws.cases_dir / "CASE-123" / "events.jsonl"
     before = (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns)
     f = FakeRun(sync.raw_rules(conf))
-    monkeypatch.setattr(subprocess, "run", f)
+    monkeypatch.setattr(sync.process, "run", f)
     msg = sync.checkout(conf, ws, "CASE-123")
     assert [c[1] for c in f.calls] == ["copyto", "copy"] and "/events.jsonl" not in _excludes(f.calls[1]) and "--update" in f.calls[1]
     assert (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns) == before and "events merged" not in msg
     # rclone コマンド不在（FileNotFoundError）でもマージを飛ばして copy を試みる（copy 自体の失敗は従来どおり伝播）
     def missing(cmd, **kw):
         raise FileNotFoundError("rclone")
-    monkeypatch.setattr(subprocess, "run", missing)
+    monkeypatch.setattr(sync.process, "run", missing)
     with pytest.raises(FileNotFoundError):
         sync.checkout(conf, ws, "CASE-123")
     assert (ev.read_text(encoding="utf-8"), ev.stat().st_mtime_ns) == before
     # dry-run ではマージしない（copyto を呼ばない）
-    monkeypatch.setattr(subprocess, "run", f)
+    monkeypatch.setattr(sync.process, "run", f)
     f.calls.clear()
     sync.checkout(conf, ws, "CASE-123", dry=True)
     assert [c[1] for c in f.calls] == ["copy"] and f.calls[0][-1] == "--dry-run"
@@ -602,7 +603,7 @@ def test_checkin_case_merges_then_syncs(conf, monkeypatch):
     st.create_case("CASE-123", "t", "acme", actor="human")
     remote = [_ev("2026-08-01T00:00:00+09:00", "remote only"), _ev("2026-08-02T00:00:00+09:00", "remote only 2")]
     f = FakeRun(sync.raw_rules(conf), remote_events={"CASE-123": remote})
-    monkeypatch.setattr(subprocess, "run", f)
+    monkeypatch.setattr(sync.process, "run", f)
     msg = sync.checkin(conf, ws, "CASE-123")
     assert [c[1] for c in f.calls] == ["copyto", "sync"]   # マージ → 転送（集計ファイルの更新は無い）
     assert f.calls[1][:4] == ["rclone", "sync", str(ws.cases_dir / "CASE-123"), "my-drive:ws/acme/cases/CASE-123"]
@@ -611,7 +612,7 @@ def test_checkin_case_merges_then_syncs(conf, monkeypatch):
     assert st.load_case("CASE-123")["last_checkin_events"] == 3 and msg.endswith("[events merged: 1]") and "manifest" not in msg
     # 取得失敗 → マージなしで sync（従来どおり）
     f2 = FakeRun(sync.raw_rules(conf), fail={"copyto"})
-    monkeypatch.setattr(subprocess, "run", f2)
+    monkeypatch.setattr(sync.process, "run", f2)
     sync.checkin(conf, ws, "CASE-123")
     assert [c[1] for c in f2.calls] == ["copyto", "sync"] and len(_events_of(ws, "CASE-123")) == 3
 
@@ -626,7 +627,7 @@ def test_checkout_and_checkin_workspace_merge_per_case(conf, monkeypatch):
     remote = {"CASE-1": [_ev("2026-08-01T00:00:00+09:00", "r1")], "CASE-9": [_ev("2026-08-01T00:00:00+09:00", "r9")]}
     f = FakeRun(sync.raw_rules(conf), remote_events=remote)
     f.remote_markers = {"CASE-1": ["d1"], "CASE-2": ["d2"], "CASE-9": ["d9"]}
-    monkeypatch.setattr(subprocess, "run", f)
+    monkeypatch.setattr(sync.process, "run", f)
     msg = sync.checkout(conf, ws)
     assert [(c[1], c[2].rsplit("/", 2)[-2] if c[1] == "copyto" else c[2].rsplit("/", 1)[-1]) for c in f.calls] == \
         [("lsf", "-R"), ("copyto", "CASE-1"), ("copy", "CASE-1"), ("copyto", "CASE-2"), ("copy", "CASE-2"), ("copyto", "CASE-9"), ("copy", "CASE-9")]
@@ -688,7 +689,7 @@ def test_checkin_transfer_failure_restores_case_json_and_marker(conf, monkeypatc
     st = CaseStore(ws.cases_dir)
     st.create_case("CASE-1", "t", "acme", actor="human")
     f = FakeRun(sync.raw_rules(conf), fail={"sync"})
-    monkeypatch.setattr(subprocess, "run", f)
+    monkeypatch.setattr(sync.process, "run", f)
     cj = ws.cases_dir / "CASE-1" / "case.json"
     before = (cj.read_text(encoding="utf-8"), cj.stat().st_mtime)
     with pytest.raises(sync.RcloneError, match="sync failed"):
@@ -799,17 +800,17 @@ def test_parse_rev_listing_and_drive_revs(conf, monkeypatch):
     def run(cmd, **kw):
         seen["cmd"] = cmd; seen["kw"] = kw
         return subprocess.CompletedProcess(cmd, 0, "cases/CASE-1/.rev/r1\n", "")
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(sync.process, "run", run)
     assert sync.drive_revs(conf, ws) == {"CASE-1": "r1"} and seen["kw"]["timeout"] == sync.DRIVE_REVS_TIMEOUT_SEC
     assert seen["cmd"] == ["rclone", "lsf", "-R", "--files-only", "--include", "/cases/*/.rev/*", "my-drive:ws/acme"]
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "offline"))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "offline"))
     assert sync.drive_revs(conf, ws) is None
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 10)))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 10)))
     assert sync.drive_revs(conf, ws) is None
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError("rclone")))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError("rclone")))
     assert sync.drive_revs(conf, ws) is None and sync.refresh_drive_revs(conf, ws) is None
     assert not (ws.index_dir / "drive_revs.cache.json").exists() and sync.load_drive_revs_cache(ws) is None
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "cases/CASE-1/.rev/a\n", ""))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "cases/CASE-1/.rev/a\n", ""))
     assert sync.refresh_drive_revs(conf, ws) == {"CASE-1": "a"} and sync.load_drive_revs_cache(ws)["fetched_at"]
     # 一部だけの更新（open_case / checkin）は fetched_at を変えない。remove でエントリを消す
     at = sync.load_drive_revs_cache(ws)["fetched_at"]
@@ -830,21 +831,21 @@ def test_drive_rev_single_case(conf, monkeypatch):
             seen["cmd"] = cmd; seen["kw"] = kw
             return subprocess.CompletedProcess(cmd, rc, out, err)
         return run
-    monkeypatch.setattr(subprocess, "run", run_with(0, "r1\n"))
+    monkeypatch.setattr(sync.process, "run", run_with(0, "r1\n"))
     assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": "r1", "markers": ["r1"]}
     assert seen["cmd"] == ["rclone", "lsf", "my-drive:ws/acme/cases/CASE-1/.rev/"] and seen["kw"]["timeout"] == sync.REV_LSF_TIMEOUT_SEC == 10
-    monkeypatch.setattr(subprocess, "run", run_with(0, "r2\nr1\nsub/\n"))
+    monkeypatch.setattr(sync.process, "run", run_with(0, "r2\nr1\nsub/\n"))
     assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": None, "markers": ["r1", "r2"]}
-    monkeypatch.setattr(subprocess, "run", run_with(0, ""))
+    monkeypatch.setattr(sync.process, "run", run_with(0, ""))
     assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": None, "markers": []}
-    monkeypatch.setattr(subprocess, "run", run_with(3, "", "directory not found"))
+    monkeypatch.setattr(sync.process, "run", run_with(3, "", "directory not found"))
     assert sync.drive_rev(conf, ws, "CASE-1") == {"available": True, "rev": None, "markers": []}
-    monkeypatch.setattr(subprocess, "run", run_with(1, "", "couldn't connect"))
+    monkeypatch.setattr(sync.process, "run", run_with(1, "", "couldn't connect"))
     r = sync.drive_rev(conf, ws, "CASE-1")
     assert r["available"] is False and r["rev"] is None and "couldn't connect" in r["error"]
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 10)))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 10)))
     assert sync.drive_rev(conf, ws, "CASE-1")["available"] is False
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError("rclone")))
+    monkeypatch.setattr(sync.process, "run", lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError("rclone")))
     assert sync.drive_rev(conf, ws, "CASE-1")["available"] is False
 
 
@@ -901,7 +902,7 @@ def test_workarea_filters_come_first_and_before_rclone_flags(conf, fake):
     assert _excludes(ws_copy)[:2] == ["/CASE-1/scratch/**", "/CASE-1/wt/**"]
 
 
-def test_workarea_dirs(conf, tmp_path):
+def test_workarea_dirs(conf, tmp_path, requires_symlinks):
     """root 配下の作業領域の相対パス。配下・シンボリックリンク・rules.exclude のディレクトリは辿らない。root 自身なら ['']。"""
     case = _workarea_case(tmp_path / "cases")
     _touch(case / "wt" / "nested" / ".kairn-nosync"); _touch(case / "target" / "x" / ".kairn-nosync"); _touch(case / "deep" / "a" / "b" / ".kairn-nosync")
@@ -943,7 +944,7 @@ def _local_remote_conf(conf, tmp_path, monkeypatch) -> Path:
 
 
 def _files(root: Path) -> list[str]:
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and ".rev" not in p.parts)
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and ".rev" not in p.parts)
 
 
 @pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
@@ -959,7 +960,7 @@ def test_checkin_and_checkout_skip_workareas_with_real_rclone(conf, tmp_path, mo
     assert _files(drive_cases / "CASE-1") == kept
     (case / "worklog.md").write_text("# t\n## Notes\nkeep me v2\n", encoding="utf-8")
     sync.checkin(conf, ws)
-    assert _files(drive_cases / "CASE-1") == kept and (drive_cases / "CASE-1" / "worklog.md").read_text().endswith("v2\n")
+    assert _files(drive_cases / "CASE-1") == kept and (drive_cases / "CASE-1" / "worklog.md").read_text(encoding="utf-8").endswith("v2\n")
     # Drive 側に作業領域の写しがあっても、ローカルの作業領域（wt/ scratch/）は上書きしない（clone/.git/ は rules.exclude）
     for rel in ("wt/src/a.py", "wt/src/new.py", "scratch/b.txt", "clone/.git/HEAD", "clone/c.py"):
         f = drive_cases / "CASE-1" / rel; f.parent.mkdir(parents=True, exist_ok=True); f.write_text("from drive\n")
@@ -970,8 +971,8 @@ def test_checkin_and_checkout_skip_workareas_with_real_rclone(conf, tmp_path, mo
             os.utime(f, (t, t))
     sync.checkout(conf, ws, "CASE-1")
     assert (case / "wt" / "src" / "a.py").read_bytes() == b"x" * 10 and not (case / "wt" / "src" / "new.py").exists()
-    assert (case / "scratch" / "b.txt").read_bytes() == b"x" * 10 and not (case / "clone" / ".git" / "HEAD").read_text().startswith("from drive")
-    assert (case / "clone" / "c.py").read_text() == "from drive\n"
+    assert (case / "scratch" / "b.txt").read_bytes() == b"x" * 10 and not (case / "clone" / ".git" / "HEAD").read_text(encoding="utf-8").startswith("from drive")
+    assert (case / "clone" / "c.py").read_text(encoding="utf-8") == "from drive\n"
 
 
 @pytest.mark.skipif(not shutil.which("rclone"), reason="rclone not installed")
@@ -1017,13 +1018,13 @@ def test_drive_markers_marks_only_matching_cases(conf, fake):
                  "CASE-6": {"drive": "r6", "local": None}}, "drive_no_rev": ["CASE-3"], "local_absent": ["CASE-4"],
                  "errors": {"CASE-7": "Expecting value: line 1 column 1 (char 0)"}, "manifest_removed": None}
     assert [c[1] for c in fake.calls] == ["copy"] and fake.remote_markers == {"CASE-1": ["stale"]} and fake.deleted == []
-    assert fake.calls[0][2:6] == ["my-drive:ws/acme", fake.calls[0][3], "--include", "/cases/*/case.json"] and fake.calls[0][3].startswith("/")
+    assert fake.calls[0][2:6] == ["my-drive:ws/acme", fake.calls[0][3], "--include", "/cases/*/case.json"] and Path(fake.calls[0][3]).is_absolute()
     fake.calls.clear()
     r = sync.drive_markers(conf, ws, remove_manifest=True)
     assert r["dry"] is False and r["marked"] == {"CASE-1": c1["rev"]} and r["manifest_removed"] is True
     assert [c[1] for c in fake.calls] == ["copy", "sync", "deletefile"]
     s_ = fake.calls[1]
-    assert s_[3] == "my-drive:ws/acme/cases" and s_[2].endswith("/stage/cases") and s_[4:] == ["--filter", "+ /CASE-1/.rev/**", "--filter", "- **"]
+    assert s_[3] == "my-drive:ws/acme/cases" and Path(s_[2]).parts[-2:] == ("stage", "cases") and s_[4:] == ["--filter", "+ /CASE-1/.rev/**", "--filter", "- **"]
     assert fake.remote_markers == {"CASE-1": [c1["rev"]]} and fake.deleted == ["my-drive:ws/acme/manifest.json"]   # 古いマーカーは消え、他案件は触らない
     assert not Path(s_[2]).exists()                                                                                   # 一時ディレクトリは消えている
     # copy の失敗は RcloneError。remove_manifest 無しなら deletefile しない
@@ -1139,7 +1140,7 @@ def test_rclone_flags_on_progress_path_uses_popen(conf, fake, monkeypatch):
     """progress 付き（MCP のジョブ経路）は subprocess.Popen。そこにも flags が付く。"""
     from tests.test_jobs import FakePopen
     FakePopen.calls = []; FakePopen.rc = 0
-    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(sync.process, "popen", FakePopen)
     ws = conf.workspaces["acme"]
     CaseStore(ws.cases_dir).create_case("CASE-123", "t", "acme", actor="human")
     conf.rules["rclone_flags"] = list(FLAGS)

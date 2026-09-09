@@ -2,7 +2,7 @@
 
 アダプタが担うのは 3 つだけ:
   (a) build_command(prompt_path, schema_path, case_dir, timeout, out_path=None) -> list[str]   コマンドの組み立て（純関数）
-  (b) run(...)                                                                                subprocess.run(cwd=case_dir, timeout=…)
+  (b) run(...)                                                                                process.run(cwd=case_dir, timeout=…)
   (c) extract_json(stdout, out_file=None) -> dict | None                                       出力から JSON を取り出す
 プロンプトとスキーマは共通（kairn/extract/prompt.md, schema.json）。スキーマ検証は kairn/extract/__init__.py が行う。
 docs/extract-agents.md に無いオプションは使わない。
@@ -15,10 +15,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import process
+
 DEFAULT_TIMEOUT_SEC = 600  # 既定値。実際の値は設定 extract.timeout（config.DEFAULT_EXTRACT_TIMEOUT_SEC と同じ既定）を extract_card が渡す
 # 子プロセスへ渡す環境変数（最小限）。各 CLI が必要とするものはアダプタの env_keys に足す
 COMMON_ENV_KEYS = ("HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER",
-                   "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME")
+                   "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+                   "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP")
 _FENCE_RE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*?)```", re.S)
 
 
@@ -116,7 +119,7 @@ class Adapter:
         （CLI 不在の FileNotFoundError は呼び出し元へ）。"""
         cmd = self.build_command(prompt_path, schema_path, case_dir, timeout, out_path)
         try:
-            p = subprocess.run(cmd, cwd=str(case_dir), env=env, capture_output=True, text=True, timeout=timeout,
+            p = process.run(cmd, cwd=str(case_dir), env=env, capture_output=True, text=True, encoding="utf-8", timeout=timeout,
                                stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as e:
             return RunResult(cmd, None, _text(e.stdout), _text(e.stderr), timed_out=True)

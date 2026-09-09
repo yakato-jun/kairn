@@ -365,7 +365,7 @@ def _fake_config_show(stdout: str | None, rc: int = 0, missing: bool = False):
 ])
 def test_shared_client_id_warning(monkeypatch, stdout, rc, missing, warned):
     import subprocess
-    monkeypatch.setattr(subprocess, "run", _fake_config_show(stdout, rc, missing))
+    monkeypatch.setattr(cfg.process, "run", _fake_config_show(stdout, rc, missing))
     w = cfg.shared_client_id_warning("my-drive")
     if warned:
         assert w and "my-drive" in w and "共有 client_id" in w and "専用 OAuth クライアント" in w
@@ -383,7 +383,7 @@ def test_cli_setup_and_status_warn_about_shared_client_id(tmp_path, monkeypatch,
     monkeypatch.setattr(cfg, "USER_CONFIG_PATH", p)
     monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
     monkeypatch.setattr("kairn.sync.list_ws_on_drive", lambda conf: [])
-    monkeypatch.setattr(subprocess, "run", _fake_config_show(f"[my-drive]\ntype = drive\ntoken = {SECRET_TOKEN}\n"))
+    monkeypatch.setattr(cfg.process, "run", _fake_config_show(f"[my-drive]\ntype = drive\ntoken = {SECRET_TOKEN}\n"))
     monkeypatch.setattr("sys.argv", ["kairn", "setup", "--remote", "my-drive"])
     cli.main()
     out, err = capsys.readouterr()
@@ -393,12 +393,12 @@ def test_cli_setup_and_status_warn_about_shared_client_id(tmp_path, monkeypatch,
     out, err = capsys.readouterr()
     assert "remote: my-drive" in out and err.count("warning:") == 1 and "SECRET" not in out + err
     # client_id があれば何も言わない
-    monkeypatch.setattr(subprocess, "run", _fake_config_show(f"[my-drive]\ntype = drive\nclient_id = 123-abc.apps.googleusercontent.com\nclient_secret = {SECRET_CLIENT}\n"))
+    monkeypatch.setattr(cfg.process, "run", _fake_config_show(f"[my-drive]\ntype = drive\nclient_id = 123-abc.apps.googleusercontent.com\nclient_secret = {SECRET_CLIENT}\n"))
     cli.main()
     out, err = capsys.readouterr()
     assert "remote: my-drive" in out and err == ""
     # rclone 不在でも何も言わない（status は動く）
-    monkeypatch.setattr(subprocess, "run", _fake_config_show(None, missing=True))
+    monkeypatch.setattr(cfg.process, "run", _fake_config_show(None, missing=True))
     cli.main()
     out, err = capsys.readouterr()
     assert "remote: my-drive" in out and err == ""

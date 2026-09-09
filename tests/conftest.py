@@ -19,6 +19,18 @@ def _state_home(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture
+def requires_symlinks(tmp_path):
+    link = tmp_path / "symlink-probe"
+    try:
+        link.symlink_to(tmp_path, target_is_directory=True)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege unavailable (enable Developer Mode)")
+        raise
+    link.unlink()
+
+
+@pytest.fixture
 def conf(tmp_path: Path, monkeypatch) -> cfg.Config:
     """一時ディレクトリに閉じた設定: ワークスペース acme、remote my-drive（架空）。
     DATA_ROOT も同じ一時ディレクトリに向ける: ConfigHolder が conf.path から読み直した Config の Workspace は data_root を持たず
@@ -111,12 +123,15 @@ FAKE_RCLONE = r'''#!/usr/bin/env python3
 lsf（-R / --files-only / --include）・copy / sync（--update、--include、.rev/ 限定の --filter）・copyto・cat・rcat・deletefile。
 それ以外は成功を返すだけ。クラウドには接続しない。"""
 import fnmatch, os, re, shutil, sys
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 STORE = %(store)r
 LOG = %(log)r
 VALUED = {"--include", "--exclude", "--filter", "--format", "--separator", "--max-depth", "--transfers", "--checkers", "--stats",
           "--bwlimit", "--backup-dir", "--max-size", "--min-size", "--min-age", "--drive-pacer-min-sleep", "--drive-pacer-burst"}
 args = sys.argv[1:]
-with open(LOG, "a") as fh:
+with open(LOG, "a", encoding="utf-8") as fh:
     fh.write(" ".join(args) + "\n")
 sub, rest = args[0], args[1:]
 opts, pos = {}, []
@@ -132,6 +147,8 @@ while i < len(rest):
 
 
 def path(p):
+    if os.path.isabs(p):
+        return p
     m = re.match(r"^([A-Za-z0-9_-]+):(.*)$", p)
     return os.path.join(STORE, m.group(2)) if m else p
 

@@ -9,7 +9,23 @@ from kairn import cli, config as cfg
 SRC = cfg.ROOT / "skills" / "kairn"
 
 
-def test_install_skill_links_both_and_keeps_existing(tmp_path: Path, monkeypatch, capsys):
+def test_install_skill_copies_without_symlink_privilege(tmp_path, monkeypatch):
+    def denied(*args, **kwargs):
+        error = OSError("symlink privilege unavailable")
+        error.winerror = 1314
+        raise error
+    monkeypatch.setattr(Path, "symlink_to", denied)
+    lines = cli.install_skill(tmp_path)
+    assert all(line.startswith("copied ") for line in lines)
+    for base in (".agents", ".claude"):
+        installed = tmp_path / base / "skills" / "kairn" / "SKILL.md"
+        assert installed.read_bytes() == (SRC / "SKILL.md").read_bytes()
+        installed.write_text("user edit", encoding="utf-8")
+    assert all(line.startswith("exists:") for line in cli.install_skill(tmp_path))
+    assert installed.read_text(encoding="utf-8") == "user edit"
+
+
+def test_install_skill_links_both_and_keeps_existing(tmp_path: Path, monkeypatch, capsys, requires_symlinks):
     home = tmp_path / "home"
     lines = cli.install_skill(home)
     agents = home / ".agents" / "skills" / "kairn"; claude = home / ".claude" / "skills" / "kairn"
@@ -26,7 +42,9 @@ def test_install_skill_links_both_and_keeps_existing(tmp_path: Path, monkeypatch
     (home2 / ".claude" / "skills" / "kairn").symlink_to(tmp_path)
     lines = cli.install_skill(home2)
     assert lines[0].startswith("exists:") and "dir" in lines[0] and (home2 / ".agents" / "skills" / "kairn" / "SKILL.md").read_text() == "mine"
-    assert lines[1].startswith("exists:") and "fix by hand" in lines[1] and os.readlink(home2 / ".claude" / "skills" / "kairn") == str(tmp_path)
+    raw_target = os.readlink(home2 / ".claude" / "skills" / "kairn")
+    plain_target = raw_target[4:] if raw_target.startswith("\\\\?\\") else raw_target  # Windows のディレクトリ symlink は \\?\ 拡張長パスで返る
+    assert lines[1].startswith("exists:") and "fix by hand" in lines[1] and plain_target == str(tmp_path)
     # CLI 経由（--home）。実 HOME には触れない
     monkeypatch.setattr(cfg, "assert_data_not_tracked", lambda data_root=None: None)
     home3 = tmp_path / "home3"

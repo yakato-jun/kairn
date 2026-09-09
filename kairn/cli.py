@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -343,7 +344,8 @@ def install_skill(home: Path) -> list[str]:
         base.mkdir(parents=True, exist_ok=True)
         dst = base / "kairn"
         if dst.is_symlink():
-            target = Path(os.readlink(dst))
+            raw = os.readlink(dst)
+            target = Path(raw[4:] if raw.startswith("\\\\?\\") else raw)  # Windows のディレクトリ symlink は \\?\ 拡張長パスで返る
             state = "already linked" if dst.resolve() == src.resolve() else f"symlink to {target}, not {src}; fix by hand"
             out.append(f"exists: {dst} ({state})")
         elif dst.exists():
@@ -353,7 +355,10 @@ def install_skill(home: Path) -> list[str]:
                 dst.symlink_to(src, target_is_directory=True)
                 out.append(f"linked {dst} -> {src}")
             except OSError as e:
-                out.append(f"failed to symlink {dst} -> {src}: {e} (on Windows, enable Developer Mode or run as Administrator)")
+                if getattr(e, "winerror", None) != 1314:
+                    raise
+                shutil.copytree(src, dst)
+                out.append(f"copied {src} -> {dst} (symlink privilege unavailable; updates must be copied manually)")
     return out
 
 
